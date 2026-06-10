@@ -1,5 +1,8 @@
 # Limen
 
+[![CI](https://github.com/charliek/limen/actions/workflows/ci.yml/badge.svg)](https://github.com/charliek/limen/actions/workflows/ci.yml)
+[![Docs](https://github.com/charliek/limen/actions/workflows/docs.yml/badge.svg)](https://github.com/charliek/limen/actions/workflows/docs.yml)
+
 **A production-grade Rust reverse proxy for safely migrating HTTP traffic from
 a legacy service to a new implementation** — through shadowing, response
 comparison, deterministic percentage rollout, and fail-safe fallback.
