@@ -5,11 +5,14 @@
 //! among matching routes the **longest prefix wins**, with config order as a
 //! stable tiebreak.
 
+use std::sync::Arc;
+
 use thiserror::Error;
 use url::Url;
 
 use crate::config::model::{Config, RolloutConfig, RouteMode, TimeoutsConfig};
 use crate::contract::model::ComparisonRules;
+use crate::resilience::CircuitBreaker;
 
 /// Failure compiling a route into the route table.
 #[derive(Debug, Error)]
@@ -65,6 +68,11 @@ pub struct CompiledRoute {
     pub comparison: RouteComparison,
     /// Rollout settings (`percentage_split` only).
     pub rollout: Option<RolloutConfig>,
+    /// Whether a failed in-flight request may be replayed against legacy
+    /// (idempotent routes only; spec §6.5).
+    pub failover_safe: bool,
+    /// Per-route circuit breaker guarding the new upstream (`None` if disabled).
+    pub breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl CompiledRoute {
@@ -111,6 +119,11 @@ impl RouteTable {
                 timeouts: r.timeouts.clone(),
                 comparison,
                 rollout: r.rollout.clone(),
+                failover_safe: r.failover_safe,
+                breaker: r
+                    .circuit_breaker
+                    .enabled
+                    .then(|| Arc::new(CircuitBreaker::new(&r.circuit_breaker))),
             });
         }
         // Longest prefix first; `sort_by_key` is stable, so equal-length

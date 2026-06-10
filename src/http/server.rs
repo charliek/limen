@@ -35,6 +35,7 @@ struct Inner {
     shadow_limiter: ShadowLimiter,
     observer: Arc<dyn ShadowObserver>,
     flags: Arc<dyn FlagProvider>,
+    request_body_limit: usize,
     shutting_down: AtomicBool,
 }
 
@@ -47,6 +48,7 @@ impl AppState {
         shadow_limiter: ShadowLimiter,
         observer: Arc<dyn ShadowObserver>,
         flags: Arc<dyn FlagProvider>,
+        request_body_limit: usize,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -55,6 +57,7 @@ impl AppState {
                 shadow_limiter,
                 observer,
                 flags,
+                request_body_limit,
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -83,6 +86,11 @@ impl AppState {
     /// The feature-flag provider.
     pub fn flags(&self) -> &Arc<dyn FlagProvider> {
         &self.inner.flags
+    }
+
+    /// The hard cap on buffered request bodies (e.g. for failover replay).
+    pub fn request_body_limit(&self) -> usize {
+        self.inner.request_body_limit
     }
 
     /// Whether shutdown has begun (shadows are not started during shutdown).
@@ -116,12 +124,14 @@ pub fn build_state_with_observer(
     let client = UpstreamClient::build(&config.upstream_tls)?;
     let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
     let flags = crate::flags::build(&config.flags)?;
+    let request_body_limit = config.server.request_body_limit_bytes as usize;
     Ok(AppState::new(
         routes,
         client,
         shadow_limiter,
         observer,
         flags,
+        request_body_limit,
     ))
 }
 

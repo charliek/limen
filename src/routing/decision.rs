@@ -19,6 +19,7 @@ use axum::http::HeaderMap;
 
 use crate::config::model::RouteMode;
 use crate::flags::FlagProvider;
+use crate::resilience::BreakerReservation;
 use crate::routing::matcher::CompiledRoute;
 use crate::routing::rollout;
 
@@ -56,23 +57,74 @@ pub fn primary_upstream(mode: RouteMode) -> Upstream {
     }
 }
 
-/// Decide the primary upstream for a request. This refines [`primary_upstream`]:
-/// `percentage_split` resolves the rollout percentage from the flag provider and
-/// picks deterministically by assignment key; every other mode is the
-/// mode-level default.
+/// The chosen primary upstream plus the breaker reservation the proxy must
+/// settle.
 ///
-/// Phase 6 adds the circuit breaker's **pre-flight steering** here (skip new
-/// while the breaker is open) — it will grow a breaker/context parameter. The
-/// *mid-flight* failover retry (new failed → try legacy) is a separate concern
-/// that lives in the proxy's error arms, not in this pre-flight chooser.
+/// `breaker` is `Some` **only** when a breaker-guarded `new` attempt was
+/// admitted — i.e. [`allow`](crate::resilience::CircuitBreaker::allow) issued an
+/// admission (reserving a trial slot if half-open). Carrying the reservation
+/// here ties the settlement obligation to the decision: whenever it is `Some`,
+/// the proxy must settle it exactly once — [`record`](BreakerReservation::record)
+/// on a real attempt, or [`release`](BreakerReservation::release) if it bails out
+/// before reaching new.
+#[derive(Debug, Clone)]
+pub struct PrimaryDecision {
+    /// The upstream that serves the client.
+    pub upstream: Upstream,
+    /// The breaker reservation to settle, if a `new` trial was admitted
+    /// (otherwise `None`).
+    pub breaker: Option<BreakerReservation>,
+}
+
+/// Decide the primary upstream for a request. This refines [`primary_upstream`]:
+/// `percentage_split` resolves the rollout percentage from flags and picks by
+/// assignment key; `failover_to_legacy` prefers new. Both consult the circuit
+/// breaker (**pre-flight steering**): while the breaker is open, the request is
+/// routed to legacy instead of new. The *mid-flight* failover retry (new failed
+/// → replay legacy) lives in the proxy's error handling, not here.
 pub async fn decide_primary(
     route: &CompiledRoute,
     headers: &HeaderMap,
     flags: &dyn FlagProvider,
-) -> Upstream {
+) -> PrimaryDecision {
     match route.mode {
         RouteMode::PercentageSplit => percentage_split(route, headers, flags).await,
-        other => primary_upstream(other),
+        RouteMode::FailoverToLegacy => gate_new(route),
+        other => to_legacy(primary_upstream(other)),
+    }
+}
+
+/// A decision for `upstream` with no breaker slot to settle.
+fn to_legacy(upstream: Upstream) -> PrimaryDecision {
+    PrimaryDecision {
+        upstream,
+        breaker: None,
+    }
+}
+
+/// Gate a `new`-preferring choice through the circuit breaker: an open breaker
+/// steers to legacy; otherwise attempt new and, if a breaker guards the route,
+/// hand back its handle so the proxy settles the reserved slot. Shared by
+/// `failover_to_legacy` and a split bucket that selects new.
+fn gate_new(route: &CompiledRoute) -> PrimaryDecision {
+    match &route.breaker {
+        Some(breaker) => match breaker.allow() {
+            // Admitted (a trial slot is reserved if half-open); the proxy must
+            // settle the reservation.
+            Some(admission) => PrimaryDecision {
+                upstream: Upstream::New,
+                breaker: Some(BreakerReservation::new(breaker.clone(), admission)),
+            },
+            // Breaker open — steer to legacy, nothing to settle.
+            None => PrimaryDecision {
+                upstream: Upstream::Legacy,
+                breaker: None,
+            },
+        },
+        None => PrimaryDecision {
+            upstream: Upstream::New,
+            breaker: None,
+        },
     }
 }
 
@@ -81,17 +133,16 @@ async fn percentage_split(
     route: &CompiledRoute,
     headers: &HeaderMap,
     flags: &dyn FlagProvider,
-) -> Upstream {
-    // Fail safe: if flags are stale, apply the fail-safe mode regardless of the
-    // percentage. `legacy_only` is the only fail-safe mode today, so this is a
-    // direct route to legacy; a future mode would be threaded in here.
+) -> PrimaryDecision {
+    // Fail safe: stale flags apply the fail-safe mode (legacy_only is the only
+    // mode today) regardless of percentage.
     if flags.health().stale {
-        return Upstream::Legacy;
+        return to_legacy(Upstream::Legacy);
     }
-    // A percentage_split route always has rollout config (enforced by
-    // validation); absent it, fail safe to legacy.
+    // A percentage_split route always has rollout config (validated); absent it,
+    // fail safe to legacy.
     let Some(rollout) = &route.rollout else {
-        return Upstream::Legacy;
+        return to_legacy(Upstream::Legacy);
     };
     let percentage = flags
         .get(&rollout.percentage_flag)
@@ -105,9 +156,10 @@ async fn percentage_split(
         headers,
     );
     if rollout::selects_new(rollout::bucket(&route.id, &key), percentage) {
-        Upstream::New
+        // The bucket selected new — still gate through the breaker.
+        gate_new(route)
     } else {
-        Upstream::Legacy
+        to_legacy(Upstream::Legacy)
     }
 }
 
@@ -205,11 +257,15 @@ routes:
             percentage: Some(0.0),
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &all_new).await,
+            decide_primary(route, &headers("t"), &all_new)
+                .await
+                .upstream,
             Upstream::New
         );
         assert_eq!(
-            decide_primary(route, &headers("t"), &none_new).await,
+            decide_primary(route, &headers("t"), &none_new)
+                .await
+                .upstream,
             Upstream::Legacy
         );
     }
@@ -222,10 +278,14 @@ routes:
             stale: false,
             percentage: Some(50.0),
         };
-        let first = decide_primary(route, &headers("tenant-42"), &flags).await;
+        let first = decide_primary(route, &headers("tenant-42"), &flags)
+            .await
+            .upstream;
         for _ in 0..10 {
             assert_eq!(
-                decide_primary(route, &headers("tenant-42"), &flags).await,
+                decide_primary(route, &headers("tenant-42"), &flags)
+                    .await
+                    .upstream,
                 first
             );
         }
@@ -241,7 +301,7 @@ routes:
             percentage: Some(100.0),
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &stale).await,
+            decide_primary(route, &headers("t"), &stale).await.upstream,
             Upstream::Legacy
         );
     }
@@ -256,7 +316,9 @@ routes:
             percentage: None,
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &no_value).await,
+            decide_primary(route, &headers("t"), &no_value)
+                .await
+                .upstream,
             Upstream::Legacy
         );
     }

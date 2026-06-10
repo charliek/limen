@@ -12,16 +12,20 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use bytes::Bytes;
 use tracing::warn;
 use url::Url;
 
 use super::server::AppState;
 use crate::compare::Captured;
+use crate::config::model::RouteMode;
 use crate::http::body::{self, Buffered};
+use crate::http::client::UpstreamClient;
 use crate::http::shadow::{self, ShadowRequest};
 use crate::observability::SkipReason;
+use crate::resilience::BreakerReservation;
 use crate::routing::{decision, Upstream};
 
 /// Hop-by-hop headers (RFC 7230 §6.1) that must not be forwarded across a proxy.
@@ -49,12 +53,19 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
         return not_found();
     };
 
-    let upstream = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
+    let decision = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
+    let upstream = decision.upstream;
+    // `Some` only when a breaker-guarded `new` trial was admitted: we then own
+    // the obligation to settle that reserved slot exactly once — `record` on a
+    // real attempt below, or `release` if we bail out before reaching new.
+    let breaker = decision.breaker;
+
     let base = match upstream {
         Upstream::Legacy => route.legacy_upstream.as_ref(),
         Upstream::New => route.new_upstream.as_ref(),
     };
     let Some(base) = base else {
+        release_breaker(&breaker);
         warn!(
             route = %route.id,
             upstream = upstream.as_str(),
@@ -72,6 +83,7 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     // `build_upstream_url`). Copy out what we need so the `state` borrow ends
     // before the await.
     let Some(url) = build_upstream_url(base, path, uri.query()) else {
+        release_breaker(&breaker);
         warn!(route = %route.id, path, "refusing to forward a path that requires normalization");
         return (
             StatusCode::BAD_REQUEST,
@@ -82,6 +94,32 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     let route_id = route.id.clone();
     let timeout = Duration::from_millis(route.timeouts.primary_ms);
     let request_headers = filter_headers(&parts.headers, Direction::Request);
+
+    // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
+    // request body so a new-side failure can be replayed against legacy. Handled
+    // before planning a shadow, which `shadow::plan` never produces for this mode
+    // anyway — so the shadow setup below is dead work on this path.
+    if route.mode == RouteMode::FailoverToLegacy && route.failover_safe && upstream == Upstream::New
+    {
+        if let Some(legacy_url) = route
+            .legacy_upstream
+            .as_ref()
+            .and_then(|b| build_upstream_url(b, path, uri.query()))
+        {
+            return failover_dispatch(
+                &state,
+                &route_id,
+                &breaker,
+                method,
+                url,
+                legacy_url,
+                request_headers,
+                body,
+                timeout,
+            )
+            .await;
+        }
+    }
 
     // Prepare a shadow plan *before* sending the primary, so the method and
     // headers are available to replay. Only `shadow_legacy_primary` + sampled
@@ -112,13 +150,20 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
         .send();
 
     match tokio::time::timeout(timeout, send).await {
-        Ok(Ok(resp)) => primary_succeeded(&state, &route_id, shadow, resp).await,
+        Ok(Ok(resp)) => {
+            record_breaker(&breaker, !resp.status().is_server_error());
+            primary_succeeded(&state, &route_id, shadow, resp).await
+        }
         Ok(Err(error)) => {
-            // Phase 6 adds failover; for now an upstream failure is a 502.
+            // A non-failover-safe failover route returns the new-side failure to
+            // the client (the in-flight request is NOT replayed); the breaker
+            // still steers *subsequent* requests to legacy.
+            record_breaker(&breaker, false);
             warn!(route = %route_id, upstream = upstream.as_str(), %error, "upstream request failed");
             bad_gateway()
         }
         Err(_elapsed) => {
+            record_breaker(&breaker, false);
             warn!(
                 route = %route_id,
                 upstream = upstream.as_str(),
@@ -128,6 +173,129 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
             gateway_timeout()
         }
     }
+}
+
+/// Record an attempt's outcome on the route's breaker reservation, if any.
+fn record_breaker(reservation: &Option<BreakerReservation>, success: bool) {
+    if let Some(reservation) = reservation {
+        reservation.record(success);
+    }
+}
+
+/// Release a breaker reservation without recording an outcome — used when the
+/// request is rejected locally (bad path, missing upstream, un-bufferable body)
+/// before any attempt against new is made, so the trial slot is not leaked.
+fn release_breaker(reservation: &Option<BreakerReservation>) {
+    if let Some(reservation) = reservation {
+        reservation.release();
+    }
+}
+
+/// Failover-safe dispatch: buffer the (bounded) request body, send to new, and —
+/// on a new-side failure — replay the same request to legacy. Safe to replay
+/// because the route is `failover_safe` (idempotent). Records the new attempt's
+/// outcome on the breaker.
+///
+/// A new-side failure is a 5xx response, a transport error/timeout, **or** a
+/// response whose body errors or times out mid-read: because this path buffers
+/// the (bounded) new response before committing, such a body failure fails over
+/// to legacy rather than streaming a truncated response to the client.
+#[allow(clippy::too_many_arguments)]
+async fn failover_dispatch(
+    state: &AppState,
+    route_id: &str,
+    breaker: &Option<BreakerReservation>,
+    method: Method,
+    new_url: Url,
+    legacy_url: Url,
+    headers: HeaderMap,
+    body: Body,
+    timeout: Duration,
+) -> Response {
+    // Buffer the request body so it can be replayed. failover_safe is opt-in, so
+    // an over-limit body that can't be buffered is rejected rather than sent
+    // un-replayable.
+    let bytes = match axum::body::to_bytes(body, state.request_body_limit()).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            // We never reach new on this path, so settle the reserved breaker
+            // slot by releasing it (not recording a failure against new).
+            release_breaker(breaker);
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "limen: request body too large to buffer for failover replay\n",
+            )
+                .into_response();
+        }
+    };
+
+    let new_result = send_buffered(
+        state.client(),
+        method.clone(),
+        new_url,
+        headers.clone(),
+        bytes.clone(),
+        timeout,
+    )
+    .await;
+
+    // Classify the new attempt on its *complete* outcome — status and body, not
+    // just the status line. On a non-5xx response, buffer the body (bounded) so
+    // a 2xx whose body then fails is treated as a new-side failure.
+    if let Ok(resp) = new_result {
+        if !resp.status().is_server_error() {
+            let status = resp.status();
+            let resp_headers = filter_headers(resp.headers(), Direction::Response);
+            match body::buffer_or_stream(resp, state.request_body_limit()).await {
+                Buffered::Full(buffered) => {
+                    record_breaker(breaker, true);
+                    return response_from_parts(status, resp_headers, Body::from(buffered));
+                }
+                Buffered::TooLarge(streamed) => {
+                    // Past the buffer bound the body can't be verified, and a
+                    // committed stream can't be replayed; relay as-is (the
+                    // failover guarantee is header-level for such responses).
+                    record_breaker(breaker, true);
+                    return response_from_parts(status, resp_headers, streamed);
+                }
+                // Body errored mid-read (including the total timeout firing):
+                // a new-side failure — fall through to the legacy replay.
+                Buffered::Error => {}
+            }
+        }
+    }
+
+    // New failed (5xx, transport error/timeout, or a body that errored
+    // mid-read) — replay legacy.
+    record_breaker(breaker, false);
+    warn!(route = %route_id, "new upstream failed; failing over to legacy");
+    match send_buffered(state.client(), method, legacy_url, headers, bytes, timeout).await {
+        Ok(resp) => relay_response(resp),
+        Err(error) => {
+            warn!(route = %route_id, %error, "legacy failover also failed");
+            bad_gateway()
+        }
+    }
+}
+
+/// Send a request with a fully-buffered body, bounding the whole exchange with a
+/// total timeout (safe because the body is bounded).
+async fn send_buffered(
+    client: &UpstreamClient,
+    method: Method,
+    url: Url,
+    headers: HeaderMap,
+    body: Bytes,
+    timeout: Duration,
+) -> Result<reqwest::Response, reqwest::Error> {
+    client
+        .inner()
+        .request(method, url)
+        .headers(headers)
+        .timeout(timeout)
+        .body(reqwest::Body::from(body))
+        .send()
+        .await
 }
 
 /// Handle a successful primary response: stream it directly, or — when the

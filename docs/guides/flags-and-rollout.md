@@ -92,6 +92,6 @@ Raise the flag in steps, pausing at each to recheck the budget on real traffic
 ```
 
 Because traffic shifting is flag-driven, rollback is fast and reversible — lower
-the flag to the last-green percentage (no redeploy), or trip the circuit breaker
-(spec §9). Writes move via `percentage_split` too — each
+the flag to the last-green percentage (no redeploy), or let the
+[circuit breaker](resilience.md) trip. Writes move via `percentage_split` too — each
 request goes to exactly one implementation, so a side effect is never doubled.
