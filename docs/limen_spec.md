@@ -1,0 +1,915 @@
+# Limen — Legacy-to-New Service Migration Proxy
+
+**A production-grade Rust reverse proxy for safely migrating HTTP traffic from a legacy service to a new implementation, through shadowing, response comparison, deterministic percentage rollout, and fail-safe fallback.**
+
+---
+
+## 0. About This Document
+
+This is the implementation specification for **Limen**, intended to be handed to a coding agent (Claude Code, Codex, etc.) and to human engineers. It defines the goals, scope, architecture, configuration model, phased build plan, acceptance criteria, and test plan in enough detail to implement the project from a clean checkout with high test coverage and confidence.
+
+Limen is one of two complementary projects:
+
+- **Limen** (this project, Rust): the runtime migration proxy. Handles live traffic routing, read-path shadowing, response comparison, gradual rollout, and safe fallback in development, staging, and production.
+- **Pharos** (separate project, TypeScript/Vitest): a black-box functional test suite that validates a new service against a legacy service deterministically, before and during rollout.
+
+The two share a **behavioral contract** (Section 4) but are independently deployable and have no build-time dependency on each other. See Section 13 for the relationship.
+
+> **Naming note:** *Limen* is the Latin word for "threshold" — the liminal state in which the old and new implementations coexist and traffic crosses safely from one to the other, with the ability to step back. This directionality is deliberate: unlike a one-way crossing, every Limen route can fail back to legacy.
+
+---
+
+## 1. Goals and Non-Goals
+
+### 1.1 Primary goals
+
+1. **Safe traffic migration.** Sit in front of two upstreams — `legacy` (current source of truth) and `new` (the replacement) — and move traffic between them without changing user-facing behavior.
+2. **Risk-free validation in production.** Shadow eligible read traffic to the new service, compare responses against legacy, and emit correctness signals **without ever letting the new service or comparison affect the client response**.
+3. **Deterministic, controllable rollout.** Shift traffic from legacy to new by percentage, deterministically per assignment key, controllable at runtime via feature flags without redeploying.
+4. **Fail safe under uncertainty.** Default to legacy whenever anything is wrong — new upstream unhealthy, circuit open, flags stale, config ambiguous.
+5. **Production-grade performance and observability.** Sub-millisecond proxying overhead on the streaming path, bounded resource use, Prometheus metrics, structured logs, health endpoints, and graceful shutdown.
+6. **Consume the shared behavioral contract.** Apply the same normalization and comparison vocabulary that Pharos validates, so the rules refined during functional testing drive production shadow comparison unchanged.
+
+### 1.2 Non-goals (MVP)
+
+- Unit/integration testing of either upstream's internals (that is Pharos's and the services' own job).
+- TLS **termination** at the proxy (the MVP makes TLS calls *to* upstreams; terminating client TLS is a documented post-MVP expansion — see Section 11.4).
+- Long-term analytics, dashboards, or historical trend storage.
+- Stateful load testing or large-scale performance testing.
+- Protocols beyond HTTP/1.1 and HTTP/2 over TCP. No gRPC, no WebSockets, no GraphQL-specific handling in MVP.
+- Dual-writing or reconciling production *data*. Limen shadows reads; it does not replay or reconcile writes.
+- Hot-reloading of behavioral comparison rules mid-run (flag *values* hot-reload; comparison *semantics* are fixed for the duration of a run — see Section 4.4).
+- A web UI.
+
+### 1.3 Assumed migration pattern
+
+Limen is designed for the common, lowest-risk migration shape: **legacy and new share the same backing datastore**, and the migration is a **re-implementation of request-handling logic** (e.g. a framework or language change), not a data migration. A write through either implementation is immediately visible to the other, so correctness reduces to **behavioral parity over shared data** — exactly what the shared contract (Section 4) expresses.
+
+This assumption is why shadowing reads is safe (both read the same data) and why writes route to exactly one implementation rather than being shadowed (Section 6). Migrations that do **not** share a datastore (separate stores requiring synchronization) move into dual-write/reconciliation territory, which is explicitly out of scope; Limen's safety properties are not designed for that case.
+
+---
+
+## 2. Personas and Core Use Cases
+
+### 2.1 Personas
+
+- **Migrating engineer:** runs Limen locally (often in Docker Compose) against a legacy and an in-progress new service, watches shadow diffs, fixes the new service, repeats.
+- **Service owner / SRE:** operates Limen in staging/production, controls rollout percentage via flags, watches correctness and circuit-breaker metrics, owns the fail-safe posture.
+- **Platform engineer:** maintains Limen itself, its CI, config conventions, and the shared-contract integration.
+- **AI coding agent:** drafts behavioral contracts from service docs/traffic, and (in the broader workflow) implements new-service behavior guided by Pharos failures. Limen consumes the resulting contract.
+
+### 2.2 Core use cases
+
+1. **Local development proxy.** Engineer runs Limen in front of legacy + new in Docker Compose; route is in `shadow_legacy_primary`; engineer iterates on the new service until shadow diffs are clean.
+2. **Production shadow observation.** Limen runs at the edge or as a sidecar, returns legacy to clients, shadows reads to new, and reports a per-route mismatch rate to decide rollout readiness.
+3. **Gradual rollout.** Once mismatch rate is acceptable, the route moves to `percentage_split`; operators raise the rollout flag (0 → 1 → 5 → 25 → 100) at runtime; deterministic hashing keeps a given tenant/user stable.
+4. **Fail-safe under incident.** New upstream degrades; circuit breaker opens; traffic returns to legacy automatically; metrics and logs make the transition observable.
+5. **Cutover and regression watch.** Route reaches 100% new; Limen can remain in `failover_to_legacy` to keep legacy as a safety net, or in `new_only` once legacy is decommissioned.
+
+---
+
+## 3. Architecture
+
+### 3.1 Technology choice
+
+**Primary stack (recommended and assumed by this spec):**
+
+| Concern | Choice | Why |
+|---|---|---|
+| Async runtime | `tokio` | De facto standard; mature, performant. |
+| HTTP server + middleware | `axum` + `tower` on `hyper` | `tower`'s `Service`/`Layer` model maps directly onto the proxy's middleware concerns (routing decision, rollout, shadow dispatch, circuit breaking, timeouts, metrics) as composable layers rather than ad-hoc code. `axum` gives ergonomic routing for the control-plane endpoints. `hyper` keeps the data plane low-level enough to control buffering and streaming. |
+| Upstream HTTP client | `reqwest` | Connection pooling, timeouts, TLS, redirects handled. Pragmatic for both primary and shadow calls. A raw `hyper` client is the documented fallback if tighter control over shadow-path resource use is needed later. |
+| Config / serde | `serde`, `serde_json`, `serde_yaml` | Config in YAML; contract in YAML or JSON. |
+| Logging / tracing | `tracing`, `tracing-subscriber` | Structured logs, span context. |
+| Metrics | `metrics` + `metrics-exporter-prometheus` | Prometheus endpoint, low-cardinality. |
+| CLI | `clap` | Subcommands and config validation. |
+| Errors | `thiserror` (library errors) + `anyhow` (binary/top-level) | Typed errors where they cross boundaries; ergonomic propagation at the top. |
+| Hashing | `blake3` | Fast, stable hash for normalized-response comparison. |
+| Redis client | `redis` (with `tokio` features) or `fred` | For the Redis flag provider. Pick one; `fred` has stronger async ergonomics and connection management, `redis` is more ubiquitous. Either is acceptable; document the choice. |
+| Test HTTP servers | `wiremock` and/or lightweight `axum` test servers | Integration tests. |
+
+**Documented fallbacks (only if the primary stack proves insufficient during implementation):**
+
+- **Pure `hyper` (no `axum`)** for the data plane if `axum`'s extractors get in the way of streaming control. More boilerplate, more control.
+- **Raw `hyper` upstream client** instead of `reqwest` if the shadow path needs finer resource control.
+
+**Pingora sidebar (read before reaching for it):**
+
+> Pingora (Cloudflare's Rust proxy framework, open-sourced 2024) is purpose-built for very-high-volume edge proxying and would be a strong fit for the standalone-edge deployment at large scale. This MVP deliberately chooses `axum`/`tower`/`hyper` because: (1) the `tower` `Service`/`Layer` model maps cleanly onto our middleware concerns and is widely understood; (2) the ecosystem and documentation surface is larger, which matters for a codebase that AI agents and multiple engineers will extend; (3) Pingora is more opinionated and would shape the entire architecture around itself. **Migration path:** because routing, comparison, flags, and resilience all sit behind traits and the data plane is isolated, the proxying core could later be re-hosted on Pingora for the edge deployment **without rewriting** the comparison, flags, or rollout logic. Revisit Pingora only if single-instance edge throughput becomes the binding constraint.
+
+### 3.2 Data plane vs. control plane
+
+Limen runs **two listeners**:
+
+- **Data plane** (`server.listen_addr`, e.g. `:8080`): the actual proxy. Receives client traffic, matches routes, decides upstream, proxies, optionally shadows and compares.
+- **Control plane** (`metrics.listen_addr`, e.g. `:9090`): `/metrics`, `/health/live`, `/health/ready`. Never serves proxied traffic. Bound separately so it can be firewalled off from public exposure.
+
+### 3.3 Two body-handling paths (performance-critical)
+
+This is a central design decision. Limen has **two deliberately separate code paths** for handling bodies:
+
+1. **Streaming path (default).** Used when a route has comparison disabled, or when a request is not selected for comparison sampling. Request and response bodies are **streamed** between client and upstream without full buffering. Limen observes only status, headers, and latency. Lowest overhead; unbounded body size is fine. This is the path most production traffic should take.
+
+2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client.
+
+The sampling decision is made **per request**, before buffering, so that on a route with `sample_rate: 0.1` you pay buffering cost on ~10% of traffic and stream the other ~90%.
+
+### 3.4 Request lifecycle (data plane)
+
+For each incoming client request:
+
+1. **Match route** by method + path (longest path-prefix wins; see 5.2). No match → configured not-found response.
+2. **Resolve route mode** and, for `percentage_split`, resolve the rollout percentage from the flag provider.
+3. **Decide primary upstream** (legacy or new) per mode + rollout + circuit-breaker state.
+4. **Decide shadow eligibility** (see 6.1).
+5. **Dispatch:**
+   - Send the **primary** request to the chosen upstream (streamed unless this request will be compared and buffered).
+   - If shadowing, dispatch the **shadow** request fire-and-forget; it must **never** delay or fail the client response.
+6. **Return the primary response to the client** as soon as it is available.
+7. **Comparison (off the client path):** if eligible and sampled, normalize both responses, hash, compare, optionally diff, emit metrics/logs/sampled diff.
+8. **Record metrics** for the request regardless of comparison.
+
+Circuit-breaker state is updated based on primary-upstream outcomes (and shadow outcomes where configured) per Section 9.
+
+### 3.5 Module structure
+
+```text
+limen/
+  Cargo.toml
+  README.md
+  LICENSE
+  config/
+    limen.example.yaml
+    flags.example.yaml
+    contracts/
+      example-service.contract.yaml
+  src/
+    main.rs                 # bootstrap, signal handling, listener wiring
+    cli.rs                  # clap subcommands: run, validate-config, print-routes, check-contract
+    error.rs                # top-level error types
+    config/
+      mod.rs
+      model.rs              # serde structs for limen.config.yaml
+      load.rs               # load + layer (defaults < file < env < CLI)
+      validate.rs           # semantic validation (URLs, percentages, timeouts, refs)
+    contract/
+      mod.rs
+      model.rs              # serde structs for the shared contract (YAML/JSON)
+      load.rs               # load contract files, resolve `path#routeId` references
+      merge.rs              # merge contract comparison rules with route operational config
+    http/
+      mod.rs
+      server.rs             # data-plane listener (hyper/axum)
+      client.rs             # upstream client (reqwest), TLS, timeouts, pooling
+      proxy.rs              # streaming proxy core
+      body.rs               # bounded buffering helpers, body-limit enforcement
+    routing/
+      mod.rs
+      matcher.rs            # method + longest-prefix matching
+      decision.rs           # mode + rollout + circuit-breaker → upstream choice
+      rollout.rs            # deterministic hashing, bucket assignment
+    flags/
+      mod.rs
+      provider.rs           # FlagProvider trait
+      static_provider.rs
+      file_provider.rs      # polling refresh, last-known-good, staleness
+      redis_provider.rs     # polling/pub-sub refresh, last-known-good, staleness
+      health.rs             # provider health + staleness tracking
+    compare/
+      mod.rs
+      normalize.rs          # JSON normalization (sort keys, ignore/redact paths, sort arrays, timestamps, enums)
+      jsonpath.rs           # the supported JSONPath subset
+      hash.rs               # blake3 over normalized representation
+      diff.rs               # JSON-aware structural diff, bounded + redacted
+      redact.rs             # header + JSON-path + query redaction
+      result.rs             # ComparisonResult, Mismatch types
+    observability/
+      mod.rs
+      metrics.rs            # metric definitions + registration
+      logging.rs            # tracing setup, structured fields
+      request_id.rs         # request/trace id extraction + propagation
+    resilience/
+      mod.rs
+      circuit_breaker.rs    # per-route, per-upstream breaker state machine
+      timeouts.rs           # primary/shadow timeout layers
+      concurrency.rs        # shadow concurrency limiting
+    health/
+      mod.rs
+      endpoints.rs          # /health/live, /health/ready
+      readiness.rs          # readiness evaluation (config valid, providers usable/fail-safe)
+  tests/
+    integration/
+      legacy_only.rs
+      new_only.rs
+      shadow_match.rs
+      shadow_mismatch.rs
+      shadow_timeout.rs
+      percentage_rollout.rs
+      circuit_breaker.rs
+      flag_reload.rs
+      stale_flag_failsafe.rs
+      graceful_shutdown.rs
+    common/
+      mod.rs                # test server helpers, fixtures
+  benches/
+    proxy_overhead.rs       # criterion benchmarks for SLO validation
+  examples/
+    docker-compose.yaml     # legacy + new mock + limen, for local trial
+```
+
+---
+
+## 4. The Shared Behavioral Contract
+
+### 4.1 Purpose and lifecycle
+
+The behavioral contract is the artifact that flows through the migration workflow and gets more trustworthy at each stage:
+
+```
+   AI investigation                Pharos                       Limen
+ (docs, OpenAPI, traffic,   (deterministic functional      (production shadow
+  code, logs)                validation + refinement)        comparison + rollout)
+        │                            │                              │
+        ▼                            ▼                              ▼
+   DRAFTS the contract  ──▶  VALIDATES & REFINES it  ──▶  CONSUMES it unchanged
+   (ignore/redact paths,     (catches over-normalization,  (same normalization
+    timestamp & enum          missed real diffs,             vocabulary applied to
+    normalizations,           tightens rules)                live shadow traffic)
+    expectations)
+```
+
+The contract describes **observable behavior and how to compare it** — never service internals. It is framework-agnostic by design, because the migration pairs vary (e.g. Ratpack→Spring Boot, Python→Rust, TypeScript→Go). It is the **single source of truth for comparison semantics** shared between Pharos and Limen.
+
+### 4.2 Contract format
+
+A contract file is YAML or JSON (Limen detects by extension; AI tooling tends to emit JSON, humans review YAML — both parse to the same structure).
+
+```yaml
+# config/contracts/device-service.contract.yaml
+version: 1
+service: device-service
+description: >
+  Behavioral contract for device-service migration. Drafted from OpenAPI +
+  captured traffic, refined by Pharos runs, consumed by Limen for shadow comparison.
+
+# Service-wide defaults. Per-route `comparison` blocks merge on top of these.
+defaults:
+  compare_status: true
+  compare_body: true
+  compare_headers: []          # header names compared only if listed
+  json:
+    ignore_paths:
+      - "$.metadata.requestId"
+      - "$.metadata.generatedAt"
+    redact_paths:
+      - "$.user.email"
+      - "$.token"
+    sort_arrays:
+      - path: "$.devices"
+        key: "id"
+    unordered_arrays:
+      - path: "$.permissions"
+    normalize_timestamps:
+      - path: "$.createdAt"
+        precision: seconds       # e.g. legacy emits millis, new emits seconds
+    enum_aliases:
+      - path: "$.status"
+        aliases: { ACTIVE: enabled, INACTIVE: disabled }
+
+routes:
+  - id: "get-device"
+    match:
+      methods: ["GET"]
+      path_template: "/devices/{id}"
+    comparison:
+      json:
+        ignore_paths: ["$.device.lastSeenAt"]   # merged with defaults
+    expectations:
+      typical_status: 200
+      notes: >
+        Legacy returns 200 with empty body on soft-deleted devices; new returns
+        404. This is an intentional change — see the intentional-change tag.
+    tags: [read, migration-ready]
+
+  - id: "list-devices"
+    match:
+      methods: ["GET"]
+      path_template: "/devices"
+    comparison:
+      json:
+        sort_arrays:
+          - path: "$.devices"
+            key: "id"
+    tags: [read, migration-ready]
+```
+
+### 4.3 What lives in the contract vs. in Limen config
+
+This split is the rule that keeps the two artifacts from ever conflicting — they occupy **distinct key namespaces**:
+
+| Concern | Lives in | Rationale |
+|---|---|---|
+| **What** to compare and **how** (`ignore_paths`, `redact_paths`, `sort_arrays`, `unordered_arrays`, `normalize_timestamps`, `enum_aliases`, `compare_status`, `compare_body`, `compare_headers`) | **Contract** | Behavioral truth, shared with and refined by Pharos. |
+| **Whether / how often / how much** to compare operationally (`enabled`, `sample_rate`, `max_body_bytes`) | **Limen route config** | Runtime cost/volume policy, deployment-specific. |
+| Routing, upstreams, rollout, timeouts, circuit breaker, flags, server | **Limen route config** | Pure operational concern; Pharos has no equivalent. |
+
+Because behavioral keys never appear in Limen route config and operational keys never appear in the contract, there is **no possible key-level conflict** — the merge (Section 4.4) is a union, not a reconciliation.
+
+### 4.4 How Limen consumes the contract (MVP behavior — "Option B")
+
+- Each Limen route **references** a contract route by file + fragment: `contract: "./contracts/device-service.contract.yaml#get-device"`.
+- At **startup**, Limen loads the contract, resolves the reference, and **merges** the contract's behavioral comparison rules (service `defaults` + per-route `comparison`, with per-route overriding/merging onto defaults) with the route's operational comparison policy.
+- The merged comparison configuration is what the comparison engine uses at runtime.
+- **Contracts are loaded once at startup and are NOT hot-reloaded.** Only flag *values* hot-reload (Section 8). Comparison *semantics* stay fixed for the duration of a run, so a contract edit cannot change how in-flight comparisons behave. To pick up a contract change, restart (or trigger a controlled reload — a documented post-MVP enhancement).
+- A route **without** a `contract` reference may specify its comparison rules inline using the **same vocabulary** (this keeps a single-file quickstart possible and is the documented fallback authoring style). If both a contract reference and an inline `comparison.json` behavioral block are present, that is a **validation error** — pick one source of behavioral truth per route.
+
+### 4.5 `check-contract` CLI command
+
+Limen ships a `check-contract` subcommand that validates a contract file against the schema and reports the supported-JSONPath compliance of every path it contains. This lets the AI→Pharos→Limen loop verify a freshly drafted contract is Limen-consumable before wiring it into a route.
+
+---
+
+## 5. Configuration
+
+### 5.1 Sources and precedence
+
+Config is layered, later sources overriding earlier:
+
+1. Built-in defaults.
+2. Config file (`--config ./limen.config.yaml`).
+3. Environment variables.
+4. CLI arguments.
+
+Example environment variables:
+
+```bash
+LIMEN_LISTEN_ADDR=0.0.0.0:8080
+LIMEN_METRICS_ADDR=0.0.0.0:9090
+LIMEN_FLAGS_PROVIDER=redis
+LIMEN_REDIS_URL=redis://localhost:6379
+LIMEN_FAIL_SAFE_MODE=legacy_only
+LIMEN_CONFIG=./limen.config.yaml
+```
+
+### 5.2 Config model
+
+```yaml
+# limen.config.yaml
+server:
+  listen_addr: "0.0.0.0:8080"
+  graceful_shutdown_timeout_ms: 10000
+  request_body_limit_bytes: 1048576       # hard cap on buffered request bodies
+
+metrics:
+  listen_addr: "0.0.0.0:9090"
+  path: "/metrics"
+
+upstream_tls:
+  # applies to reqwest client used for upstream calls
+  verify_certificates: true
+  # optional custom CA bundle for internal PKI
+  ca_bundle_path: null
+  # optional per-upstream overrides may be added post-MVP
+
+flags:
+  provider: "redis"                         # static | file | redis
+  static:
+    values: {}                              # used when provider = static
+  file:
+    path: "./flags.local.yaml"
+    refresh_interval_ms: 1000
+  redis:
+    url: "redis://localhost:6379"
+    key_prefix: "limen:flags:"
+    refresh_interval_ms: 1000
+  stale_ttl_ms: 30000                       # after this, apply fail_safe_mode
+  fail_safe_mode: "legacy_only"             # behavior when flags are stale/unavailable
+
+routes:
+  - id: "get-device"
+    match:
+      methods: ["GET"]
+      path_prefix: "/devices/"
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "shadow_legacy_primary"           # see Section 6
+    contract: "./contracts/device-service.contract.yaml#get-device"
+    failover_safe: false                      # may this route auto-failover? (see 6.5)
+    rollout:
+      percentage_flag: "migration.get-device.rollout_percentage"
+      default_percentage: 0
+      assignment_key:
+        header: "x-tenant-id"
+        fallback: "request_random"          # request_random (MVP) | ...
+    timeouts:
+      primary_ms: 2000
+      shadow_ms: 2000
+    comparison:
+      enabled: true                         # operational gate
+      sample_rate: 0.1                       # fraction of eligible requests to compare
+      max_body_bytes: 262144                 # skip comparison above this
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 0.25
+      min_requests: 20
+      open_duration_ms: 30000
+      half_open_max_requests: 5
+    # budget: forward-looking, see Section 12.1 — NOT enforced by MVP, documented
+    # here so rollout go/no-go gates have a home. Emitted-metric thresholds the
+    # operator checks manually today; candidate for enforcement in a later version.
+    budget:
+      max_new_p95_latency_ratio: 1.0          # new p95 / legacy p95 ceiling (1.0 = no worse)
+      max_new_error_rate_ratio: 1.0           # new 5xx rate / legacy 5xx rate ceiling
+      max_mismatch_rate: 0.001                # parity ceiling (fraction of compared requests)
+```
+
+Local flags file:
+
+```yaml
+# flags.local.yaml
+migration.get-device.rollout_percentage: 0
+migration.get-device.shadow_enabled: true
+```
+
+### 5.3 Validation
+
+`validate-config` performs **semantic** validation, not just parse:
+
+- Upstream URLs are well-formed absolute URLs with a supported scheme (`http`/`https`).
+- Rollout percentages are within 0–100.
+- Timeouts are positive and sane.
+- Route IDs are unique.
+- Route modes are known enum values.
+- `contract` references resolve to an existing file and route fragment.
+- A route does not declare **both** a `contract` reference and an inline behavioral `comparison.json` block.
+- All JSONPath expressions (in contract or inline) are within the supported subset (Section 7.4).
+- `fail_safe_mode` is a valid mode.
+- A route in `failover_to_legacy` mode whose `match.methods` include non-idempotent methods (POST, and PATCH unless declared idempotent) **must** set `failover_safe: true` explicitly, or validation fails. This forces an operator to consciously affirm that auto-failover is safe for that route (Section 6.5).
+- `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
+
+Validation failures must name the offending field and route.
+
+---
+
+## 6. Route Modes
+
+Limen implements five modes. Each route declares exactly one.
+
+### 6.1 `shadow_legacy_primary`
+
+- Primary request → **legacy**; legacy response returned to client.
+- For **eligible** read requests, a shadow request → **new** (fire-and-forget).
+- Compare legacy vs. new after normalization; emit metrics/logs/sampled diffs.
+- **Shadow or comparison failure never affects the client response.**
+
+**Shadow eligibility (all must hold):**
+
+- Method is `GET` or `HEAD`.
+- Comparison is enabled for the route.
+- Request body is absent or below the configured buffer limit.
+- Shadow concurrency limit not exceeded (if configured).
+- Shutdown is not in progress.
+
+Writes are **never** shadowed by default.
+
+### 6.2 `legacy_only`
+
+- Request → legacy only. Return legacy response. No new traffic.
+
+### 6.3 `new_only`
+
+- Request → new only. Return new response. (Used post-cutover or for endpoints with no legacy equivalent.)
+
+### 6.4 `percentage_split`
+
+- Resolve rollout percentage from flags.
+- Deterministically select legacy or new by hashing `route_id + ':' + assignment_key` into bucket 0–9999; if bucket `< percentage * 100`, choose new, else legacy.
+- Missing assignment key → configured fallback (`request_random` in MVP).
+- Optionally shadow the non-primary upstream if configured.
+- Circuit-breaker / fail-safe can override the new selection toward legacy.
+
+### 6.5 `failover_to_legacy`
+
+- Prefer **new** as primary.
+- Fall back to legacy when new fails, times out, or the circuit is open.
+- **Non-idempotent writes are never auto-failed-over by default.** A request that may have already taken effect on the new service (a non-idempotent POST) must **not** be retried against legacy, because the side effect could be applied twice (e.g. a resource created on both). This is a load-bearing safety guarantee.
+- Auto-failover for a route is gated by the route's **`failover_safe`** flag (Section 5.2):
+  - `failover_safe: false` (default): on new-side failure, Limen returns the failure to the client rather than silently retrying on legacy. The circuit breaker may still *route subsequent* requests to legacy (that is a routing decision, not a retry of an in-flight request), but the **failed request itself is not replayed**.
+  - `failover_safe: true`: the route's operations are affirmed idempotent (GET/HEAD/PUT/DELETE, or a write the team has made idempotent), and Limen may retry the failed request against legacy.
+- Validation **requires** `failover_safe: true` to be set explicitly on any `failover_to_legacy` route whose methods include non-idempotent verbs (Section 5.3), so the safety decision is always conscious rather than defaulted.
+
+> **Distinction that matters:** *routing* the next request to legacy because the circuit is open is always safe — no request is executed twice. *Retrying an in-flight request* that already hit new is only safe when the operation is idempotent. `failover_safe` governs the second, dangerous case; the circuit breaker governs the first, safe one.
+
+---
+
+## 7. Comparison Engine
+
+### 7.1 Hybrid comparison strategy
+
+1. Normalize legacy and new responses (Section 7.2).
+2. Hash the normalized representations (`blake3`).
+3. If hashes match → record a **match**, no diff generated.
+4. If hashes differ **and** both bodies are JSON → generate a JSON-aware structural diff.
+5. If bodies are non-JSON → record a **body mismatch** without structural diff.
+6. Sample and **redact** detailed diffs before logging.
+
+Default comparison dimensions: **HTTP status** and **normalized body**. Headers are compared **only** when explicitly listed in the contract's `compare_headers`.
+
+### 7.2 Normalization (runs before hashing and diffing)
+
+Supported transformations, all driven by the merged contract rules:
+
+- Parse JSON to a value tree; **sort object keys canonically**.
+- **Remove ignored JSON paths** (`ignore_paths`).
+- **Redact configured JSON paths** for diff output (`redact_paths`).
+- **Sort arrays** by a configured key (`sort_arrays`).
+- **Treat configured arrays as unordered sets** (`unordered_arrays`).
+- **Normalize timestamps** to a configured precision (`normalize_timestamps`).
+- **Map equivalent enum aliases** (`enum_aliases`).
+
+Normalization must be deterministic and order-independent in its result.
+
+### 7.3 Diff output
+
+A mismatch log entry includes bounded, redacted differences:
+
+```json
+{
+  "event": "limen.response_mismatch",
+  "route_id": "get-device",
+  "request_id": "...",
+  "method": "GET",
+  "path_template": "/devices/{id}",
+  "primary_upstream": "legacy",
+  "legacy_status": 200,
+  "new_status": 200,
+  "legacy_latency_ms": 23,
+  "new_latency_ms": 31,
+  "comparison": {
+    "status_match": true,
+    "body_hash_match": false,
+    "diff_kind": "json",
+    "differences": [
+      { "path": "$.device.name", "legacy": "A", "new": "B" }
+    ]
+  }
+}
+```
+
+Diff output must respect a **maximum difference count** and a **maximum value length**, and apply redaction **before** anything is logged.
+
+### 7.4 Supported JSONPath subset (hard MVP boundary)
+
+To keep normalization fast and predictable, Limen supports a **documented subset** of JSONPath, identical to what Pharos supports, so contracts are portable:
+
+- `$.field`
+- `$.nested.field`
+- `$.items[*].field` (wildcard over array elements)
+
+Anything outside this subset is a **validation error** at config/contract load time. The subset may be expanded later, in lockstep across Limen and Pharos.
+
+### 7.5 Redaction scope
+
+Redaction applies to **every** output surface: console logs, structured logs, JSON diff output, and (in the broader system) any artifact. Configurable targets:
+
+- **Header names** (e.g. `authorization`, `cookie`, `x-api-key`).
+- **JSON paths** (e.g. `$.token`, `$.password`, `$.user.email`).
+- **Query parameters** (e.g. `access_token`).
+
+No secret value may appear in any log or diff. A test explicitly proves this (Section 12).
+
+---
+
+## 8. Feature Flags
+
+### 8.1 Provider trait
+
+Flags sit behind a trait so providers are swappable and future providers (LaunchDarkly-style remote, etc.) drop in without touching routing:
+
+```rust
+#[async_trait]
+pub trait FlagProvider: Send + Sync {
+    /// Return the current value for a flag key, or None if unset.
+    async fn get(&self, key: &str) -> Option<FlagValue>;
+    /// Provider health, including last successful refresh time and staleness.
+    fn health(&self) -> FlagProviderHealth;
+}
+```
+
+### 8.2 MVP providers
+
+- **Static** — values from config; never stale.
+- **File** — polling refresh from a YAML file; keeps **last known good** on invalid update; tracks staleness.
+- **Redis** — polling (and/or pub-sub) refresh from a Redis key space under `key_prefix`; keeps **last known good** on connection failure; tracks staleness. **Designed so a LaunchDarkly-style remote provider can be added later behind the same trait.**
+
+### 8.3 Behavior
+
+- Missing flag → default.
+- Invalid/failed refresh → keep last known good; do **not** crash.
+- Track last successful refresh time.
+- If stale beyond `stale_ttl_ms` → apply `fail_safe_mode` (usually `legacy_only`).
+- Emit provider-health and staleness metrics/logs.
+
+---
+
+## 9. Resilience
+
+### 9.1 Circuit breaker
+
+Per-route, per-(new-)upstream breaker:
+
+- **Closed** by default.
+- **Opens** when failure rate exceeds `failure_rate_threshold` after at least `min_requests`.
+- While **open**, avoid the new upstream; route to legacy when fail-safe allows.
+- After `open_duration_ms`, transition to **half-open**.
+- **Half-open**: allow up to `half_open_max_requests` trial requests; success closes the circuit, failure reopens it.
+- Failures = 5xx responses, connection failures, timeouts (configurable).
+- Emit state-transition metrics and logs.
+
+### 9.2 Timeouts
+
+Per-route `primary_ms` and `shadow_ms`. The shadow timeout must **never** extend the client-visible latency — shadow work is off the client path.
+
+### 9.3 Shadow concurrency limiting
+
+A global and/or per-route limit on concurrent in-flight shadow requests. When exceeded, shadows are **skipped** (not queued unboundedly), incrementing `shadow_skipped{reason="concurrency_limit"}`. Protects the proxy and the new upstream under load.
+
+### 9.4 Bounded buffers
+
+All buffering (request bodies, comparison buffering) is bounded by configured limits. The proxy must never buffer unbounded data; over-limit bodies fall back to streaming with comparison skipped.
+
+---
+
+## 10. Observability
+
+### 10.1 Metrics (Prometheus)
+
+Required metrics (avoid high-cardinality labels — **no** user IDs, tenant IDs, request IDs, or raw full paths in labels; use route IDs and path templates):
+
+- Request count by route, method, primary upstream, status class.
+- Request latency by route and upstream.
+- Upstream error count by route and upstream.
+- Timeout count by route and upstream.
+- Shadow request count.
+- Shadow skipped count by reason.
+- Comparison attempted count.
+- Comparison match count.
+- Comparison mismatch count.
+- Comparison skipped count by reason (`response_too_large`, `not_sampled`, `non_json`, `concurrency_limit`, …).
+- Diff sampled count.
+- Circuit-breaker state by route and upstream.
+- Feature-flag provider health.
+- Feature-flag staleness age.
+- Active in-flight request count.
+
+### 10.2 Structured logs
+
+Via `tracing`. Include: request/trace ID, route ID, route mode, primary upstream selected, rollout decision and assignment-key type, upstream status codes, latencies, comparison result, error reason when relevant. Propagate standard trace headers where practical. Redact per Section 7.5.
+
+### 10.3 Health endpoints
+
+- `/health/live` — process is running.
+- `/health/ready` — config is valid **and** required providers are usable or in a safe fallback mode. Readiness should degrade (not just hard-fail) when a provider is stale-but-within-fail-safe.
+
+---
+
+## 11. Deployment Models
+
+Limen is written deployment-agnostic and must support both first-class:
+
+### 11.1 Sidecar / co-located (two processes on one box)
+
+Limen and one or both upstreams run on the same host (e.g. legacy and new processes side by side). Upstreams may be `http://localhost:PORT`. Common in staging and incremental production rollouts.
+
+### 11.2 Standalone edge proxy (targets different clusters)
+
+Limen runs toward the edge and routes to legacy and new running in **separate clusters** behind internal DNS/load balancers, typically over **TLS**. This is the higher-scale deployment and the one to keep in mind for the streaming-path performance posture.
+
+### 11.3 Local development (Docker Compose / static binary)
+
+A `examples/docker-compose.yaml` brings up mock legacy + new + Limen for a day-one trial. Limen also builds as a single static binary for local use without Docker.
+
+### 11.4 TLS posture
+
+- **MVP: TLS to upstreams** (HTTPS legacy/new), with certificate verification on by default and an optional custom CA bundle for internal PKI.
+- **Post-MVP: client-side TLS termination** at Limen (serving HTTPS to clients) — explicitly a future expansion, designed for but not implemented in MVP.
+
+---
+
+## 12. Performance Targets (SLOs)
+
+All targets are **starting defaults**, measured in a controlled local benchmark (`benches/`), and **explicitly team-tunable per deployment environment**:
+
+| Path | Metric | Target |
+|---|---|---|
+| Streaming path, comparison disabled | p50 added latency | < 1 ms |
+| Streaming path, comparison disabled | p99 added latency | < 5 ms |
+| Buffer-for-compare path (bodies < ~64 KB) | p50 added latency | < 3 ms |
+| Buffer-for-compare path (bodies < ~64 KB) | p99 added latency | < 15 ms |
+| Shadow dispatch | client-visible added latency | **0 by design** (fire-and-forget; asserted statistically unchanged with shadow on) |
+| Throughput (single instance, comparison disabled) | RPS | No measurable ceiling below upstream saturation in local benchmark; **stretch:** > 10k RPS on commodity hardware |
+
+The shadow-dispatch guarantee is **architectural, not a percentile**: the client must receive the primary response without waiting on shadow or comparison work. An acceptance test asserts client latency is statistically unchanged when shadowing is toggled on.
+
+### 12.1 Rollout budget (forward-looking; not enforced by MVP)
+
+The SLOs above govern **Limen's own overhead** — whether the proxy is healthy. A separate concern, owned by the migration process rather than the proxy, is whether the **new service** is performing acceptably enough to advance a rollout: its latency and error rate relative to legacy, and the response parity (mismatch) rate.
+
+In the MVP these are **operator-checked gates against emitted metrics**, not enforced controls — the migration runbook defines the go/no-go thresholds and the operator reads them off Limen's metrics before raising a rollout percentage. To give those gates a home and signal the intended direction, the route config accepts an **optional `budget` block** (Section 5.2):
+
+```yaml
+budget:
+  max_new_p95_latency_ratio: 1.0     # new p95 / legacy p95 ceiling
+  max_new_error_rate_ratio: 1.0      # new 5xx rate / legacy 5xx rate ceiling
+  max_mismatch_rate: 0.001           # parity ceiling (fraction of compared requests)
+```
+
+**MVP behavior:** Limen validates the block's shape (Section 5.3) and may surface budget status in logs/metrics, but does **not** automatically gate or roll back on it. A documented post-MVP enhancement is to have Limen *enforce* the budget — e.g. automatically refusing to honor a rollout-percentage increase, or auto-lowering the effective percentage, when a route is out of budget. The two distinct latency obligations — *proxy overhead within SLO* and *new-service latency within budget* — must not be conflated; both must hold for a route to be considered green.
+
+---
+
+## 13. Relationship to Pharos (Functional Test Suite)
+
+- **Separate repositories, no build-time dependency.** Either project can be built and run alone.
+- **Shared behavioral contract (Section 4) is the integration point**, as a documented schema and vocabulary — *not* shared code in the MVP.
+- **Workflow:** AI drafts a contract from service docs/traffic → **Pharos** validates and refines it deterministically (catching over-normalization and missed real differences) → **Limen** consumes the refined contract unchanged for production shadow comparison and rollout.
+- **Same JSONPath subset and same normalization vocabulary** on both sides, so a contract Pharos validated behaves identically in Limen.
+- **Readiness signal:** passing Pharos scenarios for a route is a precondition for enabling Limen shadow mode, and a clean Limen shadow mismatch rate is a precondition for raising the rollout percentage.
+- **Deferred:** a shared `normalization` crate/package extracted from both could replace the shared-contract-by-schema approach later, once both sides are stable. Designed toward, not built now.
+
+---
+
+## 14. Phased Build Plan
+
+Each phase ends with passing tests and a runnable artifact. Build incrementally and run tests after each major component.
+
+### Phase 0 — Scaffold
+- Cargo project, module skeleton (Section 3.5), CI (build + test + clippy + fmt), README stub, license.
+- `clap` CLI with `run`, `validate-config`, `print-routes`, `check-contract` (stubs that wire up).
+- **Done when:** `cargo build`, `cargo test` (empty), `cargo clippy` all pass in CI.
+
+### Phase 1 — Config + contract loading and validation
+- Config model, layered loading, semantic `validate-config`.
+- Contract model, loading (YAML/JSON), reference resolution, merge logic, `check-contract`.
+- **Done when:** valid configs/contracts load; invalid ones fail with field-level messages; merge and conflict rules enforced; unit tests cover the validation matrix.
+
+### Phase 2 — HTTP core: routing + legacy_only + new_only
+- Data-plane listener, route matcher (longest-prefix), upstream client with TLS + timeouts, streaming proxy core, body limits.
+- Control-plane listener with `/health/live`, `/health/ready` (basic).
+- Implement `legacy_only` and `new_only`.
+- **Done when:** integration tests prove legacy-only and new-only proxying preserve method/path/query/headers and return the correct upstream response; streaming works; body limit enforced.
+
+### Phase 3 — Comparison engine
+- Normalization (all transforms), supported JSONPath subset, `blake3` hashing, bounded+redacted JSON diff, redaction (headers/paths/query).
+- **Done when:** unit tests cover normalization, hashing, diff, and redaction per Section 12 test plan; redaction-in-diff test passes.
+
+### Phase 4 — Shadowing: shadow_legacy_primary
+- Shadow eligibility, fire-and-forget dispatch, buffer-for-compare vs. streaming decision, per-request sampling, shadow concurrency limit, comparison wiring, mismatch logging.
+- **Done when:** integration tests prove shadow match, shadow mismatch (with diff at sample_rate 1.0), shadow timeout (client unaffected), and that shadow/comparison failures never affect the client.
+
+### Phase 5 — Flags + rollout: percentage_split
+- `FlagProvider` trait, static + file + Redis providers, last-known-good, staleness, fail-safe.
+- Deterministic rollout hashing + bucket assignment; assignment-key extraction + fallback.
+- **Done when:** rollout determinism, distribution, missing-key fallback, file reload, Redis reload, and stale-flag fail-safe all tested (unit + integration).
+
+### Phase 6 — Resilience: circuit breaker + failover_to_legacy
+- Circuit-breaker state machine; `failover_to_legacy` mode; `failover_safe` gating with validation that rejects non-idempotent `failover_to_legacy` routes lacking the flag.
+- **Done when:** breaker transition unit tests pass; integration test shows new-upstream failures open the circuit and traffic returns to legacy.
+
+### Phase 7 — Observability hardening + graceful shutdown
+- Full metric set, structured logging fields, trace-header propagation, readiness degradation logic.
+- Graceful shutdown: stop accepting, drain in-flight primary up to timeout, cancel/skip shadow, clean exit.
+- **Done when:** metrics-scrape test confirms metric names/labels and absence of high-cardinality/secret labels; graceful-shutdown integration test passes.
+
+### Phase 8 — Performance validation + examples + docs
+- `criterion` benchmarks for the SLO table; Docker Compose example; README that runs from a fresh checkout; example config, flags, and contract files.
+- **Done when:** benchmarks run and report against SLO defaults; `docker-compose up` yields a working local proxy + mocks; README instructions verified from clean checkout.
+
+---
+
+## 15. Acceptance Criteria (Definition of Done)
+
+The MVP is **done** when all of the following hold:
+
+### 15.1 Functionality
+- All five route modes work: `legacy_only`, `new_only`, `shadow_legacy_primary`, `percentage_split`, `failover_to_legacy`.
+- Method, path, query string, and relevant headers are preserved through the proxy.
+- No matching route returns a configured not-found response.
+
+### 15.2 Configuration & contract
+- Config loads from defaults < file < env < CLI.
+- `validate-config` performs semantic validation with field-level errors.
+- Contracts load from YAML/JSON, references resolve, behavioral rules merge with operational config, conflict rules enforced.
+- `check-contract` validates a contract and its JSONPath compliance.
+- Missing required config for the selected mode fails with an actionable error.
+
+### 15.3 Comparison
+- Hybrid hash-then-diff comparison works.
+- Normalization: canonical key order, ignore paths, redact paths, sort arrays by key, unordered arrays, timestamp normalization, enum aliases — all work.
+- Supported JSONPath subset enforced; out-of-subset paths rejected at load.
+- JSON object key order never causes a false mismatch.
+- Diffs are bounded (max count, max value length) and redacted; **no secret appears in any diff or log**.
+
+### 15.4 Shadowing
+- Client always receives the legacy (primary) response in shadow mode.
+- Eligible reads are shadowed to new; writes are not shadowed by default.
+- Shadow or comparison failure never affects the client request or latency.
+- Per-request sampling gates buffering and detailed diffing.
+
+### 15.5 Rollout & flags
+- Static, file, and Redis providers work; missing flags use defaults; invalid refresh keeps last known good; staleness beyond TTL triggers fail-safe.
+- Rollout is deterministic per assignment key; 0% → all legacy, 100% → all new (subject to breaker/fail-safe); intermediate splits distribute within tolerance.
+- File and Redis flag changes take effect **without restart**.
+
+### 15.6 Resilience
+- Circuit breaker opens on threshold breach, routes to legacy while open, transitions through half-open, and reopens/closes correctly.
+- `failover_to_legacy` falls back on new failure/timeout/open-circuit, and does not replay a failed in-flight request against legacy unless the route sets `failover_safe: true`; validation rejects a `failover_to_legacy` route with non-idempotent methods that omits the flag.
+
+### 15.7 Observability & ops
+- Prometheus `/metrics` exposes the full required metric set with low-cardinality labels.
+- Structured logs include the required fields and are redacted.
+- `/health/live` and `/health/ready` behave per spec, including readiness degradation under safe fallback.
+- Graceful shutdown drains in-flight primary requests and exits cleanly.
+
+### 15.8 Performance
+- Benchmarks exist and report against the SLO defaults; shadow dispatch adds no client-visible latency (statistically asserted).
+
+### 15.9 Quality gates
+- `cargo build` and `cargo test` pass.
+- `cargo clippy` is clean (deny warnings in CI) and `cargo fmt --check` passes.
+- Example local config + Docker Compose run successfully.
+- README instructions work from a fresh checkout.
+- Limen fails safe to legacy under all configured uncertainty conditions.
+
+---
+
+## 16. Test Plan
+
+### 16.1 Unit tests
+
+**Route matching:** exact match; prefix match; longest prefix wins; method-specific over method-agnostic; header predicate (if implemented); no match; duplicate route IDs fail validation.
+
+**Config validation:** valid minimal config; invalid upstream URL; percentage out of range; missing required route fields; invalid timeouts; out-of-subset JSONPath; duplicate route IDs; unknown route mode; both contract-ref and inline behavioral block on one route fails; `failover_to_legacy` route with non-idempotent methods missing `failover_safe: true` fails; out-of-range `budget` values fail.
+
+**Contract:** valid contract loads; reference resolves; merge of defaults + per-route comparison; conflict (contract + inline) rejected; `check-contract` flags out-of-subset paths.
+
+**Rollout decision:** 0% → legacy; 100% → new; same key → same upstream; different keys distribute; missing key → fallback; open circuit overrides new → legacy.
+
+**Flag provider:** static returns configured; missing → default; file loads; file refresh picks up changes; file keeps last known good on invalid update; Redis loads; Redis refresh; Redis keeps last known good on connection failure; stale TTL → fail-safe.
+
+**JSON normalization:** key-order independence; ignore paths removed; redact paths masked in diff; nested ignore paths; arrays ordered by default; arrays sorted by key; unordered arrays compare as sets; timestamp precision normalization; enum alias mapping; invalid JSON falls back to raw/body comparison per config.
+
+**Hash comparison:** equivalent normalized bodies → same hash; different → different; ignored fields don't change hash; status mismatch detected even if body matches.
+
+**JSON diff:** added field; removed field; changed scalar; changed nested object; array differences; respects max difference count; respects max value length; redaction applied before logging.
+
+**Circuit breaker:** consecutive failures open; successes keep closed; open → half-open after duration; half-open success closes; half-open failure reopens; metrics reflect transitions.
+
+### 16.2 Integration tests (with `wiremock` / test servers)
+
+- **legacy_only:** client gets legacy body; legacy gets one request; new gets zero; metrics show primary=legacy.
+- **new_only:** client gets new body; new gets one request; metrics show primary=new.
+- **shadow_match:** legacy and new return equivalent JSON with different key order; client gets legacy; both upstreams hit; comparison records match; no diff emitted.
+- **shadow_mismatch:** legacy `{"name":"A"}`, new `{"name":"B"}`; client gets legacy; mismatch recorded; sampled diff includes changed path at sample_rate 1.0.
+- **shadow_timeout:** legacy fast, new sleeps beyond shadow timeout; client gets legacy quickly; shadow-timeout metric increments; client latency unaffected.
+- **percentage_rollout:** assignment header `x-tenant-id`, rollout 50; same tenant stable; many tenants ≈ 50/50 within tolerance; metrics reflect selection.
+- **circuit_breaker:** new returns repeated 500s; circuit opens after threshold; subsequent requests route to legacy; state metric flips to open.
+- **failover_safe:** in `failover_to_legacy`, a route with `failover_safe: true` and a failing new upstream replays the request against legacy and the client gets the legacy response; a route with `failover_safe: false` returns the new-side failure to the client (the in-flight request is **not** replayed), while the circuit breaker still routes *subsequent* requests to legacy.
+- **flag_reload:** file provider starts rollout 0, file updated to 100; proxy observes change without restart; routing follows; refresh-success log/metric.
+- **stale_flag_failsafe:** file provider valid, then file invalid; before TTL uses last known good; after TTL applies fail-safe; stale metrics/logs emitted.
+- **graceful_shutdown:** start long-running primary request; send SIGTERM; proxy stops accepting; in-flight completes within timeout; clean exit.
+
+### 16.3 Security & privacy tests
+
+- Header redaction (`authorization`, `cookie`) — secrets absent from logs.
+- JSON-field redaction (`$.token`, `$.user.email`) — masked in diff output.
+- Metric cardinality — many unique path/header IDs do not appear as labels.
+- (If debug endpoints exist) disabled by default; sensitive config not exposed.
+
+### 16.4 Performance tests (`criterion`)
+
+- Baseline streaming overhead vs. SLO defaults.
+- Shadow overhead — client-visible latency statistically unchanged with shadow on.
+- Large-body behavior — bodies above `max_body_bytes` skip comparison (`response_too_large`), no unbounded buffering, client still served.
+- High concurrency — stable, bounded memory, shadows throttled/skipped, no panics or task leaks.
+
+---
+
+## 17. Implementation Guidance
+
+Prioritize a clean MVP with strong tests over breadth or cleverness.
+
+**Safe default choices:**
+- Default to legacy when uncertain.
+- Never block client responses on shadow/comparison.
+- Never shadow writes by default.
+- Never replay a failed in-flight request against legacy unless the route is explicitly `failover_safe: true` (idempotent). Routing *subsequent* requests to legacy via the circuit breaker is fine; *retrying the same request* that may already have hit new is not, unless idempotent.
+- Never log sensitive values by default.
+- Bound all buffers.
+- Validate configuration and contracts at startup; refuse to start on invalid config.
+
+**Keep abstractions modular** behind traits — `FlagProvider`, the comparison/normalization engine, route decisioning, and the upstream client — so future work (Redis→LaunchDarkly, a shared normalization crate, a Pingora data-plane, client TLS termination, advanced write migration) can land without reshaping the core.
+
+**Prioritize, in order:** correctness and safe fallback; clear configuration and error messages; deterministic behavior; observability; performance on the streaming path.
+
+**Before coding:** read this spec end to end. Then implement phase by phase (Section 14), running tests after each major component.
