@@ -75,6 +75,11 @@ pub enum JsonPathError {
     /// adjacent to another wildcard). The supported form is `$.items[*].field`.
     #[error("`[*]` must sit between fields, as in `$.items[*].field`")]
     MisplacedWildcard,
+    /// More than one `[*]` wildcard. The documented MVP subset allows at most
+    /// one, so contracts stay portable to Pharos; the subset may be widened
+    /// later in lockstep.
+    #[error("at most one `[*]` wildcard is supported (the documented MVP subset)")]
+    TooManyWildcards,
 }
 
 /// Characters allowed in an unquoted field name within the subset.
@@ -133,6 +138,14 @@ pub fn parse(input: &str) -> Result<JsonPath, JsonPathError> {
     {
         return Err(JsonPathError::MisplacedWildcard);
     }
+    if segments
+        .iter()
+        .filter(|s| matches!(s, Segment::Wildcard))
+        .count()
+        > 1
+    {
+        return Err(JsonPathError::TooManyWildcards);
+    }
 
     Ok(JsonPath {
         raw: input.to_string(),
@@ -177,17 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_multiple_wildcards_between_fields() {
-        assert_eq!(
-            parse("$.a[*].b[*].c").unwrap().segments(),
-            &[
-                Segment::Field("a".into()),
-                Segment::Wildcard,
-                Segment::Field("b".into()),
-                Segment::Wildcard,
-                Segment::Field("c".into()),
-            ]
-        );
+    fn rejects_more_than_one_wildcard() {
+        // The documented MVP subset allows a single wildcard; nested wildcards
+        // stay out until the subset is widened in lockstep with Pharos.
+        assert_eq!(parse("$.a[*].b[*].c"), Err(JsonPathError::TooManyWildcards));
     }
 
     #[test]

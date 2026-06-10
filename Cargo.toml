@@ -61,6 +61,8 @@ async-trait = "0.1"
 futures = "0.3"
 rand = "0.9"
 url = "2"
+# RFC3339 parsing for timestamp normalization (convert to UTC before truncating).
+time = { version = "0.3", features = ["parsing"] }
 
 [dev-dependencies]
 wiremock = "0.6"
