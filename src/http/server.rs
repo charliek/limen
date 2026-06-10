@@ -15,6 +15,7 @@ use tokio::net::TcpListener;
 use tracing::info;
 
 use crate::config::model::Config;
+use crate::flags::FlagProvider;
 use crate::health::endpoints as health_endpoints;
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
@@ -33,6 +34,7 @@ struct Inner {
     client: UpstreamClient,
     shadow_limiter: ShadowLimiter,
     observer: Arc<dyn ShadowObserver>,
+    flags: Arc<dyn FlagProvider>,
     shutting_down: AtomicBool,
 }
 
@@ -44,6 +46,7 @@ impl AppState {
         client: UpstreamClient,
         shadow_limiter: ShadowLimiter,
         observer: Arc<dyn ShadowObserver>,
+        flags: Arc<dyn FlagProvider>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -51,6 +54,7 @@ impl AppState {
                 client,
                 shadow_limiter,
                 observer,
+                flags,
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -74,6 +78,11 @@ impl AppState {
     /// The shadow/comparison observer.
     pub fn observer(&self) -> Arc<dyn ShadowObserver> {
         self.inner.observer.clone()
+    }
+
+    /// The feature-flag provider.
+    pub fn flags(&self) -> &Arc<dyn FlagProvider> {
+        &self.inner.flags
     }
 
     /// Whether shutdown has begun (shadows are not started during shutdown).
@@ -106,7 +115,14 @@ pub fn build_state_with_observer(
     let routes = RouteTable::build(config, comparisons)?;
     let client = UpstreamClient::build(&config.upstream_tls)?;
     let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
-    Ok(AppState::new(routes, client, shadow_limiter, observer))
+    let flags = crate::flags::build(&config.flags)?;
+    Ok(AppState::new(
+        routes,
+        client,
+        shadow_limiter,
+        observer,
+        flags,
+    ))
 }
 
 /// The data-plane router: a single fallback handler proxies every request.
@@ -135,6 +151,22 @@ pub async fn serve(config: Config, base_dir: &Path) -> anyhow::Result<()> {
             config.metrics.listen_addr
         )
     })?;
+
+    // Start the flag-refresh loop (file/Redis providers). Do one initial,
+    // best-effort refresh so values are populated before serving; a failure
+    // leaves the provider stale (fail-safe to legacy) until a refresh succeeds.
+    let flags = state.flags().clone();
+    if let Some(interval) = flags.refresh_interval() {
+        flags.refresh().await;
+        // Phase 7: tie this background task into graceful shutdown (hold its
+        // JoinHandle / abort on drain). It is detached for now.
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                flags.refresh().await;
+            }
+        });
+    }
 
     let data_app = data_plane_router(state.clone());
     let control_app = control_plane_router();

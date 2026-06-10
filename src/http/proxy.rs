@@ -49,7 +49,7 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
         return not_found();
     };
 
-    let upstream = decision::primary_upstream(route.mode);
+    let upstream = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
     let base = match upstream {
         Upstream::Legacy => route.legacy_upstream.as_ref(),
         Upstream::New => route.new_upstream.as_ref(),

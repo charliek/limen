@@ -64,6 +64,17 @@ url = "2"
 # RFC3339 parsing for timestamp normalization (convert to UTC before truncating).
 time = { version = "0.3", features = ["parsing"] }
 
+# Redis flag provider (async; cached + polled). `redis` is the more ubiquitous
+# of the two options in the spec; the provider sits behind the FlagProvider
+# trait so a remote provider can replace it later. rustls TLS so `rediss://`
+# URLs (which config validation accepts) actually connect.
+redis = { version = "0.27", features = [
+    "tokio-comp",
+    "connection-manager",
+    "tokio-rustls-comp",
+    "tls-rustls-webpki-roots",
+] }
+
 [dev-dependencies]
 wiremock = "0.6"
 tempfile = "3"

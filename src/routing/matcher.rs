@@ -8,7 +8,7 @@
 use thiserror::Error;
 use url::Url;
 
-use crate::config::model::{Config, RouteMode, TimeoutsConfig};
+use crate::config::model::{Config, RolloutConfig, RouteMode, TimeoutsConfig};
 use crate::contract::model::ComparisonRules;
 
 /// Failure compiling a route into the route table.
@@ -63,6 +63,8 @@ pub struct CompiledRoute {
     pub timeouts: TimeoutsConfig,
     /// Resolved comparison policy.
     pub comparison: RouteComparison,
+    /// Rollout settings (`percentage_split` only).
+    pub rollout: Option<RolloutConfig>,
 }
 
 impl CompiledRoute {
@@ -108,6 +110,7 @@ impl RouteTable {
                 new_upstream: parse_opt(&r.id, r.new_upstream.as_deref())?,
                 timeouts: r.timeouts.clone(),
                 comparison,
+                rollout: r.rollout.clone(),
             });
         }
         // Longest prefix first; `sort_by_key` is stable, so equal-length

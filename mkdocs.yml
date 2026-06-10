@@ -88,6 +88,7 @@ nav:
       - Quickstart: getting-started/quickstart.md
   - Guides:
       - Comparison & Contracts: guides/comparison-and-contracts.md
+      - Flags & Rollout: guides/flags-and-rollout.md
   - Reference:
       - Architecture: reference/architecture.md
       - CLI: reference/cli.md
