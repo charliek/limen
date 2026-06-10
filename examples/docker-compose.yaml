@@ -1,0 +1,38 @@
+# A day-one local trial of Limen: two mock upstreams (legacy + new) behind the
+# proxy. Brings up a working proxy + mocks with one command.
+#
+#   docker compose -f examples/docker-compose.yaml up --build
+#
+# Then, in another shell:
+#   curl localhost:8080/                      # served by legacy ("hello from LEGACY")
+#   curl -s localhost:9090/metrics | grep limen_comparisons_total
+#   curl localhost:9090/health/ready          # -> ready
+#
+# `legacy` and `new` return different bodies, so the shadow comparison records a
+# mismatch — visible in limen_comparisons_total{result="mismatch"} and in the
+# proxy's logs — while the client always sees legacy's response.
+
+name: limen-demo
+
+services:
+  legacy:
+    image: hashicorp/http-echo
+    command: ["-text=hello from LEGACY", "-listen=:5678"]
+
+  new:
+    image: hashicorp/http-echo
+    command: ["-text=hello from NEW", "-listen=:5678"]
+
+  limen:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    command: ["run", "-c", "/etc/limen/limen.yaml"]
+    volumes:
+      - ./compose-config.yaml:/etc/limen/limen.yaml:ro
+    ports:
+      - "8080:8080" # data plane
+      - "9090:9090" # control plane (/metrics, /health/*)
+    depends_on:
+      - legacy
+      - new

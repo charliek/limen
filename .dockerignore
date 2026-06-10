@@ -1,0 +1,9 @@
+# Keep the build context small and the image clean.
+/target
+/site-build
+.git
+.github
+.venv
+docs
+*.md
+!README.md

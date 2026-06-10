@@ -39,9 +39,51 @@ but have no build-time dependency on each other.
 
 ## Status
 
-Limen is built in phases (see the [spec](docs/limen_spec.md), Section 14). This
-repository tracks that build; consult `CLAUDE.md` for the conventions and the
-[documentation site](#documentation) for usage.
+Limen implements the full MVP from the [spec](docs/limen_spec.md): all five
+route modes, the shadow comparison engine, deterministic percentage rollout, the
+circuit breaker and `failover_to_legacy`, Prometheus metrics, structured logs,
+health endpoints, and bounded graceful shutdown. See the spec's Section 14 for
+the phased build and `CLAUDE.md` for conventions.
+
+## Quickstart
+
+### Docker Compose — no toolchain needed
+
+Bring up the proxy in front of two mock upstreams with one command:
+
+```bash
+docker compose -f examples/docker-compose.yaml up --build
+```
+
+Then, in another shell:
+
+```bash
+curl localhost:8080/                                      # served by legacy
+curl -s localhost:9090/metrics | grep limen_comparisons   # shadow comparison counts
+curl localhost:9090/health/ready                          # -> ready
+```
+
+`legacy` and `new` return different bodies on purpose, so the shadow comparison
+records a *mismatch* — Limen detecting a behavioral difference while the client
+still gets legacy's response. That is the core loop, end to end.
+
+### From a checkout
+
+With [mise](https://mise.jdx.dev) installed (it reads `.mise.toml` to pin the
+Rust toolchain):
+
+```bash
+mise install                                              # install pinned Rust
+mise exec -- cargo build --release                        # -> target/release/limen
+./target/release/limen validate-config -c config/limen.example.yaml
+./target/release/limen print-routes    -c config/limen.example.yaml
+```
+
+`validate-config` and `print-routes` work against the example as-is. `run` also
+expects reachable upstreams (the example uses `*.internal` placeholders) and the
+flag file named by `flags.file.path` — copy `config/flags.example.yaml` to
+`./flags.local.yaml`, or flag-driven routes simply fail safe to legacy. For a
+self-contained *running* proxy, use the Compose demo above.
 
 ## Build
 
@@ -70,15 +112,37 @@ Configuration is layered (defaults < file < environment < CLI). See the
 [configuration reference](docs/reference/config-reference.md) and the example
 config under `config/`.
 
+## Performance
+
+Limen's per-request CPU work is microsecond-scale. `cargo bench` runs the
+criterion suite (`benches/proxy_overhead.rs`), which microbenchmarks the two
+dominant added costs against the spec's SLO budgets (§12). These are component
+measurements, not end-to-end added latency, but they show the work sits far
+inside the budget — representative figures from a developer laptop:
+
+| Component | Time | SLO budget (added latency) |
+|---|---|---|
+| Route match (longest prefix) | ~5 ns | streaming p50 < 1 ms |
+| Compare ~2 KB JSON bodies | ~35 µs | buffer-compare p50 < 3 ms |
+| Compare ~40 KB JSON bodies | ~0.7 ms | buffer-compare p50 < 3 ms |
+
+```bash
+mise exec -- cargo bench
+```
+
+Production traffic that isn't sampled for comparison takes the zero-copy
+streaming path; only the sampled fraction pays the buffer-and-compare cost, and
+even that stays well inside budget for bodies up to the configured limit.
+
 ## Documentation
 
 The full site lives under `docs/` and builds with `mkdocs-material`
 (`mise exec -- make docs-serve` → http://127.0.0.1:7071):
 
-- **Getting started** — installation, quickstart, configuration
-- **Guides** — route modes, comparison & contracts, flags & rollout,
-  resilience, observability, deployment
-- **Reference** — architecture, CLI, config, contract, metrics
+- **Getting started** — installation, quickstart
+- **Guides** — comparison & contracts, flags & rollout, resilience & failover,
+  observability & operations, deployment
+- **Reference** — architecture, CLI, config, contract
 - **Specifications** — the full Limen spec, the migration runbook, and the
   PR/FAQ that motivate the design
 

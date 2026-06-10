@@ -25,6 +25,17 @@ fn example_config_loads_and_validates() {
 }
 
 #[test]
+fn docker_compose_demo_config_validates() {
+    // The config the Compose demo mounts must always load and validate, so
+    // `docker compose up` yields a working proxy.
+    let path = repo_path("examples/compose-config.yaml");
+    let loaded = config::load::load(&path, &ConfigOverrides::default())
+        .expect("compose demo config should load");
+    config::validate(&loaded.config, &loaded.base_dir)
+        .expect("compose demo config should pass semantic validation");
+}
+
+#[test]
 fn example_contract_check_passes() {
     let path = repo_path("config/contracts/example-service.contract.yaml");
     let contract = contract_load::load_file(&path).expect("example contract should load");

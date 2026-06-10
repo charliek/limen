@@ -1,0 +1,35 @@
+# Limen config for the Docker Compose demo (examples/docker-compose.yaml).
+#
+# One route in shadow mode: the client is served by `legacy`, while `new` is
+# shadowed and the two responses are compared. The two mock upstreams return
+# deliberately different bodies, so the comparison records a *mismatch* — which
+# is the point: it shows Limen detecting a behavioral difference without ever
+# affecting the client's response.
+
+server:
+  listen_addr: "0.0.0.0:8080" # data plane (what you curl)
+  graceful_shutdown_timeout_ms: 10000
+  request_body_limit_bytes: 1048576
+
+metrics:
+  listen_addr: "0.0.0.0:9090" # control plane: /metrics, /health/*
+  path: "/metrics"
+
+# No `flags` block: defaults to the static provider (never stale), which is all
+# a shadow route needs.
+
+routes:
+  - id: "echo"
+    match:
+      methods: ["GET"]
+      path_prefix: "/"
+    legacy_upstream: "http://legacy:5678" # served to the client
+    new_upstream: "http://new:5678" # shadowed and compared
+    mode: "shadow_legacy_primary"
+    timeouts:
+      primary_ms: 2000
+      shadow_ms: 2000
+    comparison:
+      enabled: true
+      sample_rate: 1.0 # compare every eligible read, for the demo
+      max_body_bytes: 65536
