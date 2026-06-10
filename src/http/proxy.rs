@@ -1,10 +1,12 @@
 //! The streaming proxy core: match a route, choose the primary upstream, relay
 //! the request, and stream the response back.
 //!
-//! This is the default zero-copy path (spec §3.3): neither the request nor the
-//! response body is buffered. Limen observes only method, path, status, and
-//! headers. Shadowing and comparison (Phase 4) layer on top without touching
-//! this client-facing relay.
+//! The default path is zero-copy (spec §3.3): neither the request nor the
+//! response body is buffered. When a `shadow_legacy_primary` route samples a
+//! request for comparison, the primary (legacy) response is buffered (bounded)
+//! so it can be both served to the client *and* compared against a fire-and-
+//! forget shadow to the new upstream — the shadow and comparison never delay or
+//! affect the client response.
 
 use std::time::Duration;
 
@@ -16,6 +18,10 @@ use tracing::warn;
 use url::Url;
 
 use super::server::AppState;
+use crate::compare::Captured;
+use crate::http::body::{self, Buffered};
+use crate::http::shadow::{self, ShadowRequest};
+use crate::observability::SkipReason;
 use crate::routing::{decision, Upstream};
 
 /// Hop-by-hop headers (RFC 7230 §6.1) that must not be forwarded across a proxy.
@@ -75,8 +81,23 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     };
     let route_id = route.id.clone();
     let timeout = Duration::from_millis(route.timeouts.primary_ms);
+    let request_headers = filter_headers(&parts.headers, Direction::Request);
 
-    let headers = filter_headers(&parts.headers, Direction::Request);
+    // Prepare a shadow plan *before* sending the primary, so the method and
+    // headers are available to replay. Only `shadow_legacy_primary` + sampled
+    // eligible reads, not while shutting down, and not for a request that
+    // carries a body — the shadow replays an empty GET/HEAD, so a request body
+    // could not be reproduced faithfully (spec §6.1).
+    let shadow = if state.is_shutting_down() || request_has_body(&parts.headers) {
+        None
+    } else {
+        route
+            .new_upstream
+            .as_ref()
+            .and_then(|new_base| build_upstream_url(new_base, path, uri.query()))
+            .and_then(|new_url| shadow::plan(route, &method, &request_headers, new_url))
+    };
+
     let upstream_body = reqwest::Body::wrap_stream(body.into_data_stream());
 
     // The timeout bounds time-to-response (connect + send + first byte), not the
@@ -86,12 +107,12 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
         .client()
         .inner()
         .request(method, url)
-        .headers(headers)
+        .headers(request_headers)
         .body(upstream_body)
         .send();
 
     match tokio::time::timeout(timeout, send).await {
-        Ok(Ok(resp)) => relay_response(resp),
+        Ok(Ok(resp)) => primary_succeeded(&state, &route_id, shadow, resp).await,
         Ok(Err(error)) => {
             // Phase 6 adds failover; for now an upstream failure is a 502.
             warn!(route = %route_id, upstream = upstream.as_str(), %error, "upstream request failed");
@@ -105,6 +126,72 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
                 "upstream did not respond before the primary timeout",
             );
             gateway_timeout()
+        }
+    }
+}
+
+/// Handle a successful primary response: stream it directly, or — when the
+/// request is shadow-planned — buffer it (bounded) to both serve the client and
+/// compare against a fire-and-forget shadow to the new upstream.
+async fn primary_succeeded(
+    state: &AppState,
+    route_id: &str,
+    shadow: Option<ShadowRequest>,
+    resp: reqwest::Response,
+) -> Response {
+    // No shadow planned, or shutdown began while the primary was in flight:
+    // stream the primary straight through, no buffering, no comparison.
+    let Some(shadow_req) = shadow.filter(|_| !state.is_shutting_down()) else {
+        return relay_response(resp);
+    };
+    // Buffering the primary here adds bounded latency on the *sampled* fraction
+    // of requests (the documented buffer-for-compare overhead, spec §12) — the
+    // shadow dispatch and comparison themselves stay off the client path. A
+    // stream-tee that buffers a copy while streaming to the client (zero added
+    // latency even when sampled) is a documented future enhancement.
+    //
+    // Reserve a shadow slot before buffering; if saturated, stream and skip.
+    let Some(permit) = state.shadow_limiter().try_acquire() else {
+        state
+            .observer()
+            .shadow_skipped(route_id, SkipReason::ConcurrencyLimit);
+        return relay_response(resp);
+    };
+
+    let status = resp.status();
+    // Compare against the *unfiltered* upstream headers; filter only for the
+    // client-facing response.
+    let upstream_headers = resp.headers().clone();
+    let client_headers = filter_headers(&upstream_headers, Direction::Response);
+
+    match body::buffer_or_stream(resp, shadow_req.max_body_bytes).await {
+        Buffered::Full(bytes) => {
+            let legacy = Captured {
+                status: status.as_u16(),
+                headers: upstream_headers,
+                body: bytes.clone(),
+            };
+            shadow::spawn(
+                state.client().clone(),
+                state.observer(),
+                shadow_req,
+                legacy,
+                permit,
+            );
+            response_from_parts(status, client_headers, Body::from(bytes))
+        }
+        Buffered::TooLarge(streamed) => {
+            // The primary body is too large to buffer for comparison; serve it
+            // (prefix + remaining stream) and skip the comparison.
+            state
+                .observer()
+                .comparison_skipped(route_id, SkipReason::ResponseTooLarge);
+            drop(permit);
+            response_from_parts(status, client_headers, streamed)
+        }
+        Buffered::Error => {
+            drop(permit);
+            bad_gateway()
         }
     }
 }
@@ -159,6 +246,20 @@ fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
     out
 }
 
+/// Whether the request carries a body, per its framing headers — a non-zero
+/// `content-length` or any `transfer-encoding`. Used to keep a body-bearing
+/// GET/HEAD out of shadowing (the shadow replays an empty request).
+fn request_has_body(headers: &HeaderMap) -> bool {
+    if headers.contains_key("transfer-encoding") {
+        return true;
+    }
+    headers
+        .get("content-length")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+        .is_some_and(|n| n > 0)
+}
+
 /// Lowercased header names listed in any `Connection` header's comma-separated
 /// token list — these are connection-specific and must not be forwarded.
 fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
@@ -176,7 +277,11 @@ fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
 fn relay_response(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let headers = filter_headers(resp.headers(), Direction::Response);
-    let body = Body::from_stream(resp.bytes_stream());
+    response_from_parts(status, headers, Body::from_stream(resp.bytes_stream()))
+}
+
+/// Assemble a client response from a status, headers, and body.
+fn response_from_parts(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
     let mut response = Response::new(body);
     *response.status_mut() = status;
     *response.headers_mut() = headers;
@@ -250,6 +355,22 @@ mod tests {
         assert!(out.get("content-length").is_none());
         assert!(out.get("x-secret").is_none()); // named by Connection
         assert_eq!(out.get("x-tenant-id").unwrap(), "t-1");
+    }
+
+    #[test]
+    fn detects_request_body_presence() {
+        let mut none = HeaderMap::new();
+        assert!(!request_has_body(&none));
+        none.insert("content-length", HeaderValue::from_static("0"));
+        assert!(!request_has_body(&none));
+
+        let mut with_len = HeaderMap::new();
+        with_len.insert("content-length", HeaderValue::from_static("12"));
+        assert!(request_has_body(&with_len));
+
+        let mut chunked = HeaderMap::new();
+        chunked.insert("transfer-encoding", HeaderValue::from_static("chunked"));
+        assert!(request_has_body(&chunked));
     }
 
     #[test]

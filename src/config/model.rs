@@ -48,6 +48,14 @@ pub struct ServerConfig {
     pub graceful_shutdown_timeout_ms: u64,
     /// Hard cap on buffered request bodies.
     pub request_body_limit_bytes: u64,
+    /// Maximum concurrent in-flight shadow requests across all routes; excess
+    /// shadows are skipped rather than queued (spec §9.3). `0` means no limit.
+    #[serde(default = "default_shadow_concurrency_limit")]
+    pub shadow_concurrency_limit: usize,
+}
+
+fn default_shadow_concurrency_limit() -> usize {
+    100
 }
 
 impl Default for ServerConfig {
@@ -56,6 +64,7 @@ impl Default for ServerConfig {
             listen_addr: "0.0.0.0:8080".to_string(),
             graceful_shutdown_timeout_ms: 10_000,
             request_body_limit_bytes: 1_048_576,
+            shadow_concurrency_limit: default_shadow_concurrency_limit(),
         }
     }
 }

@@ -11,6 +11,8 @@
 
 pub mod decision;
 pub mod matcher;
+pub mod resolve;
 
 pub use decision::{primary_upstream, Upstream};
-pub use matcher::{CompiledRoute, RouteTable};
+pub use matcher::{CompiledRoute, RouteComparison, RouteTable};
+pub use resolve::resolve_comparisons;

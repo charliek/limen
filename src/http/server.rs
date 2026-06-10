@@ -6,6 +6,8 @@
 //! against real upstreams without binding the production ports.
 
 use std::net::SocketAddr;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use axum::Router;
@@ -16,6 +18,8 @@ use crate::config::model::Config;
 use crate::health::endpoints as health_endpoints;
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
+use crate::observability::{MetricsObserver, ShadowObserver, Stats};
+use crate::resilience::ShadowLimiter;
 use crate::routing::RouteTable;
 
 /// Shared, cheaply-cloneable application state for the data plane.
@@ -27,13 +31,28 @@ pub struct AppState {
 struct Inner {
     routes: RouteTable,
     client: UpstreamClient,
+    shadow_limiter: ShadowLimiter,
+    observer: Arc<dyn ShadowObserver>,
+    shutting_down: AtomicBool,
 }
 
 impl AppState {
-    /// Construct from a compiled route table and an upstream client.
-    pub fn new(routes: RouteTable, client: UpstreamClient) -> Self {
+    /// Construct application state from its parts. The observer owns the stats
+    /// counters; the control plane reads them via [`ShadowObserver::snapshot`].
+    pub fn new(
+        routes: RouteTable,
+        client: UpstreamClient,
+        shadow_limiter: ShadowLimiter,
+        observer: Arc<dyn ShadowObserver>,
+    ) -> Self {
         Self {
-            inner: Arc::new(Inner { routes, client }),
+            inner: Arc::new(Inner {
+                routes,
+                client,
+                shadow_limiter,
+                observer,
+                shutting_down: AtomicBool::new(false),
+            }),
         }
     }
 
@@ -46,13 +65,48 @@ impl AppState {
     pub fn client(&self) -> &UpstreamClient {
         &self.inner.client
     }
+
+    /// The shadow concurrency limiter.
+    pub fn shadow_limiter(&self) -> &ShadowLimiter {
+        &self.inner.shadow_limiter
+    }
+
+    /// The shadow/comparison observer.
+    pub fn observer(&self) -> Arc<dyn ShadowObserver> {
+        self.inner.observer.clone()
+    }
+
+    /// Whether shutdown has begun (shadows are not started during shutdown).
+    pub fn is_shutting_down(&self) -> bool {
+        self.inner.shutting_down.load(Ordering::Relaxed)
+    }
+
+    /// Mark shutdown as begun.
+    pub fn begin_shutdown(&self) {
+        self.inner.shutting_down.store(true, Ordering::Relaxed);
+    }
 }
 
-/// Build the data-plane application state from a (validated) config.
-pub fn build_state(config: &Config) -> anyhow::Result<AppState> {
-    let routes = RouteTable::build(config)?;
+/// Build the data-plane application state from a (validated) config, using the
+/// production [`MetricsObserver`]. `base_dir` resolves relative contract refs.
+pub fn build_state(config: &Config, base_dir: &Path) -> anyhow::Result<AppState> {
+    let observer: Arc<dyn ShadowObserver> =
+        Arc::new(MetricsObserver::new(Arc::new(Stats::default())));
+    build_state_with_observer(config, base_dir, observer)
+}
+
+/// Build application state with a caller-supplied observer (used by tests to
+/// capture comparison outcomes).
+pub fn build_state_with_observer(
+    config: &Config,
+    base_dir: &Path,
+    observer: Arc<dyn ShadowObserver>,
+) -> anyhow::Result<AppState> {
+    let comparisons = crate::routing::resolve_comparisons(config, base_dir)?;
+    let routes = RouteTable::build(config, comparisons)?;
     let client = UpstreamClient::build(&config.upstream_tls)?;
-    Ok(AppState::new(routes, client))
+    let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
+    Ok(AppState::new(routes, client, shadow_limiter, observer))
 }
 
 /// The data-plane router: a single fallback handler proxies every request.
@@ -66,8 +120,8 @@ pub fn control_plane_router() -> Router {
 }
 
 /// Bind both listeners and serve until a shutdown signal arrives.
-pub async fn serve(config: Config) -> anyhow::Result<()> {
-    let state = build_state(&config)?;
+pub async fn serve(config: Config, base_dir: &Path) -> anyhow::Result<()> {
+    let state = build_state(&config, base_dir)?;
 
     let data_addr: SocketAddr = config.server.listen_addr.parse().map_err(|e| {
         anyhow::anyhow!(
@@ -94,7 +148,16 @@ pub async fn serve(config: Config) -> anyhow::Result<()> {
         "limen listening"
     );
 
-    let data = axum::serve(data_listener, data_app).with_graceful_shutdown(shutdown_signal());
+    // On the signal, flag shutdown so the data plane stops starting new
+    // shadows, then let axum drain in-flight requests.
+    let data_shutdown = {
+        let state = state.clone();
+        async move {
+            shutdown_signal().await;
+            state.begin_shutdown();
+        }
+    };
+    let data = axum::serve(data_listener, data_app).with_graceful_shutdown(data_shutdown);
     let control =
         axum::serve(control_listener, control_app).with_graceful_shutdown(shutdown_signal());
 

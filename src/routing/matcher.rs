@@ -9,8 +9,9 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::model::{Config, RouteMode, TimeoutsConfig};
+use crate::contract::model::ComparisonRules;
 
-/// Failure compiling a route's upstream URL into the route table.
+/// Failure compiling a route into the route table.
 #[derive(Debug, Error)]
 pub enum RouteBuildError {
     /// An upstream URL did not parse (should not happen post-validation).
@@ -23,6 +24,24 @@ pub enum RouteBuildError {
         /// The parse error.
         source: url::ParseError,
     },
+    /// The resolved-comparison list did not match the route count.
+    #[error("internal error: {0} comparisons for {1} routes")]
+    ComparisonCountMismatch(usize, usize),
+}
+
+/// A route's resolved comparison policy: the operational gate plus the merged
+/// behavioral rules the comparison engine consumes (spec §4.4). Resolved once at
+/// startup from the contract reference or inline rules.
+#[derive(Debug, Clone)]
+pub struct RouteComparison {
+    /// Whether comparison is enabled for this route.
+    pub enabled: bool,
+    /// Fraction of eligible requests to buffer and compare.
+    pub sample_rate: f64,
+    /// Skip comparison above this body size.
+    pub max_body_bytes: usize,
+    /// Merged behavioral rules (what to compare and how).
+    pub rules: ComparisonRules,
 }
 
 /// A route compiled for matching and proxying.
@@ -42,6 +61,8 @@ pub struct CompiledRoute {
     pub new_upstream: Option<Url>,
     /// Per-route timeouts.
     pub timeouts: TimeoutsConfig,
+    /// Resolved comparison policy.
+    pub comparison: RouteComparison,
 }
 
 impl CompiledRoute {
@@ -58,10 +79,21 @@ pub struct RouteTable {
 }
 
 impl RouteTable {
-    /// Compile the config's routes into a table. URLs are parsed here.
-    pub fn build(config: &Config) -> Result<Self, RouteBuildError> {
+    /// Compile the config's routes into a table: parse upstream URLs and pair
+    /// each route with its already-resolved comparison policy (see
+    /// [`super::resolve`]). Pure — no contract I/O happens here.
+    pub fn build(
+        config: &Config,
+        comparisons: Vec<RouteComparison>,
+    ) -> Result<Self, RouteBuildError> {
+        if comparisons.len() != config.routes.len() {
+            return Err(RouteBuildError::ComparisonCountMismatch(
+                comparisons.len(),
+                config.routes.len(),
+            ));
+        }
         let mut routes = Vec::with_capacity(config.routes.len());
-        for r in &config.routes {
+        for (r, comparison) in config.routes.iter().zip(comparisons) {
             routes.push(CompiledRoute {
                 id: r.id.clone(),
                 methods: r
@@ -75,6 +107,7 @@ impl RouteTable {
                 legacy_upstream: parse_opt(&r.id, r.legacy_upstream.as_deref())?,
                 new_upstream: parse_opt(&r.id, r.new_upstream.as_deref())?,
                 timeouts: r.timeouts.clone(),
+                comparison,
             });
         }
         // Longest prefix first; `sort_by_key` is stable, so equal-length
@@ -115,10 +148,12 @@ fn parse_opt(id: &str, url: Option<&str>) -> Result<Option<Url>, RouteBuildError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::routing::resolve::resolve_comparisons;
 
     fn table(yaml: &str) -> RouteTable {
         let config: Config = serde_yaml::from_str(yaml).unwrap();
-        RouteTable::build(&config).unwrap()
+        let comparisons = resolve_comparisons(&config, std::path::Path::new(".")).unwrap();
+        RouteTable::build(&config, comparisons).unwrap()
     }
 
     const ROUTES: &str = r#"

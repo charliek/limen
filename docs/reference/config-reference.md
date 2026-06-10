@@ -32,6 +32,7 @@ routes: [ … ]          # the routing table
 | `listen_addr` | string | `0.0.0.0:8080` | Data-plane bind address (`IP:port`). |
 | `graceful_shutdown_timeout_ms` | int | `10000` | Drain window on shutdown; must be > 0. |
 | `request_body_limit_bytes` | int | `1048576` | Hard cap on buffered request bodies; must be > 0. |
+| `shadow_concurrency_limit` | int | `100` | Max concurrent in-flight shadow requests across all routes; excess shadows are skipped, not queued (`0` = no limit). |
 
 ## `metrics`
 

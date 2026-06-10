@@ -121,7 +121,7 @@ async fn cmd_run(args: ConfigArgs) -> anyhow::Result<()> {
     let loaded = load_and_validate(&args)?;
     // Bind the data-plane and control-plane listeners and serve until a
     // shutdown signal.
-    crate::http::serve(loaded.config).await
+    crate::http::server::serve(loaded.config, &loaded.base_dir).await
 }
 
 fn cmd_validate_config(args: ConfigArgs) -> anyhow::Result<()> {

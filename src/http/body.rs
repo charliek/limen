@@ -1,67 +1,58 @@
-//! Bounded body buffering and body-limit enforcement (spec §3.3, §9.4).
+//! Bounded body buffering for the buffer-for-compare path (spec §3.3, §9.4).
 //!
-//! The streaming path never buffers, so unbounded bodies are fine there. The
-//! buffer-for-compare path (Phase 4) and any request-body buffering must be
-//! *bounded*: [`to_bytes_limited`] reads a body into memory but fails fast with
-//! [`BodyError::TooLarge`] the moment it would exceed the configured cap, so the
-//! caller can fall back to streaming with comparison skipped.
+//! The streaming path never buffers, so unbounded bodies are fine there. When a
+//! response is buffered for comparison it must be *bounded*: [`buffer_or_stream`]
+//! reads up to the configured cap and, the moment a body would exceed it, falls
+//! back to streaming (the already-read prefix chained with the remaining
+//! upstream stream) so the client still receives the complete body while the
+//! comparison is skipped. Exercised end-to-end by the shadow integration tests.
 
 use axum::body::Body;
 use bytes::{Bytes, BytesMut};
-use futures::StreamExt;
-use thiserror::Error;
+use futures::{stream, StreamExt};
 
-/// Why buffering a body failed.
-#[derive(Debug, Error)]
-pub enum BodyError {
-    /// The body exceeded the configured byte limit.
-    #[error("body exceeded the {limit}-byte limit")]
-    TooLarge {
-        /// The limit that was exceeded.
-        limit: usize,
-    },
-    /// The underlying body stream errored.
-    #[error("error reading body: {0}")]
-    Read(String),
+/// The outcome of buffering a response body for comparison.
+pub enum Buffered {
+    /// The body fit within the limit and is fully buffered.
+    Full(Bytes),
+    /// The body exceeded the limit; comparison must be skipped. The carried
+    /// [`Body`] streams the already-read prefix followed by the remaining
+    /// upstream stream, so the client still receives the full, unbuffered body.
+    TooLarge(Body),
+    /// The upstream body stream errored before completing.
+    Error,
 }
 
-/// Read a body fully into memory, failing with [`BodyError::TooLarge`] as soon
-/// as it would exceed `limit` bytes (so an over-limit body is never fully
-/// buffered).
-pub async fn to_bytes_limited(body: Body, limit: usize) -> Result<Bytes, BodyError> {
-    let mut stream = body.into_data_stream();
-    let mut buf = BytesMut::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(|e| BodyError::Read(e.to_string()))?;
-        if buf.len() + chunk.len() > limit {
-            return Err(BodyError::TooLarge { limit });
+/// Buffer a reqwest response body up to `limit` bytes for comparison, falling
+/// back to streaming (prefix + remainder) the moment it would exceed the limit —
+/// so an over-limit body is never fully buffered, yet the client is still served
+/// the complete body. A body of exactly `limit` bytes is buffered; `limit + 1`
+/// streams.
+pub async fn buffer_or_stream(resp: reqwest::Response, limit: usize) -> Buffered {
+    let mut stream = resp.bytes_stream();
+    let mut chunks: Vec<Bytes> = Vec::new();
+    let mut total = 0usize;
+
+    loop {
+        match stream.next().await {
+            Some(Ok(chunk)) => {
+                total += chunk.len();
+                chunks.push(chunk);
+                if total > limit {
+                    // Over the limit: hand the client the buffered prefix
+                    // chained with the rest of the still-open stream.
+                    let prefix = stream::iter(chunks.into_iter().map(Ok::<Bytes, reqwest::Error>));
+                    return Buffered::TooLarge(Body::from_stream(prefix.chain(stream)));
+                }
+            }
+            Some(Err(_)) => return Buffered::Error,
+            None => break,
         }
+    }
+
+    let mut buf = BytesMut::with_capacity(total);
+    for chunk in chunks {
         buf.extend_from_slice(&chunk);
     }
-    Ok(buf.freeze())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn reads_body_within_limit() {
-        let body = Body::from("hello");
-        let bytes = to_bytes_limited(body, 1024).await.unwrap();
-        assert_eq!(&bytes[..], b"hello");
-    }
-
-    #[tokio::test]
-    async fn rejects_body_over_limit() {
-        let body = Body::from("0123456789");
-        let err = to_bytes_limited(body, 4).await.unwrap_err();
-        assert!(matches!(err, BodyError::TooLarge { limit: 4 }));
-    }
-
-    #[tokio::test]
-    async fn empty_body_is_ok() {
-        let bytes = to_bytes_limited(Body::empty(), 0).await.unwrap();
-        assert!(bytes.is_empty());
-    }
+    Buffered::Full(buf.freeze())
 }

@@ -16,5 +16,6 @@ pub mod body;
 pub mod client;
 pub mod proxy;
 pub mod server;
+pub mod shadow;
 
 pub use server::{serve, AppState};

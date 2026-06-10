@@ -17,9 +17,23 @@ pub fn config_from_yaml(yaml: &str) -> Config {
     serde_yaml::from_str(yaml).expect("valid test config")
 }
 
-/// Build the data-plane router for a config.
+/// Build the data-plane router for a config (no contract refs in tests, so the
+/// base dir is irrelevant).
 pub fn router(config: &Config) -> Router {
-    let state = limen::http::server::build_state(config).expect("build state");
+    let state =
+        limen::http::server::build_state(config, std::path::Path::new(".")).expect("build state");
+    limen::http::server::data_plane_router(state)
+}
+
+/// Build a data-plane router with a caller-supplied shadow observer (for tests
+/// that assert on comparison outcomes).
+pub fn router_with_observer(
+    config: &Config,
+    observer: std::sync::Arc<dyn limen::observability::ShadowObserver>,
+) -> Router {
+    let state =
+        limen::http::server::build_state_with_observer(config, std::path::Path::new("."), observer)
+            .expect("build state");
     limen::http::server::data_plane_router(state)
 }
 

@@ -8,4 +8,8 @@
 //! Submodules:
 //! - `circuit_breaker` — the per-route breaker state machine (Phase 6).
 //! - `timeouts` — primary / shadow timeout helpers (Phase 6).
-//! - `concurrency` — shadow concurrency limiting (Phase 4/6).
+//! - [`concurrency`] — shadow concurrency limiting (Phase 4).
+
+pub mod concurrency;
+
+pub use concurrency::{ShadowLimiter, ShadowPermit};
