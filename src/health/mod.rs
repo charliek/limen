@@ -6,5 +6,10 @@
 //! (Section 10.3).
 //!
 //! Submodules:
-//! - `endpoints` — the `/health/live` and `/health/ready` handlers (Phase 2).
-//! - `readiness` — readiness evaluation (Phase 2/7).
+//! - [`endpoints`] — the `/health/live` and `/health/ready` handlers (Phase 2).
+//! - [`readiness`] — readiness evaluation (Phase 2/7).
+
+pub mod endpoints;
+pub mod readiness;
+
+pub use readiness::Readiness;

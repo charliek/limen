@@ -5,6 +5,12 @@
 //! the rollout percentage, and circuit-breaker state (Section 3.4).
 //!
 //! Submodules:
-//! - `matcher` — method + longest-prefix matching (Phase 2).
-//! - `decision` — mode + rollout + breaker → upstream choice (Phase 2/5/6).
+//! - [`matcher`] — method + longest-prefix matching (Phase 2).
+//! - [`decision`] — mode + rollout + breaker → upstream choice (Phase 2/5/6).
 //! - `rollout` — deterministic hashing and bucket assignment (Phase 5).
+
+pub mod decision;
+pub mod matcher;
+
+pub use decision::{primary_upstream, Upstream};
+pub use matcher::{CompiledRoute, RouteTable};

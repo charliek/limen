@@ -119,13 +119,9 @@ fn load_and_validate(args: &ConfigArgs) -> anyhow::Result<LoadedConfig> {
 
 async fn cmd_run(args: ConfigArgs) -> anyhow::Result<()> {
     let loaded = load_and_validate(&args)?;
-    // Serving (binding the two listeners) lands in Phase 2; configuration now
-    // loads and validates so this command already fails fast on bad input.
-    anyhow::bail!(
-        "`limen run` serving is not implemented yet (lands in Phase 2); config {} validated OK with {} route(s)",
-        args.config.display(),
-        loaded.config.routes.len()
-    );
+    // Bind the data-plane and control-plane listeners and serve until a
+    // shutdown signal.
+    crate::http::serve(loaded.config).await
 }
 
 fn cmd_validate_config(args: ConfigArgs) -> anyhow::Result<()> {
