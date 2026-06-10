@@ -1,0 +1,106 @@
+# Example Limen configuration.
+#
+# Validate it with:  limen validate-config -c config/limen.example.yaml
+# Inspect routes:    limen print-routes    -c config/limen.example.yaml
+#
+# Configuration is layered (spec §5.1): built-in defaults < this file <
+# environment (LIMEN_*) < CLI flags.
+
+server:
+  listen_addr: "0.0.0.0:8080" # data plane (proxied client traffic)
+  graceful_shutdown_timeout_ms: 10000
+  request_body_limit_bytes: 1048576 # hard cap on buffered request bodies
+
+metrics:
+  listen_addr: "0.0.0.0:9090" # control plane: /metrics, /health/*
+  path: "/metrics"
+
+upstream_tls:
+  verify_certificates: true
+  ca_bundle_path: null # optional custom CA bundle for internal PKI
+
+flags:
+  provider: "file" # static | file | redis
+  file:
+    path: "./flags.local.yaml"
+    refresh_interval_ms: 1000
+  stale_ttl_ms: 30000 # after this, apply fail_safe_mode
+  fail_safe_mode: "legacy_only"
+
+routes:
+  # A read being observed in shadow mode: legacy serves the client, new is
+  # shadowed, responses are compared using the referenced contract.
+  - id: "get-device"
+    match:
+      methods: ["GET"]
+      path_prefix: "/devices/"
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "shadow_legacy_primary"
+    contract: "./contracts/example-service.contract.yaml#get-device"
+    timeouts:
+      primary_ms: 2000
+      shadow_ms: 2000
+    comparison:
+      enabled: true
+      sample_rate: 0.1 # buffer + compare ~10% of eligible reads
+      max_body_bytes: 262144
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 0.25
+      min_requests: 20
+      open_duration_ms: 30000
+      half_open_max_requests: 5
+    budget:
+      max_new_p95_latency_ratio: 1.0
+      max_new_error_rate_ratio: 1.0
+      max_mismatch_rate: 0.001
+
+  # A list endpoint mid-rollout: deterministic per-tenant split, raised at
+  # runtime via the rollout flag.
+  - id: "list-devices"
+    match:
+      methods: ["GET"]
+      path_prefix: "/devices"
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "percentage_split"
+    contract: "./contracts/example-service.contract.yaml#list-devices"
+    rollout:
+      percentage_flag: "migration.list-devices.rollout_percentage"
+      default_percentage: 0
+      assignment_key:
+        header: "x-tenant-id"
+        fallback: "request_random"
+    timeouts:
+      primary_ms: 2000
+      shadow_ms: 2000
+    comparison:
+      enabled: true
+      sample_rate: 0.05
+      max_body_bytes: 524288
+
+  # A write moved via percentage split (never shadowed): each request goes to
+  # exactly one implementation, so the side effect is never doubled.
+  - id: "create-device"
+    match:
+      methods: ["POST"]
+      path_prefix: "/devices"
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "percentage_split"
+    contract: "./contracts/example-service.contract.yaml#create-device"
+    rollout:
+      percentage_flag: "migration.create-device.rollout_percentage"
+      default_percentage: 0
+      assignment_key:
+        header: "x-tenant-id"
+        fallback: "request_random"
+
+  # A health endpoint with no legacy equivalent: served only by the new service.
+  - id: "health"
+    match:
+      methods: ["GET"]
+      path_prefix: "/health"
+    new_upstream: "https://new-device.internal"
+    mode: "new_only"

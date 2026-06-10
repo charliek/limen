@@ -6,6 +6,11 @@
 //! fail-safe mode applies.
 //!
 //! Submodules:
-//! - `provider` — the `FlagProvider` trait and `FlagValue` (Phase 5).
+//! - [`provider`] — the `FlagValue` type (Phase 1); the `FlagProvider` trait
+//!   and implementations follow in Phase 5.
 //! - `static_provider`, `file_provider`, `redis_provider` — implementations.
 //! - `health` — provider health and staleness tracking.
+
+pub mod provider;
+
+pub use provider::FlagValue;

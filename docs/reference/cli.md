@@ -62,7 +62,7 @@ JSONPath-subset compliance of every path it contains. This lets the
 AI → Pharos → Limen loop confirm a freshly drafted contract is Limen-consumable
 before wiring it into a route. It produces the **same** verdict Pharos's
 `check-contract` would, since both implement the identical
-[JSONPath subset](../limen_spec.md) (§7.4).
+[JSONPath subset](contract-reference.md#supported-jsonpath-subset).
 
 ## Configuration sources & precedence
 

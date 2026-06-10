@@ -1,0 +1,75 @@
+# Behavioral contract for the example "device-service" migration.
+#
+# Drafted from OpenAPI + captured traffic, refined by Pharos runs, and consumed
+# unchanged by Limen for shadow comparison (spec §4). It owns *what to compare
+# and how* — never operational concerns like sample_rate, which live in the
+# Limen route config.
+version: 1
+service: device-service
+description: >
+  Example behavioral contract. Every normalization rule is a deliberate,
+  justified exception to the default posture of "compare everything".
+
+# Service-wide defaults. Per-route `comparison` blocks merge on top of these:
+# scalar fields are overridden, list fields are concatenated.
+defaults:
+  compare_status: true
+  compare_body: true
+  compare_headers: []                # headers are compared only if listed
+  json:
+    ignore_paths:
+      - "$.metadata.requestId"       # per-request, non-deterministic
+      - "$.metadata.generatedAt"     # server "now" timestamp
+    redact_paths:
+      - "$.user.email"               # never appears in a log or diff
+      - "$.token"
+    normalize_timestamps:
+      - path: "$.createdAt"
+        precision: seconds            # legacy emits millis, new emits seconds
+    enum_aliases:
+      - path: "$.status"
+        aliases: { ACTIVE: enabled, INACTIVE: disabled }
+
+routes:
+  - id: "get-device"
+    match:
+      methods: ["GET"]
+      path_template: "/devices/{id}"
+    comparison:
+      json:
+        ignore_paths:
+          - "$.device.lastSeenAt"     # merged with the service defaults
+    expectations:
+      typical_status: 200
+      notes: >
+        Legacy returns 200 with an empty body on soft-deleted devices; the new
+        service returns 404. This is an intentional change — the corresponding
+        Pharos scenario is tagged intentional-change.
+    tags: [read, migration-ready]
+
+  - id: "list-devices"
+    match:
+      methods: ["GET"]
+      path_template: "/devices"
+    comparison:
+      json:
+        sort_arrays:
+          - path: "$.devices"
+            key: "id"                 # order is incidental; sort by stable id
+        unordered_arrays:
+          - path: "$.devices[*].permissions"
+    expectations:
+      typical_status: 200
+    tags: [read, migration-ready]
+
+  - id: "create-device"
+    match:
+      methods: ["POST"]
+      path_template: "/devices"
+    comparison:
+      json:
+        ignore_paths:
+          - "$.device.id"             # server-generated on create
+    expectations:
+      typical_status: 201
+    tags: [write]

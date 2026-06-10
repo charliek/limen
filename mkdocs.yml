@@ -89,6 +89,8 @@ nav:
   - Reference:
       - Architecture: reference/architecture.md
       - CLI: reference/cli.md
+      - Configuration: reference/config-reference.md
+      - Contract: reference/contract-reference.md
   - Development:
       - Setup: development/setup.md
       - Testing: development/testing.md

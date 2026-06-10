@@ -36,10 +36,10 @@ routes:
       max_body_bytes: 262144
 ```
 
-The full set of fields is in the [Limen spec](../limen_spec.md) (§5.2); the
-behavioral comparison rules live in a separate, portable
-[contract](../limen_spec.md) (§4). Dedicated reference pages for both land as
-those features are implemented.
+The full set of fields is in the
+[configuration reference](../reference/config-reference.md); the behavioral
+comparison rules live in a separate, portable
+[contract](../reference/contract-reference.md).
 
 ## 2. Validate before you run
 

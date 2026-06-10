@@ -1,0 +1,12 @@
+# Example feature-flags file for the `file` provider.
+#
+# Copy to the path referenced by `flags.file.path` in your Limen config
+# (the example config points at ./flags.local.yaml). Limen polls this file on
+# `refresh_interval_ms`, keeps the last known good values on an invalid edit,
+# and applies the fail-safe mode once the values are stale beyond `stale_ttl_ms`.
+#
+# Keys are flag names; values are numbers, booleans, or strings.
+
+migration.list-devices.rollout_percentage: 0
+migration.create-device.rollout_percentage: 0
+migration.get-device.shadow_enabled: true
