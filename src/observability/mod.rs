@@ -1,13 +1,16 @@
 //! Observability: structured logging, Prometheus metrics, and request-id
 //! propagation.
 //!
-//! Submodules grow as the build progresses:
-//! - [`logging`] — `tracing` subscriber setup (available from Phase 0).
-//! - [`metrics`] — shadow/comparison stats + observer (Phase 4); the full
-//!   Prometheus metric set and `/metrics` endpoint land in Phase 7.
-//! - `request_id` — request/trace id extraction and propagation (Phase 7).
+//! Submodules:
+//! - [`logging`] — `tracing` subscriber setup (text or JSON).
+//! - [`metrics`] — the shadow/comparison observer (records via the facade).
+//! - [`prometheus`] — the Prometheus recorder, metric vocabulary, and emission
+//!   helpers rendered on the control-plane `/metrics` endpoint.
+//! - [`request_id`] — request/trace id extraction and propagation.
 
 pub mod logging;
 pub mod metrics;
+pub mod prometheus;
+pub mod request_id;
 
-pub use metrics::{MetricsObserver, ShadowFailure, ShadowObserver, SkipReason, Stats};
+pub use metrics::{MetricsObserver, ShadowFailure, ShadowObserver, SkipReason};

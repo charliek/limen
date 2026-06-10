@@ -137,6 +137,11 @@ impl RouteTable {
         self.routes.iter().find(|r| r.matches(method, path))
     }
 
+    /// Iterate the compiled routes (e.g. to sample per-route breaker state).
+    pub fn iter(&self) -> impl Iterator<Item = &CompiledRoute> {
+        self.routes.iter()
+    }
+
     /// Number of compiled routes.
     pub fn len(&self) -> usize {
         self.routes.len()

@@ -9,17 +9,19 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::Router;
 use tokio::net::TcpListener;
-use tracing::info;
+use tokio::sync::watch;
+use tracing::{info, warn};
 
 use crate::config::model::Config;
 use crate::flags::FlagProvider;
-use crate::health::endpoints as health_endpoints;
+use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
-use crate::observability::{MetricsObserver, ShadowObserver, Stats};
+use crate::observability::{prometheus, MetricsObserver, ShadowObserver};
 use crate::resilience::ShadowLimiter;
 use crate::routing::RouteTable;
 
@@ -30,7 +32,7 @@ pub struct AppState {
 }
 
 struct Inner {
-    routes: RouteTable,
+    routes: Arc<RouteTable>,
     client: UpstreamClient,
     shadow_limiter: ShadowLimiter,
     observer: Arc<dyn ShadowObserver>,
@@ -40,8 +42,9 @@ struct Inner {
 }
 
 impl AppState {
-    /// Construct application state from its parts. The observer owns the stats
-    /// counters; the control plane reads them via [`ShadowObserver::snapshot`].
+    /// Construct application state from its parts. The routing table is shared
+    /// (behind an `Arc`) with the control plane, which reads per-route breaker
+    /// state at scrape time; metrics otherwise flow through the global recorder.
     pub fn new(
         routes: RouteTable,
         client: UpstreamClient,
@@ -52,7 +55,7 @@ impl AppState {
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
-                routes,
+                routes: Arc::new(routes),
                 client,
                 shadow_limiter,
                 observer,
@@ -66,6 +69,11 @@ impl AppState {
     /// The compiled routing table.
     pub fn routes(&self) -> &RouteTable {
         &self.inner.routes
+    }
+
+    /// A shared handle to the routing table (for the control plane).
+    pub fn routes_arc(&self) -> Arc<RouteTable> {
+        self.inner.routes.clone()
     }
 
     /// The upstream HTTP client.
@@ -107,8 +115,7 @@ impl AppState {
 /// Build the data-plane application state from a (validated) config, using the
 /// production [`MetricsObserver`]. `base_dir` resolves relative contract refs.
 pub fn build_state(config: &Config, base_dir: &Path) -> anyhow::Result<AppState> {
-    let observer: Arc<dyn ShadowObserver> =
-        Arc::new(MetricsObserver::new(Arc::new(Stats::default())));
+    let observer: Arc<dyn ShadowObserver> = Arc::new(MetricsObserver::new());
     build_state_with_observer(config, base_dir, observer)
 }
 
@@ -140,13 +147,26 @@ pub fn data_plane_router(state: AppState) -> Router {
     Router::new().fallback(proxy::handle).with_state(state)
 }
 
-/// The control-plane router: health endpoints (and, from Phase 7, `/metrics`).
-pub fn control_plane_router() -> Router {
-    health_endpoints::router()
+/// The control-plane router: health endpoints and the Prometheus `/metrics`
+/// endpoint (served at `metrics_path`).
+pub fn control_plane_router(control: ControlState, metrics_path: &str) -> Router {
+    health_endpoints::router(control, metrics_path)
 }
 
-/// Bind both listeners and serve until a shutdown signal arrives.
+/// Bind both listeners and serve until a SIGINT/SIGTERM, then drain in-flight
+/// requests up to `server.graceful_shutdown_timeout_ms` before exiting.
 pub async fn serve(config: Config, base_dir: &Path) -> anyhow::Result<()> {
+    serve_with_shutdown(config, base_dir, shutdown_signal()).await
+}
+
+/// As [`serve`], but driven by a caller-supplied `shutdown` future instead of
+/// the OS signal — used by integration tests to trigger a deterministic drain.
+pub async fn serve_with_shutdown(
+    config: Config,
+    base_dir: &Path,
+    shutdown: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
+    let metrics_handle = prometheus::install();
     let state = build_state(&config, base_dir)?;
 
     let data_addr: SocketAddr = config.server.listen_addr.parse().map_err(|e| {
@@ -162,57 +182,99 @@ pub async fn serve(config: Config, base_dir: &Path) -> anyhow::Result<()> {
         )
     })?;
 
+    // Fan the shutdown signal out to the servers and the refresh loop.
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
     // Start the flag-refresh loop (file/Redis providers). Do one initial,
     // best-effort refresh so values are populated before serving; a failure
     // leaves the provider stale (fail-safe to legacy) until a refresh succeeds.
+    // The loop stops promptly when shutdown is signalled.
     let flags = state.flags().clone();
-    if let Some(interval) = flags.refresh_interval() {
-        flags.refresh().await;
-        // Phase 7: tie this background task into graceful shutdown (hold its
-        // JoinHandle / abort on drain). It is detached for now.
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(interval).await;
-                flags.refresh().await;
-            }
-        });
-    }
+    let refresh_task = match flags.refresh_interval() {
+        Some(interval) => {
+            flags.refresh().await;
+            let mut rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(interval) => flags.refresh().await,
+                        _ = rx.changed() => break,
+                    }
+                }
+            }))
+        }
+        None => None,
+    };
 
+    let control_state =
+        ControlState::new(state.flags().clone(), state.routes_arc(), metrics_handle);
     let data_app = data_plane_router(state.clone());
-    let control_app = control_plane_router();
+    let control_app = control_plane_router(control_state, &config.metrics.path);
 
     let data_listener = TcpListener::bind(data_addr).await?;
     let control_listener = TcpListener::bind(control_addr).await?;
     info!(
         %data_addr,
         %control_addr,
+        metrics_path = %config.metrics.path,
         routes = state.routes().len(),
         "limen listening"
     );
 
-    // On the signal, flag shutdown so the data plane stops starting new
-    // shadows, then let axum drain in-flight requests.
-    let data_shutdown = {
-        let state = state.clone();
-        async move {
-            shutdown_signal().await;
-            state.begin_shutdown();
+    let data = axum::serve(data_listener, data_app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    let control = axum::serve(control_listener, control_app)
+        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    let servers = async move { tokio::try_join!(data, control) };
+    tokio::pin!(servers);
+
+    // Serve until shutdown is requested (or a listener fails on its own).
+    tokio::select! {
+        res = &mut servers => {
+            res?;
+            info!("limen stopped");
+            return Ok(());
         }
-    };
-    let data = axum::serve(data_listener, data_app).with_graceful_shutdown(data_shutdown);
-    let control =
-        axum::serve(control_listener, control_app).with_graceful_shutdown(shutdown_signal());
+        _ = shutdown => {}
+    }
 
-    // Both serve futures share `io::Error`; `?` converts to `anyhow::Error`.
-    tokio::try_join!(data, control)?;
-
-    info!("limen stopped");
+    // Drain: stop starting new shadows, end the refresh loop, and trigger the
+    // servers' graceful shutdown — bounded by the configured drain timeout.
+    state.begin_shutdown();
+    let _ = shutdown_tx.send(true);
+    let drain = Duration::from_millis(config.server.graceful_shutdown_timeout_ms);
+    match tokio::time::timeout(drain, &mut servers).await {
+        Ok(res) => {
+            res?;
+            info!("in-flight requests drained; limen stopped");
+        }
+        // On timeout we stop waiting and return. Any still-open connection tasks
+        // are abandoned and torn down when the process exits (the intended
+        // "forcing exit"). A library embedder that keeps running after this call
+        // should treat the bound as best-effort for that reason.
+        Err(_) => warn!(
+            timeout_ms = config.server.graceful_shutdown_timeout_ms,
+            "graceful shutdown timeout exceeded; forcing exit"
+        ),
+    }
+    if let Some(task) = refresh_task {
+        task.abort();
+    }
     Ok(())
 }
 
-/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM. Full in-flight
-/// draining is hardened in Phase 7; `axum::serve`'s graceful shutdown already
-/// stops accepting and lets in-flight requests finish.
+/// Resolve once the shutdown flag flips to `true` (used as each server's
+/// graceful-shutdown trigger). Returns immediately if it is already set.
+async fn wait_for_shutdown(mut rx: watch::Receiver<bool>) {
+    if *rx.borrow_and_update() {
+        return;
+    }
+    let _ = rx.changed().await;
+}
+
+/// Resolve when the process receives SIGINT (Ctrl-C) or SIGTERM. The caller then
+/// triggers the bounded drain (stop accepting, finish in-flight up to the
+/// timeout).
 async fn shutdown_signal() {
     let ctrl_c = async {
         tokio::signal::ctrl_c()

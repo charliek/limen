@@ -90,6 +90,7 @@ nav:
       - Comparison & Contracts: guides/comparison-and-contracts.md
       - Flags & Rollout: guides/flags-and-rollout.md
       - Resilience & Failover: guides/resilience.md
+      - Observability & Operations: guides/observability.md
   - Reference:
       - Architecture: reference/architecture.md
       - CLI: reference/cli.md

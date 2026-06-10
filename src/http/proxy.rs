@@ -8,14 +8,15 @@
 //! forget shadow to the new upstream — the shadow and comparison never delay or
 //! affect the client response.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, Method, StatusCode};
+use axum::http::request::Parts;
+use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use tracing::warn;
+use tracing::{info, info_span, warn, Instrument};
 use url::Url;
 
 use super::server::AppState;
@@ -24,9 +25,11 @@ use crate::config::model::RouteMode;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
 use crate::http::shadow::{self, ShadowRequest};
-use crate::observability::SkipReason;
+use crate::observability::request_id::{resolve as resolve_request_id, REQUEST_ID_HEADER};
+use crate::observability::{prometheus, SkipReason};
 use crate::resilience::BreakerReservation;
-use crate::routing::{decision, Upstream};
+use crate::routing::decision::PrimaryDecision;
+use crate::routing::{decision, CompiledRoute, Upstream};
 
 /// Hop-by-hop headers (RFC 7230 §6.1) that must not be forwarded across a proxy.
 /// Compared lowercased, which is how `HeaderName::as_str` renders them.
@@ -42,23 +45,79 @@ const HOP_BY_HOP: &[&str] = &[
 ];
 
 /// The data-plane fallback handler: every client request flows through here.
+///
+/// This thin wrapper owns the cross-cutting concerns — the in-flight gauge, the
+/// request/trace id, the per-request log span, and the request-count/latency
+/// metric — and delegates the actual proxying to [`dispatch`], so those are
+/// recorded once on every path rather than at each return site.
 pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
+    let _in_flight = prometheus::InFlight::enter();
+    let started = Instant::now();
     let (parts, body) = req.into_parts();
-    let method = parts.method;
-    let uri = parts.uri;
-    let path = uri.path();
+    let method = parts.method.clone();
+    let request_id = resolve_request_id(&parts.headers);
 
-    // Match a route by method + longest path prefix.
-    let Some(route) = state.routes().match_route(method.as_str(), path) else {
-        return not_found();
+    // Match a route by method + longest path prefix. An unmatched request has no
+    // route label, so it is not counted in the per-route request metric.
+    let Some(route) = state
+        .routes()
+        .match_route(method.as_str(), parts.uri.path())
+    else {
+        return finish_response(not_found(), &request_id);
     };
-
+    let route_id = route.id.clone();
+    let mode = route.mode;
     let decision = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
+
+    // Inner warnings inherit the request id + route via this span.
+    let span = info_span!("request", %request_id, route = %route_id);
+    // `dispatch` reports the upstream that actually *served* the client, which
+    // differs from the chosen primary when a failover route replays to legacy.
+    let (response, served) = dispatch(&state, route, decision, parts, body, &route_id, &request_id)
+        .instrument(span)
+        .await;
+
+    let status = response.status();
+    let latency = started.elapsed();
+    prometheus::record_request(
+        &route_id,
+        method.as_str(),
+        served,
+        status.as_u16(),
+        latency.as_secs_f64(),
+    );
+    info!(
+        %request_id,
+        route = %route_id,
+        mode = mode.as_str(),
+        method = %method,
+        upstream = served.as_str(),
+        status = status.as_u16(),
+        latency_ms = latency.as_millis() as u64,
+        "limen.request"
+    );
+    finish_response(response, &request_id)
+}
+
+/// Proxy a matched request to its chosen primary (and, where configured, shadow
+/// or fail over). Returns the client response; the caller records metrics/logs.
+async fn dispatch(
+    state: &AppState,
+    route: &CompiledRoute,
+    decision: PrimaryDecision,
+    parts: Parts,
+    body: Body,
+    route_id: &str,
+    request_id: &str,
+) -> (Response, Upstream) {
     let upstream = decision.upstream;
     // `Some` only when a breaker-guarded `new` trial was admitted: we then own
     // the obligation to settle that reserved slot exactly once — `record` on a
     // real attempt below, or `release` if we bail out before reaching new.
     let breaker = decision.breaker;
+    let method = parts.method;
+    let uri = parts.uri;
+    let path = uri.path();
 
     let base = match upstream {
         Upstream::Legacy => route.legacy_upstream.as_ref(),
@@ -67,33 +126,40 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     let Some(base) = base else {
         release_breaker(&breaker);
         warn!(
-            route = %route.id,
             upstream = upstream.as_str(),
             "selected upstream has no configured URL",
         );
-        return (
+        let resp = (
             StatusCode::INTERNAL_SERVER_ERROR,
             "limen: upstream not configured\n",
         )
             .into_response();
+        return (resp, upstream);
     };
 
     // Build the upstream URL, refusing to forward a path we cannot represent
     // byte-for-byte (dot-segments would be silently rewritten — see
-    // `build_upstream_url`). Copy out what we need so the `state` borrow ends
-    // before the await.
+    // `build_upstream_url`).
     let Some(url) = build_upstream_url(base, path, uri.query()) else {
         release_breaker(&breaker);
-        warn!(route = %route.id, path, "refusing to forward a path that requires normalization");
-        return (
+        warn!(
+            path,
+            "refusing to forward a path that requires normalization"
+        );
+        let resp = (
             StatusCode::BAD_REQUEST,
             "limen: request path cannot be forwarded unchanged\n",
         )
             .into_response();
+        return (resp, upstream);
     };
-    let route_id = route.id.clone();
     let timeout = Duration::from_millis(route.timeouts.primary_ms);
-    let request_headers = filter_headers(&parts.headers, Direction::Request);
+    let mut request_headers = filter_headers(&parts.headers, Direction::Request);
+    // Propagate the resolved request id to the upstream (generating one if the
+    // client didn't send it); existing trace headers ride along via the copy.
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        request_headers.insert(REQUEST_ID_HEADER, value);
+    }
 
     // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
     // request body so a new-side failure can be replayed against legacy. Handled
@@ -107,8 +173,8 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
             .and_then(|b| build_upstream_url(b, path, uri.query()))
         {
             return failover_dispatch(
-                &state,
-                &route_id,
+                state,
+                route_id,
                 &breaker,
                 method,
                 url,
@@ -152,27 +218,40 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     match tokio::time::timeout(timeout, send).await {
         Ok(Ok(resp)) => {
             record_breaker(&breaker, !resp.status().is_server_error());
-            primary_succeeded(&state, &route_id, shadow, resp).await
+            (
+                primary_succeeded(state, route_id, shadow, resp).await,
+                upstream,
+            )
         }
         Ok(Err(error)) => {
             // A non-failover-safe failover route returns the new-side failure to
             // the client (the in-flight request is NOT replayed); the breaker
             // still steers *subsequent* requests to legacy.
             record_breaker(&breaker, false);
-            warn!(route = %route_id, upstream = upstream.as_str(), %error, "upstream request failed");
-            bad_gateway()
+            prometheus::record_upstream_error(route_id, upstream);
+            warn!(upstream = upstream.as_str(), %error, "upstream request failed");
+            (bad_gateway(), upstream)
         }
         Err(_elapsed) => {
             record_breaker(&breaker, false);
+            prometheus::record_upstream_timeout(route_id, upstream);
             warn!(
-                route = %route_id,
                 upstream = upstream.as_str(),
                 timeout_ms = timeout.as_millis(),
                 "upstream did not respond before the primary timeout",
             );
-            gateway_timeout()
+            (gateway_timeout(), upstream)
         }
     }
+}
+
+/// Echo the resolved request id on the client response so clients and
+/// intermediaries can correlate it with Limen's logs.
+fn finish_response(mut response: Response, request_id: &str) -> Response {
+    if let Ok(value) = HeaderValue::from_str(request_id) {
+        response.headers_mut().insert(REQUEST_ID_HEADER, value);
+    }
+    response
 }
 
 /// Record an attempt's outcome on the route's breaker reservation, if any.
@@ -211,7 +290,7 @@ async fn failover_dispatch(
     headers: HeaderMap,
     body: Body,
     timeout: Duration,
-) -> Response {
+) -> (Response, Upstream) {
     // Buffer the request body so it can be replayed. failover_safe is opt-in, so
     // an over-limit body that can't be buffered is rejected rather than sent
     // un-replayable.
@@ -221,11 +300,12 @@ async fn failover_dispatch(
             // We never reach new on this path, so settle the reserved breaker
             // slot by releasing it (not recording a failure against new).
             release_breaker(breaker);
-            return (
+            let resp = (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "limen: request body too large to buffer for failover replay\n",
             )
                 .into_response();
+            return (resp, Upstream::New);
         }
     };
 
@@ -239,6 +319,16 @@ async fn failover_dispatch(
     )
     .await;
 
+    // A transport-level new failure is an upstream error/timeout (a 5xx is a
+    // response, counted by the request metric, not an upstream error).
+    if let Err(error) = &new_result {
+        if error.is_timeout() {
+            prometheus::record_upstream_timeout(route_id, Upstream::New);
+        } else {
+            prometheus::record_upstream_error(route_id, Upstream::New);
+        }
+    }
+
     // Classify the new attempt on its *complete* outcome — status and body, not
     // just the status line. On a non-5xx response, buffer the body (bounded) so
     // a 2xx whose body then fails is treated as a new-side failure.
@@ -249,18 +339,24 @@ async fn failover_dispatch(
             match body::buffer_or_stream(resp, state.request_body_limit()).await {
                 Buffered::Full(buffered) => {
                     record_breaker(breaker, true);
-                    return response_from_parts(status, resp_headers, Body::from(buffered));
+                    return (
+                        response_from_parts(status, resp_headers, Body::from(buffered)),
+                        Upstream::New,
+                    );
                 }
                 Buffered::TooLarge(streamed) => {
                     // Past the buffer bound the body can't be verified, and a
                     // committed stream can't be replayed; relay as-is (the
                     // failover guarantee is header-level for such responses).
                     record_breaker(breaker, true);
-                    return response_from_parts(status, resp_headers, streamed);
+                    return (
+                        response_from_parts(status, resp_headers, streamed),
+                        Upstream::New,
+                    );
                 }
                 // Body errored mid-read (including the total timeout firing):
                 // a new-side failure — fall through to the legacy replay.
-                Buffered::Error => {}
+                Buffered::Error => prometheus::record_upstream_error(route_id, Upstream::New),
             }
         }
     }
@@ -268,12 +364,17 @@ async fn failover_dispatch(
     // New failed (5xx, transport error/timeout, or a body that errored
     // mid-read) — replay legacy.
     record_breaker(breaker, false);
-    warn!(route = %route_id, "new upstream failed; failing over to legacy");
+    warn!("new upstream failed; failing over to legacy");
     match send_buffered(state.client(), method, legacy_url, headers, bytes, timeout).await {
-        Ok(resp) => relay_response(resp),
+        Ok(resp) => (relay_response(resp), Upstream::Legacy),
         Err(error) => {
-            warn!(route = %route_id, %error, "legacy failover also failed");
-            bad_gateway()
+            if error.is_timeout() {
+                prometheus::record_upstream_timeout(route_id, Upstream::Legacy);
+            } else {
+                prometheus::record_upstream_error(route_id, Upstream::Legacy);
+            }
+            warn!(%error, "legacy failover also failed");
+            (bad_gateway(), Upstream::Legacy)
         }
     }
 }

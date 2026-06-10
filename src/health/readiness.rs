@@ -5,9 +5,11 @@
 //! proxy remains safe — e.g. a stale flag provider that has fallen back to the
 //! fail-safe mode. A degraded proxy still serves (legacy), so it reports ready.
 //!
-//! In Phase 2 configuration is validated at startup and there are no runtime
-//! providers yet, so readiness is always [`Readiness::Ready`]. Phase 5/7 feed
-//! provider-staleness signals into [`evaluate`].
+//! Configuration is validated at startup, so readiness reflects the runtime
+//! flag provider: fresh → [`Readiness::Ready`]; stale-but-fail-safe →
+//! [`Readiness::Degraded`] (still serving legacy). The proxy has no state that
+//! makes it unsafe to serve once started, so [`Readiness::Unready`] is reserved
+//! for future dependencies that can hard-fail.
 
 /// The proxy's readiness state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,10 +39,15 @@ impl Readiness {
     }
 }
 
-/// Evaluate current readiness. Phase 2: config is validated before serving and
-/// there are no runtime providers, so the proxy is always ready.
-pub fn evaluate() -> Readiness {
-    Readiness::Ready
+/// Evaluate current readiness from the flag provider's health. A stale provider
+/// has fallen back to the fail-safe mode (legacy), which is still safe to serve,
+/// so it reports [`Readiness::Degraded`] rather than failing the check. `None`
+/// (a provider that reports no health, e.g. static) is treated as healthy.
+pub fn evaluate(flags: Option<&crate::flags::FlagProviderHealth>) -> Readiness {
+    match flags {
+        Some(health) if health.stale => Readiness::Degraded,
+        _ => Readiness::Ready,
+    }
 }
 
 #[cfg(test)]
@@ -55,7 +62,20 @@ mod tests {
     }
 
     #[test]
-    fn phase2_is_ready() {
-        assert_eq!(evaluate(), Readiness::Ready);
+    fn fresh_or_no_provider_is_ready_stale_is_degraded() {
+        use crate::flags::FlagProviderHealth;
+        let fresh = FlagProviderHealth {
+            stale: false,
+            last_success_age_ms: Some(0),
+            consecutive_failures: 0,
+        };
+        let stale = FlagProviderHealth {
+            stale: true,
+            last_success_age_ms: Some(99_999),
+            consecutive_failures: 5,
+        };
+        assert_eq!(evaluate(None), Readiness::Ready);
+        assert_eq!(evaluate(Some(&fresh)), Readiness::Ready);
+        assert_eq!(evaluate(Some(&stale)), Readiness::Degraded);
     }
 }
