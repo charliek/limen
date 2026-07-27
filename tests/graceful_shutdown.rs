@@ -2,7 +2,7 @@
 //! shutdown the proxy stops accepting new connections but lets an in-flight
 //! request finish within the drain window, then exits cleanly.
 
-use std::net::{SocketAddr, TcpListener as StdListener};
+use std::net::TcpListener as StdListener;
 use std::path::Path;
 use std::time::Duration;
 
@@ -19,15 +19,27 @@ fn free_port() -> u16 {
         .port()
 }
 
-/// Poll until `addr` accepts connections (the server has bound its listener).
-async fn wait_connectable(addr: SocketAddr) {
-    for _ in 0..100 {
-        if tokio::net::TcpStream::connect(addr).await.is_ok() {
-            return;
+/// Poll until the proxy actually serves a request. A bare TCP connect only
+/// proves the kernel completed a handshake into the accept backlog, which can
+/// succeed before the server is accepting — only a successful response proves
+/// the data plane is live.
+/// One outer deadline rather than a bounded attempt count: each attempt can
+/// itself block for the client's request timeout, so "100 attempts" would be an
+/// unpredictable ceiling rather than a bound.
+async fn wait_serving(client: &reqwest::Client, url: &str) {
+    let probing = async {
+        loop {
+            if let Ok(resp) = client.get(url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    panic!("server did not start listening on {addr}");
+    };
+    tokio::time::timeout(Duration::from_secs(10), probing)
+        .await
+        .unwrap_or_else(|_| panic!("proxy did not start serving requests at {url}"));
 }
 
 #[tokio::test]
@@ -66,6 +78,19 @@ routes:
     ))
     .unwrap();
 
+    // Build both clients before anything time-sensitive. With
+    // `rustls-tls-native-roots` the first `Client` construction enumerates the
+    // system trust store, which costs ~100ms on macOS; paying that inside the
+    // in-flight task would delay its connect past the shutdown signal. The two
+    // clients are deliberately separate so the in-flight request opens a fresh
+    // connection instead of reusing the probe's pooled one — draining a
+    // newly accepted connection is what this test is about.
+    let probe = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .unwrap();
+    let inflight_client = reqwest::Client::new();
+
     // Drive shutdown from a oneshot rather than an OS signal.
     let (tx, rx) = tokio::sync::oneshot::channel::<()>();
     let server = tokio::spawn(async move {
@@ -75,23 +100,50 @@ routes:
         .await
     });
 
-    let data_addr: SocketAddr = format!("127.0.0.1:{data_port}").parse().unwrap();
-    wait_connectable(data_addr).await;
-
     let url = format!("http://127.0.0.1:{data_port}/devices");
+    wait_serving(&probe, &format!("http://127.0.0.1:{data_port}/__ready")).await;
 
     // Begin a slow request, then trigger shutdown while it is still in flight.
     let inflight = tokio::spawn({
         let url = url.clone();
         async move {
-            reqwest::Client::new()
+            inflight_client
                 .get(&url)
                 .send()
                 .await
                 .map(|r| r.status().as_u16())
         }
     });
-    tokio::time::sleep(Duration::from_millis(80)).await;
+
+    // Shut down on evidence rather than on a timing guess: wait until the
+    // upstream has actually logged `/devices`. wiremock records a request under
+    // its write lock before matching it, and only awaits the response delay
+    // after releasing that lock, so observing the log entry means the request
+    // has arrived and the 300ms delay is still running.
+    //
+    // Residual window, deliberately accepted: the delay starts a moment before
+    // this poll can observe the entry, so a host stall longer than the delay
+    // could let the response complete before shutdown fires. That would make
+    // the drain assertion vacuous rather than failing — a false pass under
+    // severe load, not a flake. Removing it entirely needs an upstream that
+    // blocks until released, which wiremock's synchronous `Respond` trait
+    // cannot express.
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let seen = legacy
+                .received_requests()
+                .await
+                .expect("wiremock request recording is on by default")
+                .iter()
+                .any(|r| r.url.path() == "/devices");
+            if seen {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("upstream received /devices before shutdown was triggered");
     tx.send(()).unwrap();
 
     // The in-flight request drains to completion despite the shutdown.
@@ -109,7 +161,8 @@ routes:
         .expect("serve task joined");
     assert!(result.is_ok(), "serve exited cleanly: {result:?}");
 
-    // After shutdown the data plane no longer accepts connections.
+    // A third, fresh client so no pooled keep-alive socket can satisfy this
+    // request and mask a listener that is still accepting.
     let refused = reqwest::Client::new()
         .get(&url)
         .timeout(Duration::from_millis(500))
@@ -117,6 +170,6 @@ routes:
         .await;
     assert!(
         refused.is_err(),
-        "data plane must stop accepting after shutdown"
+        "requests must fail after shutdown: the data plane no longer accepts connections"
     );
 }
