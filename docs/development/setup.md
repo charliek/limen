@@ -2,12 +2,12 @@
 
 ## Toolchain
 
-Limen pins Rust **1.96.0** via both `.mise.toml` and `rust-toolchain.toml`.
+Limen pins Rust **1.97.1** via both `.mise.toml` and `rust-toolchain.toml`.
 Install [mise](https://mise.jdx.dev), then:
 
 ```bash
 mise install                 # install the pinned toolchain
-mise exec -- cargo --version # cargo 1.96.0
+mise exec -- cargo --version # cargo 1.97.1
 ```
 
 `.cargo/config.toml` sets `resolver.incompatible-rust-versions = "fallback"` so

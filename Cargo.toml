@@ -4,7 +4,7 @@ name = "limen"
 # first tagged release moves this to a real version.
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.96"
+rust-version = "1.97"
 description = "A production-grade reverse proxy for safely migrating HTTP traffic from a legacy service to a new implementation"
 license = "MIT"
 repository = "https://github.com/charliek/limen"

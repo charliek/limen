@@ -15,7 +15,7 @@ describes the companion test suite that shares the behavioral contract.
 
 ## Toolchain
 
-- Rust is pinned to **1.96.0** via both `.mise.toml` and `rust-toolchain.toml`.
+- Rust is pinned to **1.97.1** via both `.mise.toml` and `rust-toolchain.toml`.
 - Cargo is reached through mise: `mise exec -- cargo …` (or
   `mise exec -- make …`). `.cargo/config.toml` sets
   `resolver.incompatible-rust-versions = "fallback"` so the dependency graph
