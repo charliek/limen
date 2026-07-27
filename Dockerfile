@@ -8,7 +8,7 @@
 #
 # The build pins the same Rust toolchain as the repo (rust-toolchain.toml).
 
-FROM rust:1.96-slim-bookworm AS build
+FROM rust:1.97.1-slim-bookworm AS build
 WORKDIR /src
 COPY . .
 # `--locked` builds against the committed Cargo.lock for reproducibility.

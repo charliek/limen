@@ -10,7 +10,7 @@ toolchain pinned in the repository.
   [rustls](https://github.com/rustls/rustls) for TLS, so there is no OpenSSL
   build dependency.
 
-The Rust version is pinned to **1.96.0** in both `.mise.toml` and
+The Rust version is pinned to **1.97.1** in both `.mise.toml` and
 `rust-toolchain.toml`, so every contributor and CI run builds with the same
 compiler.
 
