@@ -6,6 +6,7 @@
 //! log. The trait indirection keeps the shadow path testable: a test supplies a
 //! capturing observer to assert on outcomes without scraping metrics or logs.
 
+use axum::http::Method;
 use tracing::{debug, warn};
 
 use crate::compare::result::ComparisonResult;
@@ -49,18 +50,41 @@ impl ShadowFailure {
     }
 }
 
+/// Request-scoped identifiers passed to every [`ShadowObserver`] callback
+/// (spec §7.3, §10.1). Built once per shadowed request (see
+/// [`crate::http::shadow::ShadowRequest::meta`]) so observers never re-derive
+/// them (e.g. re-parsing `x-request-id` out of headers).
+///
+/// Only `route_id` is ever used as a Prometheus label — `request_id`, `method`,
+/// and `path` are for structured logs and (a later sink) diff records, and must
+/// never be turned into metric labels (cardinality discipline, spec §10.1).
+#[derive(Debug, Clone)]
+pub struct ShadowMeta {
+    /// The matched route id (low-cardinality; the only field used as a metric
+    /// label).
+    pub route_id: String,
+    /// The originating request's resolved `x-request-id` (client-supplied or
+    /// generated — see [`crate::observability::request_id::resolve`]).
+    pub request_id: String,
+    /// The request method (always GET/HEAD today, spec §6.1).
+    pub method: Method,
+    /// The concrete request path (not a path template) — fine for logs/sink,
+    /// never a metric label.
+    pub path: String,
+}
+
 /// Receives shadow and comparison outcomes off the client path.
 pub trait ShadowObserver: Send + Sync {
     /// A shadow request was dispatched to the new upstream.
-    fn shadow_dispatched(&self, route_id: &str);
+    fn shadow_dispatched(&self, meta: &ShadowMeta);
     /// A comparison completed (match or mismatch).
-    fn comparison(&self, route_id: &str, result: &ComparisonResult);
+    fn comparison(&self, meta: &ShadowMeta, result: &ComparisonResult);
     /// A shadow request was not dispatched.
-    fn shadow_skipped(&self, route_id: &str, reason: SkipReason);
+    fn shadow_skipped(&self, meta: &ShadowMeta, reason: SkipReason);
     /// A shadow request was dispatched but failed.
-    fn shadow_failed(&self, route_id: &str, failure: ShadowFailure);
+    fn shadow_failed(&self, meta: &ShadowMeta, failure: ShadowFailure);
     /// A comparison was not performed (e.g. a response was too large to buffer).
-    fn comparison_skipped(&self, route_id: &str, reason: SkipReason);
+    fn comparison_skipped(&self, meta: &ShadowMeta, reason: SkipReason);
 }
 
 /// The production observer: records Prometheus metrics and emits the redacted
@@ -77,22 +101,33 @@ impl MetricsObserver {
 }
 
 impl ShadowObserver for MetricsObserver {
-    fn shadow_dispatched(&self, route_id: &str) {
-        prometheus::shadow_dispatched(route_id);
-        debug!(route_id, "limen.shadow_dispatched");
+    fn shadow_dispatched(&self, meta: &ShadowMeta) {
+        prometheus::shadow_dispatched(&meta.route_id);
+        debug!(
+            route_id = %meta.route_id,
+            request_id = %meta.request_id,
+            "limen.shadow_dispatched"
+        );
     }
 
-    fn comparison(&self, route_id: &str, result: &ComparisonResult) {
-        prometheus::comparison(route_id, result.is_match());
+    fn comparison(&self, meta: &ShadowMeta, result: &ComparisonResult) {
+        prometheus::comparison(&meta.route_id, result.is_match());
         if result.is_match() {
-            debug!(route_id, "limen.response_match");
+            debug!(
+                route_id = %meta.route_id,
+                request_id = %meta.request_id,
+                "limen.response_match"
+            );
         } else {
             if !result.differences.is_empty() {
-                prometheus::diff_sampled(route_id);
+                prometheus::diff_sampled(&meta.route_id);
             }
             warn!(
                 event = "limen.response_mismatch",
-                route_id,
+                route_id = %meta.route_id,
+                request_id = %meta.request_id,
+                method = %meta.method,
+                path = %meta.path,
                 legacy_status = result.legacy_status,
                 new_status = result.new_status,
                 status_match = result.status_match,
@@ -110,20 +145,31 @@ impl ShadowObserver for MetricsObserver {
         }
     }
 
-    fn shadow_skipped(&self, route_id: &str, reason: SkipReason) {
-        prometheus::shadow_skipped(route_id, reason);
-        debug!(route_id, reason = reason.as_str(), "limen.shadow_skipped");
-    }
-
-    fn shadow_failed(&self, route_id: &str, failure: ShadowFailure) {
-        prometheus::shadow_failed(route_id, failure);
-        debug!(route_id, kind = failure.as_str(), "limen.shadow_failed");
-    }
-
-    fn comparison_skipped(&self, route_id: &str, reason: SkipReason) {
-        prometheus::comparison_skipped(route_id, reason);
+    fn shadow_skipped(&self, meta: &ShadowMeta, reason: SkipReason) {
+        prometheus::shadow_skipped(&meta.route_id, reason);
         debug!(
-            route_id,
+            route_id = %meta.route_id,
+            request_id = %meta.request_id,
+            reason = reason.as_str(),
+            "limen.shadow_skipped"
+        );
+    }
+
+    fn shadow_failed(&self, meta: &ShadowMeta, failure: ShadowFailure) {
+        prometheus::shadow_failed(&meta.route_id, failure);
+        debug!(
+            route_id = %meta.route_id,
+            request_id = %meta.request_id,
+            kind = failure.as_str(),
+            "limen.shadow_failed"
+        );
+    }
+
+    fn comparison_skipped(&self, meta: &ShadowMeta, reason: SkipReason) {
+        prometheus::comparison_skipped(&meta.route_id, reason);
+        debug!(
+            route_id = %meta.route_id,
+            request_id = %meta.request_id,
             reason = reason.as_str(),
             "limen.comparison_skipped"
         );
@@ -150,6 +196,15 @@ mod tests {
         }
     }
 
+    fn meta() -> ShadowMeta {
+        ShadowMeta {
+            route_id: "r".to_string(),
+            request_id: "req-1".to_string(),
+            method: Method::GET,
+            path: "/devices/1".to_string(),
+        }
+    }
+
     #[test]
     fn metrics_observer_records_match_and_mismatch() {
         // A local recorder captures only this test's emissions (no global state).
@@ -157,10 +212,10 @@ mod tests {
         let handle = recorder.handle();
         metrics::with_local_recorder(&recorder, || {
             let observer = MetricsObserver::new();
-            observer.comparison("r", &result(true));
-            observer.comparison("r", &result(false));
-            observer.shadow_failed("r", ShadowFailure::Timeout);
-            observer.comparison_skipped("r", SkipReason::ResponseTooLarge);
+            observer.comparison(&meta(), &result(true));
+            observer.comparison(&meta(), &result(false));
+            observer.shadow_failed(&meta(), ShadowFailure::Timeout);
+            observer.comparison_skipped(&meta(), SkipReason::ResponseTooLarge);
         });
         let rendered = handle.render();
         assert!(rendered.contains("limen_comparisons_total"));

@@ -199,7 +199,9 @@ async fn dispatch(
             .new_upstream
             .as_ref()
             .and_then(|new_base| build_upstream_url(new_base, path, uri.query()))
-            .and_then(|new_url| shadow::plan(route, &method, &request_headers, new_url, &url))
+            .and_then(|new_url| {
+                shadow::plan(route, &method, &request_headers, new_url, &url, request_id)
+            })
     };
 
     let upstream_body = reqwest::Body::wrap_stream(body.into_data_stream());
@@ -218,10 +220,7 @@ async fn dispatch(
     match tokio::time::timeout(timeout, send).await {
         Ok(Ok(resp)) => {
             record_breaker(&breaker, !resp.status().is_server_error());
-            (
-                primary_succeeded(state, route_id, shadow, resp).await,
-                upstream,
-            )
+            (primary_succeeded(state, shadow, resp).await, upstream)
         }
         Ok(Err(error)) => {
             // A non-failover-safe failover route returns the new-side failure to
@@ -404,7 +403,6 @@ async fn send_buffered(
 /// compare against a fire-and-forget shadow to the new upstream.
 async fn primary_succeeded(
     state: &AppState,
-    route_id: &str,
     shadow: Option<ShadowRequest>,
     resp: reqwest::Response,
 ) -> Response {
@@ -423,7 +421,7 @@ async fn primary_succeeded(
     let Some(permit) = state.shadow_limiter().try_acquire() else {
         state
             .observer()
-            .shadow_skipped(route_id, SkipReason::ConcurrencyLimit);
+            .shadow_skipped(&shadow_req.meta(), SkipReason::ConcurrencyLimit);
         return relay_response(resp);
     };
 
@@ -457,7 +455,7 @@ async fn primary_succeeded(
             // (prefix + remaining stream) and skip the comparison.
             state
                 .observer()
-                .comparison_skipped(route_id, SkipReason::ResponseTooLarge);
+                .comparison_skipped(&shadow_req.meta(), SkipReason::ResponseTooLarge);
             drop(permit);
             response_from_parts(status, client_headers, streamed)
         }

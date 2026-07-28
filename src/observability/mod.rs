@@ -13,4 +13,4 @@ pub mod metrics;
 pub mod prometheus;
 pub mod request_id;
 
-pub use metrics::{MetricsObserver, ShadowFailure, ShadowObserver, SkipReason};
+pub use metrics::{MetricsObserver, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};

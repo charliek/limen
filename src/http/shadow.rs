@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, Method};
+use tracing::{info_span, Instrument};
 use url::Url;
 
 use crate::compare::{self, diff::DiffLimits, Captured};
@@ -17,7 +18,7 @@ use crate::config::model::RouteMode;
 use crate::contract::model::ComparisonRules;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
-use crate::observability::{ShadowFailure, ShadowObserver, SkipReason};
+use crate::observability::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
 use crate::resilience::ShadowPermit;
 use crate::routing::CompiledRoute;
 
@@ -58,10 +59,27 @@ pub struct ShadowRequest {
     pub max_body_bytes: usize,
     /// Route id (logs/metrics).
     pub route_id: String,
+    /// The originating request's resolved `x-request-id`, carried explicitly so
+    /// the observer never has to re-parse it out of `headers` (spec §10.1/§10.2).
+    pub request_id: String,
     /// Merged behavioral comparison rules.
     pub rules: ComparisonRules,
     /// Diff output bounds.
     pub diff_limits: DiffLimits,
+}
+
+impl ShadowRequest {
+    /// Build the [`ShadowMeta`] passed to every observer callback for this
+    /// shadowed request — cheap identifiers only, never re-derived by the
+    /// observer.
+    pub fn meta(&self) -> ShadowMeta {
+        ShadowMeta {
+            route_id: self.route_id.clone(),
+            request_id: self.request_id.clone(),
+            method: self.method.clone(),
+            path: self.new_url.path().to_string(),
+        }
+    }
 }
 
 /// Decide whether to shadow-compare this request and, if so, prepare it. Returns
@@ -73,6 +91,7 @@ pub fn plan(
     request_headers: &HeaderMap,
     new_url: Url,
     legacy_url: &Url,
+    request_id: &str,
 ) -> Option<ShadowRequest> {
     if route.mode != RouteMode::ShadowLegacyPrimary || !route.comparison.enabled {
         return None;
@@ -88,6 +107,7 @@ pub fn plan(
         shadow_timeout: Duration::from_millis(route.timeouts.shadow_ms),
         max_body_bytes: route.comparison.max_body_bytes,
         route_id: route.id.clone(),
+        request_id: request_id.to_string(),
         rules: route.comparison.rules.clone(),
         diff_limits: DiffLimits::default(),
     })
@@ -102,10 +122,20 @@ pub fn spawn(
     legacy: Captured,
     permit: ShadowPermit,
 ) {
-    tokio::spawn(async move {
-        let _permit = permit; // released when the shadow completes
-        run(&client, observer.as_ref(), shadow, legacy).await;
-    });
+    // Every log line emitted while this shadow runs (including the mismatch
+    // warn! in MetricsObserver) carries these ids, so shadow activity for a
+    // given client request is correlatable without re-threading fields through
+    // every call (spec §10.1/§10.2, D7).
+    let request_id = shadow.request_id.clone();
+    let route_id = shadow.route_id.clone();
+    let span = info_span!("shadow", %request_id, route = %route_id);
+    tokio::spawn(
+        async move {
+            let _permit = permit; // released when the shadow completes
+            run(&client, observer.as_ref(), shadow, legacy).await;
+        }
+        .instrument(span),
+    );
 }
 
 async fn run(
@@ -114,7 +144,11 @@ async fn run(
     shadow: ShadowRequest,
     legacy: Captured,
 ) {
-    observer.shadow_dispatched(&shadow.route_id);
+    // Built once, up front, from the already-resolved identifiers — the
+    // observer never re-derives them (e.g. re-parsing `x-request-id` out of
+    // headers).
+    let meta = shadow.meta();
+    observer.shadow_dispatched(&meta);
 
     // A *total* request timeout bounds the entire shadow exchange — send AND
     // body read — so a new upstream that sends headers then stalls can never
@@ -131,10 +165,8 @@ async fn run(
         .await;
     let resp = match result {
         Ok(resp) => resp,
-        Err(e) if e.is_timeout() => {
-            return observer.shadow_failed(&shadow.route_id, ShadowFailure::Timeout)
-        }
-        Err(_) => return observer.shadow_failed(&shadow.route_id, ShadowFailure::Error),
+        Err(e) if e.is_timeout() => return observer.shadow_failed(&meta, ShadowFailure::Timeout),
+        Err(_) => return observer.shadow_failed(&meta, ShadowFailure::Error),
     };
 
     let status = resp.status().as_u16();
@@ -142,11 +174,11 @@ async fn run(
     let body = match body::buffer_or_stream(resp, shadow.max_body_bytes).await {
         Buffered::Full(body) => body,
         Buffered::TooLarge(_) => {
-            return observer.comparison_skipped(&shadow.route_id, SkipReason::ResponseTooLarge);
+            return observer.comparison_skipped(&meta, SkipReason::ResponseTooLarge);
         }
         // Includes the total timeout firing mid-body: the stream errors and the
         // permit is released here.
-        Buffered::Error => return observer.shadow_failed(&shadow.route_id, ShadowFailure::Error),
+        Buffered::Error => return observer.shadow_failed(&meta, ShadowFailure::Error),
     };
 
     let new = Captured {
@@ -159,7 +191,7 @@ async fn run(
         request_url: Some(new_url),
     };
     let result = compare::compare(&shadow.rules, &shadow.diff_limits, &legacy, &new);
-    observer.comparison(&shadow.route_id, &result);
+    observer.comparison(&meta, &result);
 }
 
 #[cfg(test)]
