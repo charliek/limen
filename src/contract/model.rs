@@ -43,9 +43,10 @@ impl Contract {
 pub struct ContractRoute {
     /// Stable identifier referenced as `…contract.yaml#<id>`.
     pub id: String,
-    /// Informational match metadata (methods + path template).
-    #[serde(default, rename = "match")]
-    pub match_: Option<ContractMatch>,
+    /// Match metadata (methods + path template) shared with Pharos, where
+    /// both fields are already required — kept in lockstep here (D5).
+    #[serde(rename = "match")]
+    pub match_: ContractMatch,
     /// Per-route behavioral overrides, merged onto the service defaults.
     #[serde(default)]
     pub comparison: Option<BehavioralRules>,
@@ -57,16 +58,18 @@ pub struct ContractRoute {
     pub tags: Option<Vec<String>>,
 }
 
-/// Informational route match metadata (not used for Limen's own routing).
+/// Required route match metadata (methods + path template). Not used for
+/// Limen's own routing, but required so every contract route is
+/// self-describing and matches Pharos's schema (D5).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ContractMatch {
     /// HTTP methods this contract route describes.
     #[serde(default)]
     pub methods: Vec<String>,
-    /// A path template such as `/devices/{id}`.
-    #[serde(default)]
-    pub path_template: Option<String>,
+    /// A path template such as `/devices/{id}`. Must be non-empty
+    /// (`validate_semantics` checks; serde only guarantees presence).
+    pub path_template: String,
 }
 
 /// Notes a contract author records about a route.

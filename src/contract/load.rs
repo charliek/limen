@@ -157,6 +157,12 @@ pub fn validate_semantics(contract: &Contract) -> Vec<String> {
         } else if !seen.insert(route.id.as_str()) {
             issues.push(format!("duplicate route id {:?}", route.id));
         }
+        if route.match_.path_template.trim().is_empty() {
+            issues.push(format!(
+                "route {:?} has an empty `match.path_template`",
+                route.id
+            ));
+        }
     }
     issues
 }
@@ -227,10 +233,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let yaml_path = dir.path().join("svc.contract.yaml");
         let json_path = dir.path().join("svc.contract.json");
-        std::fs::write(&yaml_path, "version: 1\nservice: s\nroutes:\n  - id: r\n").unwrap();
+        std::fs::write(
+            &yaml_path,
+            "version: 1\nservice: s\nroutes:\n  - id: r\n    match: { methods: [GET], path_template: \"/x\" }\n",
+        )
+        .unwrap();
         std::fs::write(
             &json_path,
-            r#"{"version":1,"service":"s","routes":[{"id":"r"}]}"#,
+            r#"{"version":1,"service":"s","routes":[{"id":"r","match":{"methods":["GET"],"path_template":"/x"}}]}"#,
         )
         .unwrap();
         let from_yaml = load_file(&yaml_path).unwrap();
@@ -256,8 +266,11 @@ version: 2
 service: ""
 routes:
   - id: dup
+    match: { methods: [GET], path_template: "/x" }
   - id: dup
+    match: { methods: [GET], path_template: "/x" }
   - id: ""
+    match: { methods: [GET], path_template: "/x" }
 "#;
         let contract: Contract = serde_yaml::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
@@ -271,7 +284,7 @@ routes:
 
     #[test]
     fn validate_semantics_accepts_a_good_contract() {
-        let yaml = "version: 1\nservice: s\nroutes:\n  - id: a\n  - id: b\n";
+        let yaml = "version: 1\nservice: s\nroutes:\n  - id: a\n    match: { methods: [GET], path_template: \"/a\" }\n  - id: b\n    match: { methods: [GET], path_template: \"/b\" }\n";
         let contract: Contract = serde_yaml::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
@@ -286,6 +299,7 @@ defaults:
     ignore_paths: ["$.ok", "$.bad[0]"]
 routes:
   - id: r
+    match: { methods: [GET], path_template: "/x" }
     comparison:
       json:
         ignore_paths: ["$..deep"]

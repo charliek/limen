@@ -804,7 +804,7 @@ routes:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("svc.contract.yaml"),
-            "version: 2\nservice: s\nroutes:\n  - id: get\n",
+            "version: 2\nservice: s\nroutes:\n  - id: get\n    match: { methods: [GET], path_template: \"/x\" }\n",
         )
         .unwrap();
         let yaml = r#"
@@ -829,7 +829,7 @@ routes:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("svc.contract.yaml"),
-            "version: 9\nservice: s\nroutes:\n  - id: a\n  - id: b\n",
+            "version: 9\nservice: s\nroutes:\n  - id: a\n    match: { methods: [GET], path_template: \"/a\" }\n  - id: b\n    match: { methods: [GET], path_template: \"/b\" }\n",
         )
         .unwrap();
         let yaml = r#"
@@ -860,7 +860,7 @@ routes:
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(
             dir.path().join("svc.contract.yaml"),
-            "version: 1\nservice: s\ndefaults:\n  json:\n    ignore_paths: [\"$.ok\"]\nroutes:\n  - id: get\n",
+            "version: 1\nservice: s\ndefaults:\n  json:\n    ignore_paths: [\"$.ok\"]\nroutes:\n  - id: get\n    match: { methods: [GET], path_template: \"/x\" }\n",
         )
         .unwrap();
 
