@@ -9,10 +9,15 @@
 //!   default's entries followed by the override's, de-duplicated preserving
 //!   first occurrence. This is the "merged with defaults" union the spec
 //!   annotates — never a reconciliation, because the namespaces are additive.
+//! - **Optional blocks** (`set_cookie`, `location`): absent from both layers
+//!   resolves to `None` (the dimension is not compared); present in either
+//!   resolves field-wise by the two rules above, so a route can turn a
+//!   default-declared dimension off (`compare: false`) or extend its lists.
 
 use crate::contract::model::{
-    BehavioralRules, ComparisonRules, EnumAlias, JsonRules, NormalizeTimestamp, SortArray,
-    UnorderedArray,
+    BehavioralRules, ComparisonRules, CookieValueMode, EnumAlias, JsonRules, LocationRules,
+    NormalizeTimestamp, OriginMode, ResolvedLocationRules, ResolvedSetCookieRules, SetCookieRules,
+    SortArray, UnorderedArray,
 };
 
 /// Concatenate two slices, de-duplicating by value and preserving the order of
@@ -45,6 +50,56 @@ fn merge_json(base: &JsonRules, over: &JsonRules) -> JsonRules {
     }
 }
 
+/// Merge an optional block (`set_cookie`, `location`). Declared by neither
+/// layer means no layer asked for the dimension, so it stays unresolved (not
+/// compared); otherwise the absent layer contributes its empty defaults and
+/// `resolve_fields` applies the scalar/list rules field by field.
+fn merge_optional<L: Default, R>(
+    base: Option<&L>,
+    over: Option<&L>,
+    resolve_fields: impl FnOnce(&L, &L) -> R,
+) -> Option<R> {
+    if base.is_none() && over.is_none() {
+        return None;
+    }
+    let empty = L::default();
+    Some(resolve_fields(
+        base.unwrap_or(&empty),
+        over.unwrap_or(&empty),
+    ))
+}
+
+/// Merge two `set_cookie` layers.
+fn merge_set_cookie(
+    base: Option<&SetCookieRules>,
+    over: Option<&SetCookieRules>,
+) -> Option<ResolvedSetCookieRules> {
+    merge_optional(base, over, |base, over| ResolvedSetCookieRules {
+        compare: over.compare.or(base.compare).unwrap_or(true),
+        ignore_cookies: concat_dedup::<String>(&base.ignore_cookies, &over.ignore_cookies),
+        ignore_attributes: concat_dedup::<String>(&base.ignore_attributes, &over.ignore_attributes),
+        compare_values: over
+            .compare_values
+            .or(base.compare_values)
+            .unwrap_or(CookieValueMode::Exact),
+    })
+}
+
+/// Merge two `location` layers.
+fn merge_location(
+    base: Option<&LocationRules>,
+    over: Option<&LocationRules>,
+) -> Option<ResolvedLocationRules> {
+    merge_optional(base, over, |base, over| ResolvedLocationRules {
+        compare: over.compare.or(base.compare).unwrap_or(true),
+        ignore_query_params: concat_dedup::<String>(
+            &base.ignore_query_params,
+            &over.ignore_query_params,
+        ),
+        origin: over.origin.or(base.origin).unwrap_or(OriginMode::Exact),
+    })
+}
+
 /// Resolve service `defaults` and a per-route/inline `override` layer into the
 /// concrete rules the comparison engine consumes.
 pub fn resolve(defaults: &BehavioralRules, over: &BehavioralRules) -> ComparisonRules {
@@ -63,6 +118,8 @@ pub fn resolve(defaults: &BehavioralRules, over: &BehavioralRules) -> Comparison
             defaults.json.as_ref().unwrap_or(&empty),
             over.json.as_ref().unwrap_or(&empty),
         ),
+        set_cookie: merge_set_cookie(defaults.set_cookie.as_ref(), over.set_cookie.as_ref()),
+        location: merge_location(defaults.location.as_ref(), over.location.as_ref()),
     }
 }
 
@@ -77,6 +134,20 @@ mod tests {
                 ignore_paths: paths.iter().map(|s| s.to_string()).collect(),
                 ..Default::default()
             }),
+            ..Default::default()
+        }
+    }
+
+    fn rules_with_set_cookie(set_cookie: SetCookieRules) -> BehavioralRules {
+        BehavioralRules {
+            set_cookie: Some(set_cookie),
+            ..Default::default()
+        }
+    }
+
+    fn rules_with_location(location: LocationRules) -> BehavioralRules {
+        BehavioralRules {
+            location: Some(location),
             ..Default::default()
         }
     }
@@ -138,5 +209,106 @@ mod tests {
         };
         let merged = resolve(&defaults, &BehavioralRules::default());
         assert_eq!(merged.json.sort_arrays.len(), 1);
+    }
+
+    #[test]
+    fn optional_blocks_stay_unresolved_when_no_layer_declares_them() {
+        let merged = resolve(&BehavioralRules::default(), &BehavioralRules::default());
+        assert!(merged.set_cookie.is_none());
+        assert!(merged.location.is_none());
+    }
+
+    #[test]
+    fn empty_block_resolves_to_the_documented_defaults() {
+        let over = BehavioralRules {
+            set_cookie: Some(SetCookieRules::default()),
+            location: Some(LocationRules::default()),
+            ..Default::default()
+        };
+        let merged = resolve(&BehavioralRules::default(), &over);
+        assert_eq!(
+            merged.set_cookie.unwrap(),
+            ResolvedSetCookieRules {
+                compare: true,
+                ignore_cookies: vec![],
+                ignore_attributes: vec![],
+                compare_values: CookieValueMode::Exact,
+            }
+        );
+        assert_eq!(
+            merged.location.unwrap(),
+            ResolvedLocationRules {
+                compare: true,
+                ignore_query_params: vec![],
+                origin: OriginMode::Exact,
+            }
+        );
+    }
+
+    #[test]
+    fn set_cookie_lists_concat_and_dedup_scalars_override() {
+        // The decision-table case: the same `ignore_cookies` entry in both
+        // layers resolves to a single occurrence.
+        let defaults = rules_with_set_cookie(SetCookieRules {
+            compare: Some(true),
+            ignore_cookies: vec!["csrf_token".into()],
+            ignore_attributes: vec!["Expires".into()],
+            compare_values: Some(CookieValueMode::Exact),
+        });
+        let over = rules_with_set_cookie(SetCookieRules {
+            ignore_cookies: vec!["csrf_token".into(), "session_hint".into()],
+            compare_values: Some(CookieValueMode::Presence),
+            ..Default::default()
+        });
+        let merged = resolve(&defaults, &over).set_cookie.unwrap();
+        assert_eq!(merged.ignore_cookies, vec!["csrf_token", "session_hint"]);
+        assert_eq!(merged.ignore_attributes, vec!["Expires"]);
+        assert_eq!(merged.compare_values, CookieValueMode::Presence);
+        assert!(merged.compare);
+    }
+
+    #[test]
+    fn route_can_switch_a_default_declared_dimension_off() {
+        let defaults = rules_with_set_cookie(SetCookieRules {
+            ignore_cookies: vec!["csrf_token".into()],
+            ..Default::default()
+        });
+        let over = rules_with_set_cookie(SetCookieRules {
+            compare: Some(false),
+            ..Default::default()
+        });
+        let merged = resolve(&defaults, &over).set_cookie.unwrap();
+        assert!(!merged.compare);
+        // The switch is independent of the lists, which still merge.
+        assert_eq!(merged.ignore_cookies, vec!["csrf_token"]);
+    }
+
+    #[test]
+    fn location_merges_query_params_and_origin() {
+        let defaults = rules_with_location(LocationRules {
+            ignore_query_params: vec!["state".into()],
+            ..Default::default()
+        });
+        let over = rules_with_location(LocationRules {
+            ignore_query_params: vec!["state".into(), "nonce".into()],
+            origin: Some(OriginMode::Ignore),
+            ..Default::default()
+        });
+        let merged = resolve(&defaults, &over).location.unwrap();
+        assert_eq!(merged.ignore_query_params, vec!["state", "nonce"]);
+        assert_eq!(merged.origin, OriginMode::Ignore);
+        assert!(merged.compare);
+    }
+
+    #[test]
+    fn a_block_declared_only_in_defaults_reaches_every_route() {
+        let defaults = rules_with_location(LocationRules {
+            origin: Some(OriginMode::Ignore),
+            ..Default::default()
+        });
+        let merged = resolve(&defaults, &BehavioralRules::default())
+            .location
+            .unwrap();
+        assert_eq!(merged.origin, OriginMode::Ignore);
     }
 }

@@ -1,0 +1,180 @@
+# Byte-identical twin of pharos tests/fixtures/lockstep/lockstep.contract.yaml — update BOTH or CI fails.
+#
+# A neutral example-service contract that exercises *every* feature of the
+# shared behavioral vocabulary: all six `json` rule types (with both timestamp
+# precision spellings), compare_status/compare_body/compare_headers, the
+# optional `set_cookie` and `location` comparison dimensions, required `match`
+# blocks, and defaults + per-route overrides that exercise both merge rules
+# (scalars override, lists concatenate-then-de-duplicate).
+#
+# The expected resolution of every route is recorded in the engine-neutral
+# `decisions.json` sitting next to this file; each engine replays that table
+# through its own loader and merge code.
+version: 1
+service: example-service
+description: >
+  Lockstep conformance fixture shared by Limen and Pharos. Not a real service —
+  every rule exists to pin a semantic, not to describe production behavior.
+
+defaults:
+  compare_status: true
+  compare_body: true
+  compare_headers:
+    - "content-type"
+  json:
+    ignore_paths:
+      - "$.metadata.requestId"
+      - "$.metadata.generatedAt"
+    redact_paths:
+      - "$.user.email"
+      - "$.user.token"
+    sort_arrays:
+      - path: "$.users"
+        key: "id"
+    unordered_arrays:
+      - path: "$.user.permissions"
+    normalize_timestamps:
+      - path: "$.metadata.servedAt"
+        precision: milliseconds
+    enum_aliases:
+      - path: "$.user.status"
+        aliases: { ACTIVE: enabled, INACTIVE: disabled }
+  # Declared service-wide, so every route inherits the dimension and a route may
+  # extend it, narrow it, or switch it off.
+  set_cookie:
+    compare: true
+    ignore_cookies:
+      - "csrf_token"
+    ignore_attributes:
+      - "Expires"
+    compare_values: exact
+  # `location` is deliberately absent here: routes that never declare it must
+  # resolve to "not compared".
+
+routes:
+  # List concatenation + de-duplication on compare_headers, ignore_paths, and
+  # normalize_timestamps; `millis` spelling.
+  - id: "get-user"
+    match:
+      methods: ["GET"]
+      path_template: "/users/{id}"
+    comparison:
+      compare_headers:
+        - "content-type" # duplicate of defaults — resolves to one entry
+        - "etag"
+      json:
+        ignore_paths:
+          - "$.metadata.requestId" # duplicate of defaults
+          - "$.user.lastSeenAt"
+        normalize_timestamps:
+          - path: "$.user.createdAt"
+            precision: millis # Limen's historical spelling of `milliseconds`
+    expectations:
+      typical_status: 200
+      notes: >
+        Both sides return the user document; lastSeenAt is written by a
+        background job and is ignored rather than normalized.
+    tags: [read, migration-ready]
+
+  # Scalar override (compare_body) plus de-duplication of *structured* list
+  # entries; `milliseconds` spelling; set_cookie scalar override + list merge.
+  - id: "list-users"
+    match:
+      methods: ["GET"]
+      path_template: "/users"
+    comparison:
+      compare_body: false
+      json:
+        sort_arrays:
+          - path: "$.users" # duplicate of defaults, key included
+            key: "id"
+          - path: "$.users[*].devices"
+            key: "id"
+        unordered_arrays:
+          - path: "$.user.permissions" # duplicate of defaults
+          - path: "$.tags"
+        normalize_timestamps:
+          - path: "$.users[*].createdAt"
+            precision: milliseconds
+        enum_aliases:
+          - path: "$.users[*].status"
+            aliases: { ACTIVE: enabled, PENDING: pending }
+      set_cookie:
+        ignore_cookies:
+          - "csrf_token" # duplicate of defaults — the decision-table dedup case
+          - "session_hint"
+        compare_values: presence
+    expectations:
+      typical_status: 200
+    tags: [read]
+
+  # set_cookie attribute-list merge; a route-only redact path; `seconds`.
+  - id: "create-session"
+    match:
+      methods: ["POST"]
+      path_template: "/sessions"
+    comparison:
+      json:
+        redact_paths:
+          - "$.user.token" # duplicate of defaults
+          - "$.session.token"
+        normalize_timestamps:
+          - path: "$.session.expiresAt"
+            precision: seconds
+      set_cookie:
+        ignore_attributes:
+          - "Expires" # duplicate of defaults
+          - "Max-Age" # both sides mint sessions at different clock instants
+    expectations:
+      typical_status: 201
+    tags: [write]
+
+  # `location` declared for the first time (route-only), with origin: ignore;
+  # set_cookie switched off by the master switch.
+  - id: "login-redirect"
+    match:
+      methods: ["GET"]
+      path_template: "/auth/login"
+    comparison:
+      compare_body: false
+      compare_headers:
+        - "cache-control"
+      set_cookie:
+        compare: false
+      location:
+        compare: true
+        ignore_query_params:
+          - "state"
+          - "nonce"
+        origin: ignore
+    expectations:
+      typical_status: 302
+      notes: >
+        Legacy and new redirect to different hosts for the same logical
+        destination, so only path + remaining query are compared.
+    tags: [read, redirect]
+
+  # An empty `location: {}` block: present, so the dimension is on and every
+  # field takes its resolved default.
+  - id: "logout-redirect"
+    match:
+      methods: ["POST"]
+      path_template: "/auth/logout"
+    comparison:
+      compare_status: false
+      location: {}
+    expectations:
+      typical_status: 303
+      notes: >
+        Legacy answers 302, new answers 303 — an intentional change, so the
+        status is not compared while the redirect target still is.
+    tags: [write, redirect, intentional-change]
+
+  # No `comparison` block at all: resolves to the service defaults verbatim.
+  - id: "health"
+    match:
+      methods: ["GET"]
+      path_template: "/health"
+    expectations:
+      typical_status: 200
+    tags: [read]

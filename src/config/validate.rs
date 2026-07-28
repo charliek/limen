@@ -437,12 +437,17 @@ fn validate_behavioral_source(
     if let Some(reference) = &route.contract {
         validate_contract_reference(loc, reference, base_dir, contracts, errs);
     } else if has_inline {
-        validate_jsonpaths(
-            loc,
-            "comparison",
-            &route.comparison.inline_behavioral(),
-            errs,
-        );
+        let inline = route.comparison.inline_behavioral();
+        validate_jsonpaths(loc, "comparison", &inline, errs);
+        // Inline rules speak the same vocabulary as a contract layer, so they
+        // are subject to the same `compare_headers`-vs-block conflict (§4.2);
+        // contract-referencing routes are covered by `validate_semantics`.
+        for (header, block) in contract_load::header_dimension_conflicts(&[&inline]) {
+            errs.push(
+                loc("comparison"),
+                contract_load::header_dimension_conflict_message(header, block),
+            );
+        }
     }
 }
 
@@ -690,6 +695,62 @@ routes:
         assert!(errs
             .iter()
             .any(|e| e.message.contains("outside the supported subset")));
+    }
+
+    #[test]
+    fn inline_compare_headers_conflicting_with_a_block_is_caught() {
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 1024
+      compare_headers: ["Content-Type", "Set-Cookie", "location"]
+      set_cookie: { compare_values: presence }
+      location: {}
+"#,
+        );
+        let conflicts: Vec<&str> = errs
+            .iter()
+            .filter(|e| e.message.contains("separate comparison dimension"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(conflicts.len(), 2, "{errs:?}");
+        assert!(conflicts.iter().any(|m| m.contains("`set_cookie`")));
+        assert!(conflicts.iter().any(|m| m.contains("`location`")));
+        // The location prefix names the offending route.
+        assert!(errs
+            .iter()
+            .filter(|e| e.message.contains("separate comparison dimension"))
+            .all(|e| e.location.contains("\"r\"")));
+    }
+
+    #[test]
+    fn inline_blocks_without_the_header_entry_are_fine() {
+        let config = parse(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 1024
+      compare_headers: ["content-type"]
+      set_cookie: { ignore_cookies: ["csrf_token"] }
+      location: { origin: ignore }
+"#,
+        );
+        assert!(validate(&config, &base()).is_ok());
     }
 
     #[test]

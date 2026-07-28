@@ -102,17 +102,31 @@ pub struct BehavioralRules {
     /// JSON normalization rules.
     #[serde(default)]
     pub json: Option<JsonRules>,
+    /// `Set-Cookie` comparison, an optional *dimension* of its own (spec §4.2).
+    /// Omitted at every layer = Set-Cookie is not compared at all.
+    #[serde(default)]
+    pub set_cookie: Option<SetCookieRules>,
+    /// `Location` comparison, an optional dimension of its own (spec §4.2).
+    /// Omitted at every layer = Location is not compared at all.
+    #[serde(default)]
+    pub location: Option<LocationRules>,
 }
 
 impl BehavioralRules {
     /// Whether this layer declares *any* behavioral rule. Used to detect an
     /// inline behavioral block on a Limen route (which conflicts with a
     /// contract reference; spec §4.4).
+    ///
+    /// An empty `set_cookie: {}` / `location: {}` *does* count: unlike an empty
+    /// `json: {}` (which normalizes nothing), the mere presence of those blocks
+    /// switches a comparison dimension on.
     pub fn is_present(&self) -> bool {
         self.compare_status.is_some()
             || self.compare_body.is_some()
             || self.compare_headers.is_some()
             || self.json.as_ref().is_some_and(|j| !j.is_empty())
+            || self.set_cookie.is_some()
+            || self.location.is_some()
     }
 
     /// Collect every JSONPath string this layer references, for subset
@@ -120,6 +134,67 @@ impl BehavioralRules {
     pub fn json_paths(&self) -> Vec<(&'static str, &str)> {
         self.json.as_ref().map(JsonRules::paths).unwrap_or_default()
     }
+}
+
+/// `Set-Cookie` comparison rules (spec §4.2 / Pharos §8.6). A *separate*
+/// comparison dimension reading every `Set-Cookie` value — not an extension of
+/// the single-value `compare_headers` allowlist, which is why listing
+/// `set-cookie` there while this block is present is a validation error.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetCookieRules {
+    /// Master switch; resolves to `true` when the block is present at all.
+    #[serde(default)]
+    pub compare: Option<bool>,
+    /// Cookie names excluded from comparison entirely.
+    #[serde(default)]
+    pub ignore_cookies: Vec<String>,
+    /// Cookie attribute names ignored (e.g. `Expires` — clock-dependent).
+    #[serde(default)]
+    pub ignore_attributes: Vec<String>,
+    /// Whether cookie *values* are compared; resolves to `exact`.
+    #[serde(default)]
+    pub compare_values: Option<CookieValueMode>,
+}
+
+/// How much of a cookie to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CookieValueMode {
+    /// Compare name, attributes, *and* value.
+    Exact,
+    /// Compare name and attributes; the value need only exist on both sides.
+    Presence,
+}
+
+/// `Location` comparison rules (spec §4.2 / Pharos §8.6). Like
+/// [`SetCookieRules`], a dimension of its own rather than a `compare_headers`
+/// entry.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocationRules {
+    /// Master switch; resolves to `true` when the block is present at all.
+    #[serde(default)]
+    pub compare: Option<bool>,
+    /// Query parameter names stripped from both sides before comparing
+    /// (e.g. `state`, `nonce`, `code`).
+    #[serde(default)]
+    pub ignore_query_params: Vec<String>,
+    /// Whether scheme+host+port participate in the comparison; resolves to
+    /// `exact`.
+    #[serde(default)]
+    pub origin: Option<OriginMode>,
+}
+
+/// How much of a `Location` URL to compare.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OriginMode {
+    /// Compare scheme+host+port along with path and remaining query.
+    Exact,
+    /// Compare only path and remaining query — for legacy and new
+    /// intentionally redirecting to different hosts for the same destination.
+    Ignore,
 }
 
 /// JSON normalization rules. All lists default empty and *merge by
@@ -230,7 +305,10 @@ pub struct NormalizeTimestamp {
 pub enum TimestampPrecision {
     /// Truncate to whole seconds.
     Seconds,
-    /// Truncate to whole milliseconds.
+    /// Truncate to whole milliseconds. Both spellings parse — `milliseconds`
+    /// is the canonical one documented by both tools, `millis` is Limen's
+    /// historical spelling kept accepted for lockstep with Pharos (spec §4.2).
+    #[serde(alias = "milliseconds")]
     Millis,
     /// Truncate to whole minutes.
     Minutes,
@@ -252,7 +330,11 @@ pub struct EnumAlias {
 
 /// Behavioral rules with every field resolved to a concrete value — the form
 /// the comparison engine consumes. Produced by [`crate::contract::merge`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Serialize` is implemented because the resolved shape is what the
+/// cross-engine lockstep table (`tests/lockstep/decisions.json`) records, so a
+/// renamed field must fail conformance rather than pass a hand-written mirror.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ComparisonRules {
     /// Whether to compare the HTTP status code.
     pub compare_status: bool,
@@ -262,18 +344,50 @@ pub struct ComparisonRules {
     pub compare_headers: Vec<String>,
     /// Resolved JSON normalization rules.
     pub json: JsonRules,
+    /// Resolved `Set-Cookie` rules, or `None` when no layer declared the block
+    /// — the dimension is then not compared at all.
+    pub set_cookie: Option<ResolvedSetCookieRules>,
+    /// Resolved `Location` rules, or `None` when no layer declared the block.
+    pub location: Option<ResolvedLocationRules>,
 }
 
 impl Default for ComparisonRules {
     fn default() -> Self {
-        // Safe defaults (spec §4.2): compare status and body, no headers.
+        // Safe defaults (spec §4.2): compare status and body, no headers, and
+        // neither optional dimension enabled.
         Self {
             compare_status: true,
             compare_body: true,
             compare_headers: Vec::new(),
             json: JsonRules::default(),
+            set_cookie: None,
+            location: None,
         }
     }
+}
+
+/// [`SetCookieRules`] with every field resolved to a concrete value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResolvedSetCookieRules {
+    /// Whether to compare `Set-Cookie` at all.
+    pub compare: bool,
+    /// Cookie names excluded from comparison entirely.
+    pub ignore_cookies: Vec<String>,
+    /// Cookie attribute names ignored.
+    pub ignore_attributes: Vec<String>,
+    /// Whether cookie values are compared.
+    pub compare_values: CookieValueMode,
+}
+
+/// [`LocationRules`] with every field resolved to a concrete value.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ResolvedLocationRules {
+    /// Whether to compare `Location` at all.
+    pub compare: bool,
+    /// Query parameter names stripped from both sides before comparing.
+    pub ignore_query_params: Vec<String>,
+    /// Whether scheme+host+port participate in the comparison.
+    pub origin: OriginMode,
 }
 
 #[cfg(test)]
@@ -302,6 +416,71 @@ mod tests {
             ..Default::default()
         }
         .is_present());
+        // An empty `set_cookie: {}` *does* count — its presence enables a
+        // comparison dimension.
+        assert!(BehavioralRules {
+            set_cookie: Some(SetCookieRules::default()),
+            ..Default::default()
+        }
+        .is_present());
+        assert!(BehavioralRules {
+            location: Some(LocationRules::default()),
+            ..Default::default()
+        }
+        .is_present());
+    }
+
+    #[test]
+    fn timestamp_precision_accepts_both_millis_spellings() {
+        let millis: TimestampPrecision = serde_yaml::from_str("millis").unwrap();
+        let milliseconds: TimestampPrecision = serde_yaml::from_str("milliseconds").unwrap();
+        assert_eq!(millis, TimestampPrecision::Millis);
+        assert_eq!(milliseconds, TimestampPrecision::Millis);
+        // Serialization stays on Limen's historical spelling.
+        assert_eq!(
+            serde_json::to_string(&TimestampPrecision::Millis).unwrap(),
+            "\"millis\""
+        );
+    }
+
+    #[test]
+    fn deserializes_set_cookie_and_location_blocks() {
+        let yaml = r#"
+set_cookie:
+  compare: true
+  ignore_cookies: [csrf_token]
+  ignore_attributes: [Expires]
+  compare_values: presence
+location:
+  ignore_query_params: [state, nonce]
+  origin: ignore
+"#;
+        let rules: BehavioralRules = serde_yaml::from_str(yaml).unwrap();
+        let sc = rules.set_cookie.unwrap();
+        assert_eq!(sc.compare, Some(true));
+        assert_eq!(sc.ignore_cookies, vec!["csrf_token"]);
+        assert_eq!(sc.ignore_attributes, vec!["Expires"]);
+        assert_eq!(sc.compare_values, Some(CookieValueMode::Presence));
+        let loc = rules.location.unwrap();
+        assert_eq!(loc.compare, None);
+        assert_eq!(loc.ignore_query_params, vec!["state", "nonce"]);
+        assert_eq!(loc.origin, Some(OriginMode::Ignore));
+    }
+
+    #[test]
+    fn empty_set_cookie_and_location_blocks_parse() {
+        let rules: BehavioralRules =
+            serde_yaml::from_str("set_cookie: {}\nlocation: {}\n").unwrap();
+        assert_eq!(rules.set_cookie, Some(SetCookieRules::default()));
+        assert_eq!(rules.location, Some(LocationRules::default()));
+    }
+
+    #[test]
+    fn rejects_unknown_fields_in_new_blocks() {
+        assert!(
+            serde_yaml::from_str::<BehavioralRules>("set_cookie:\n  ignore_cookie: [a]\n").is_err()
+        );
+        assert!(serde_yaml::from_str::<BehavioralRules>("location:\n  origin: partial\n").is_err());
     }
 
     #[test]

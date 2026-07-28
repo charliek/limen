@@ -275,6 +275,15 @@ defaults:
     enum_aliases:
       - path: "$.status"
         aliases: { ACTIVE: enabled, INACTIVE: disabled }
+  set_cookie:                    # optional; omitted = not compared (see below)
+    compare: true
+    ignore_cookies: []
+    ignore_attributes: []
+    compare_values: exact        # exact | presence
+  location:                      # optional; omitted = not compared (see below)
+    compare: true
+    ignore_query_params: []
+    origin: exact                # exact | ignore
 
 routes:
   - id: "get-device"
@@ -303,13 +312,78 @@ routes:
     tags: [read, migration-ready]
 ```
 
+#### Timestamp precision spellings
+
+`normalize_timestamps[].precision` accepts both `milliseconds` and `millis`
+(Limen's historical spelling) in **both** tools — a deliberate lockstep
+accommodation so one contract file parses in either. The two spellings resolve
+to the same precision.
+
+Write `milliseconds` in authored contracts by convention; it is the spelling
+Pharos's documentation uses, so a hand-written or AI-drafted contract reads the
+same on both sides. Limen's own serializer emits `millis` — an implementation
+detail rather than a canonicalization, and harmless because Pharos accepts that
+spelling too, so a Limen-generated contract is still valid input to both tools.
+
+The other values are `seconds`, `minutes`, `hours`, `days`.
+
+#### `set_cookie` and `location` comparison
+
+Two additional, **optional** comparison dimensions, read from every
+`Set-Cookie` response header and from the `Location` response header — not
+from the single-value header map that `compare_headers` uses. Both are legal
+at the `defaults` and per-route `comparison` levels, exactly like `json`; both
+are omitted from the example routes above purely for brevity. Omitted at every
+layer, the dimension is **not compared at all** (today's behavior).
+
+**`set_cookie` semantics:** each side's `Set-Cookie` values are parsed into
+`(name, value, attribute map)` tuples. Cookies are paired across sides **by
+name**; duplicate names on one side pair **positionally** within the name
+group. Attribute names are compared case-insensitively; attribute values are
+compared exactly, except for attributes listed in `ignore_attributes`. Cookies
+named in `ignore_cookies` are excluded entirely. A cookie present on one side
+only is a mismatch. `compare_values: presence` compares only that a value
+exists on both sides (plus the attribute map) without comparing the value
+itself; `exact` also compares the value.
+
+**`location` semantics:** the `Location` header is parsed as a URL on both
+sides. A **relative** `Location` value is resolved against the URL of the
+request that produced the response (RFC 9110 §10.2.2) before any part-wise
+comparison, so a legacy `/next?x=1` and a new `https://new.example/next?x=1`
+compare as the same target when each is resolved against its own request URL.
+Query params named in `ignore_query_params` are removed from both sides before
+comparing. `origin: exact` compares scheme+host+port as well as path and
+remaining query; `origin: ignore` compares only path and remaining query — for
+cases where legacy and new intentionally redirect to different hosts for the
+same logical destination.
+
+**Both:** a value that cannot be parsed — a malformed Set-Cookie, or a
+`Location` whose resolution against the request URL fails — falls back to
+**exact string comparison** and counts as a mismatch if the sides differ. A
+`Location` that resolves successfully is always compared part-wise, never as a
+raw string. Redaction (Section 7.5) still applies to rendered values — a
+`set_cookie` mismatch never renders a raw cookie value (name and attribute diff
+only), per the no-secret-value invariant.
+
+**`compare_headers` conflict:** because these are separate dimensions rather
+than `compare_headers` entries, listing `set-cookie` or `location` (in any
+case) in a `compare_headers` list while the corresponding block is present
+anywhere in a route's resolved rules is a **load-time validation error** — the
+block wins conceptually, and the error keeps the author's intent unambiguous.
+
+**Lockstep:** this vocabulary — field names, parsing, merge (Section 4.4), and
+validation semantics — must remain **identical** between Limen and Pharos, the
+same obligation as the JSONPath subset (Section 7.4). The shared fixture in
+`tests/lockstep/` (a byte-identical twin of the Pharos copy) plus its
+`decisions.json` table pin the resolution rules in both engines.
+
 ### 4.3 What lives in the contract vs. in Limen config
 
 This split is the rule that keeps the two artifacts from ever conflicting — they occupy **distinct key namespaces**:
 
 | Concern | Lives in | Rationale |
 |---|---|---|
-| **What** to compare and **how** (`ignore_paths`, `redact_paths`, `sort_arrays`, `unordered_arrays`, `normalize_timestamps`, `enum_aliases`, `compare_status`, `compare_body`, `compare_headers`) | **Contract** | Behavioral truth, shared with and refined by Pharos. |
+| **What** to compare and **how** (`ignore_paths`, `redact_paths`, `sort_arrays`, `unordered_arrays`, `normalize_timestamps`, `enum_aliases`, `compare_status`, `compare_body`, `compare_headers`, `set_cookie`, `location`) | **Contract** | Behavioral truth, shared with and refined by Pharos. |
 | **Whether / how often / how much** to compare operationally (`enabled`, `sample_rate`, `max_body_bytes`) | **Limen route config** | Runtime cost/volume policy, deployment-specific. |
 | Routing, upstreams, rollout, timeouts, circuit breaker, flags, server | **Limen route config** | Pure operational concern; Pharos has no equivalent. |
 
@@ -513,7 +587,7 @@ Writes are **never** shadowed by default.
 5. If bodies are non-JSON → record a **body mismatch** without structural diff.
 6. Sample and **redact** detailed diffs before logging.
 
-Default comparison dimensions: **HTTP status** and **normalized body**. Headers are compared **only** when explicitly listed in the contract's `compare_headers`.
+Default comparison dimensions: **HTTP status** and **normalized body**. Headers are compared **only** when explicitly listed in the contract's `compare_headers`. `Set-Cookie` and `Location` have their own optional dimensions, enabled by the contract's `set_cookie` / `location` blocks (Section 4.2).
 
 ### 7.2 Normalization (runs before hashing and diffing)
 
@@ -524,7 +598,7 @@ Supported transformations, all driven by the merged contract rules:
 - **Redact configured JSON paths** for diff output (`redact_paths`).
 - **Sort arrays** by a configured key (`sort_arrays`).
 - **Treat configured arrays as unordered sets** (`unordered_arrays`).
-- **Normalize timestamps** to a configured precision (`normalize_timestamps`).
+- **Normalize timestamps** to a configured precision (`normalize_timestamps`; both `milliseconds` and `millis` spellings accepted — Section 4.2).
 - **Map equivalent enum aliases** (`enum_aliases`).
 
 Normalization must be deterministic and order-independent in its result.

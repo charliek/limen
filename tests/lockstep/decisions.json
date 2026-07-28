@@ -1,0 +1,261 @@
+{
+  "$comment": "Byte-identical twin of pharos tests/fixtures/lockstep/decisions.json — update BOTH or CI fails. Engine-neutral assertions about lockstep.contract.yaml: plain JSON facts that a Rust test and a TypeScript test can both replay through their own loader and merge code. `merge_cases` pins contract resolution; a `verdict_cases` table (response pair -> expected verdict) is added additively once both comparison engines implement the set_cookie/location dimensions.",
+  "contract": "lockstep.contract.yaml",
+  "notes": {
+    "timestamp_precision": "`precision` is spelled canonically here (`milliseconds`), whatever spelling the contract used. Both engines accept `millis` and `milliseconds` and must resolve them to the same precision; each engine canonicalizes before comparing against this table.",
+    "resolution": "Every expected_rules block is the full resolution of service `defaults` plus that route's `comparison` — scalars override, lists concatenate defaults-then-route and de-duplicate preserving first occurrence.",
+    "absent_dimension": "`set_cookie`/`location` are null when no layer declared the block: the dimension is not compared at all."
+  },
+  "merge_cases": [
+    {
+      "id": "get-user-list-concat-and-dedup",
+      "route_id": "get-user",
+      "asserts": [
+        "compare_headers concatenates defaults then route and de-duplicates",
+        "ignore_paths de-duplicates an entry repeated in both layers",
+        "`millis` and `milliseconds` resolve to the same precision",
+        "location stays null when no layer declares the block",
+        "a defaults-only set_cookie block reaches a route that never mentions it"
+      ],
+      "expected_rules": {
+        "compare_status": true,
+        "compare_body": true,
+        "compare_headers": ["content-type", "etag"],
+        "json": {
+          "ignore_paths": [
+            "$.metadata.requestId",
+            "$.metadata.generatedAt",
+            "$.user.lastSeenAt"
+          ],
+          "redact_paths": ["$.user.email", "$.user.token"],
+          "sort_arrays": [{ "path": "$.users", "key": "id" }],
+          "unordered_arrays": [{ "path": "$.user.permissions" }],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" },
+            { "path": "$.user.createdAt", "precision": "milliseconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": true,
+          "ignore_cookies": ["csrf_token"],
+          "ignore_attributes": ["Expires"],
+          "compare_values": "exact"
+        },
+        "location": null
+      }
+    },
+    {
+      "id": "list-users-scalar-override-and-struct-dedup",
+      "route_id": "list-users",
+      "asserts": [
+        "a route scalar (compare_body) overrides the defaults scalar",
+        "structured list entries (sort_arrays, unordered_arrays) de-duplicate by whole value",
+        "set_cookie.ignore_cookies de-duplicates across defaults + route",
+        "set_cookie.compare_values is a scalar override inside the block",
+        "set_cookie.compare and ignore_attributes still come from defaults"
+      ],
+      "expected_rules": {
+        "compare_status": true,
+        "compare_body": false,
+        "compare_headers": ["content-type"],
+        "json": {
+          "ignore_paths": ["$.metadata.requestId", "$.metadata.generatedAt"],
+          "redact_paths": ["$.user.email", "$.user.token"],
+          "sort_arrays": [
+            { "path": "$.users", "key": "id" },
+            { "path": "$.users[*].devices", "key": "id" }
+          ],
+          "unordered_arrays": [
+            { "path": "$.user.permissions" },
+            { "path": "$.tags" }
+          ],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" },
+            { "path": "$.users[*].createdAt", "precision": "milliseconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            },
+            {
+              "path": "$.users[*].status",
+              "aliases": { "ACTIVE": "enabled", "PENDING": "pending" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": true,
+          "ignore_cookies": ["csrf_token", "session_hint"],
+          "ignore_attributes": ["Expires"],
+          "compare_values": "presence"
+        },
+        "location": null
+      }
+    },
+    {
+      "id": "create-session-attribute-merge",
+      "route_id": "create-session",
+      "asserts": [
+        "set_cookie.ignore_attributes concatenates and de-duplicates",
+        "redact_paths de-duplicates an entry repeated in both layers",
+        "`seconds` precision survives alongside a defaults-level `milliseconds` rule"
+      ],
+      "expected_rules": {
+        "compare_status": true,
+        "compare_body": true,
+        "compare_headers": ["content-type"],
+        "json": {
+          "ignore_paths": ["$.metadata.requestId", "$.metadata.generatedAt"],
+          "redact_paths": [
+            "$.user.email",
+            "$.user.token",
+            "$.session.token"
+          ],
+          "sort_arrays": [{ "path": "$.users", "key": "id" }],
+          "unordered_arrays": [{ "path": "$.user.permissions" }],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" },
+            { "path": "$.session.expiresAt", "precision": "seconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": true,
+          "ignore_cookies": ["csrf_token"],
+          "ignore_attributes": ["Expires", "Max-Age"],
+          "compare_values": "exact"
+        },
+        "location": null
+      }
+    },
+    {
+      "id": "login-redirect-location-origin-ignore",
+      "route_id": "login-redirect",
+      "asserts": [
+        "a route-only location block resolves even though defaults omit it",
+        "location.origin is a scalar taken from the route",
+        "location.ignore_query_params keeps its authored order",
+        "set_cookie.compare: false switches the dimension off without clearing its lists"
+      ],
+      "expected_rules": {
+        "compare_status": true,
+        "compare_body": false,
+        "compare_headers": ["content-type", "cache-control"],
+        "json": {
+          "ignore_paths": ["$.metadata.requestId", "$.metadata.generatedAt"],
+          "redact_paths": ["$.user.email", "$.user.token"],
+          "sort_arrays": [{ "path": "$.users", "key": "id" }],
+          "unordered_arrays": [{ "path": "$.user.permissions" }],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": false,
+          "ignore_cookies": ["csrf_token"],
+          "ignore_attributes": ["Expires"],
+          "compare_values": "exact"
+        },
+        "location": {
+          "compare": true,
+          "ignore_query_params": ["state", "nonce"],
+          "origin": "ignore"
+        }
+      }
+    },
+    {
+      "id": "logout-redirect-empty-block-defaults",
+      "route_id": "logout-redirect",
+      "asserts": [
+        "an empty `location: {}` block turns the dimension on",
+        "omitted fields inside a present block take their resolved defaults (compare: true, origin: exact)",
+        "compare_status: false is a route scalar override"
+      ],
+      "expected_rules": {
+        "compare_status": false,
+        "compare_body": true,
+        "compare_headers": ["content-type"],
+        "json": {
+          "ignore_paths": ["$.metadata.requestId", "$.metadata.generatedAt"],
+          "redact_paths": ["$.user.email", "$.user.token"],
+          "sort_arrays": [{ "path": "$.users", "key": "id" }],
+          "unordered_arrays": [{ "path": "$.user.permissions" }],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": true,
+          "ignore_cookies": ["csrf_token"],
+          "ignore_attributes": ["Expires"],
+          "compare_values": "exact"
+        },
+        "location": {
+          "compare": true,
+          "ignore_query_params": [],
+          "origin": "exact"
+        }
+      }
+    },
+    {
+      "id": "health-inherits-defaults-verbatim",
+      "route_id": "health",
+      "asserts": [
+        "a route with no `comparison` block resolves to the service defaults",
+        "the defaults-level set_cookie block still applies",
+        "location remains null"
+      ],
+      "expected_rules": {
+        "compare_status": true,
+        "compare_body": true,
+        "compare_headers": ["content-type"],
+        "json": {
+          "ignore_paths": ["$.metadata.requestId", "$.metadata.generatedAt"],
+          "redact_paths": ["$.user.email", "$.user.token"],
+          "sort_arrays": [{ "path": "$.users", "key": "id" }],
+          "unordered_arrays": [{ "path": "$.user.permissions" }],
+          "normalize_timestamps": [
+            { "path": "$.metadata.servedAt", "precision": "milliseconds" }
+          ],
+          "enum_aliases": [
+            {
+              "path": "$.user.status",
+              "aliases": { "ACTIVE": "enabled", "INACTIVE": "disabled" }
+            }
+          ]
+        },
+        "set_cookie": {
+          "compare": true,
+          "ignore_cookies": ["csrf_token"],
+          "ignore_attributes": ["Expires"],
+          "compare_values": "exact"
+        },
+        "location": null
+      }
+    }
+  ]
+}

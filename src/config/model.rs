@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::model::{BehavioralRules, JsonRules};
+use crate::contract::model::{BehavioralRules, JsonRules, LocationRules, SetCookieRules};
 use crate::flags::FlagValue;
 
 /// The top-level configuration document.
@@ -376,6 +376,12 @@ pub struct ComparisonConfig {
     /// Inline: JSON normalization rules (behavioral; conflicts with `contract`).
     #[serde(default)]
     pub json: Option<JsonRules>,
+    /// Inline: `Set-Cookie` comparison (behavioral; conflicts with `contract`).
+    #[serde(default)]
+    pub set_cookie: Option<SetCookieRules>,
+    /// Inline: `Location` comparison (behavioral; conflicts with `contract`).
+    #[serde(default)]
+    pub location: Option<LocationRules>,
 }
 
 impl Default for ComparisonConfig {
@@ -388,6 +394,8 @@ impl Default for ComparisonConfig {
             compare_body: None,
             compare_headers: None,
             json: None,
+            set_cookie: None,
+            location: None,
         }
     }
 }
@@ -404,6 +412,8 @@ impl ComparisonConfig {
             || self.compare_body.is_some()
             || self.compare_headers.is_some()
             || self.json.is_some()
+            || self.set_cookie.is_some()
+            || self.location.is_some()
     }
 
     /// The inline behavioral rules expressed as a mergeable layer.
@@ -413,6 +423,8 @@ impl ComparisonConfig {
             compare_body: self.compare_body,
             compare_headers: self.compare_headers.clone(),
             json: self.json.clone(),
+            set_cookie: self.set_cookie.clone(),
+            location: self.location.clone(),
         }
     }
 }
