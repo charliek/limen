@@ -14,8 +14,8 @@ use std::path::{Path, PathBuf};
 
 use crate::compare::jsonpath;
 use crate::config::model::{
-    BudgetConfig, CircuitBreakerConfig, Config, FlagProviderKind, FlagsConfig, RolloutConfig,
-    RouteConfig, RouteMode, TimeoutsConfig, UpstreamTlsConfig,
+    BudgetConfig, CircuitBreakerConfig, Config, DiffSinkConfig, FlagProviderKind, FlagsConfig,
+    RolloutConfig, RouteConfig, RouteMode, TimeoutsConfig, UpstreamTlsConfig,
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
@@ -107,6 +107,7 @@ pub fn validate(config: &Config, base_dir: &Path) -> Result<(), Vec<ValidationEr
 
     validate_tls(&config.upstream_tls, &mut errs);
     validate_flags(&config.flags, &mut errs);
+    validate_diff_sink(config.diff_sink.as_ref(), &mut errs);
 
     let mut seen_ids: HashSet<&str> = HashSet::new();
     let mut contracts = ContractCache::default();
@@ -171,6 +172,16 @@ fn validate_flags(flags: &FlagsConfig, errs: &mut Errors) {
                 errs.push("flags.redis.refresh_interval_ms", "must be greater than 0");
             }
         }
+    }
+}
+
+/// Validate the optional diff sink. Only the *shape* is checked: the directory
+/// is created on the first mismatch, so requiring it (or its parent) to exist at
+/// startup would make a fresh deploy fail validation for no reason.
+fn validate_diff_sink(sink: Option<&DiffSinkConfig>, errs: &mut Errors) {
+    let Some(sink) = sink else { return };
+    if sink.dir.as_os_str().is_empty() {
+        errs.push("diff_sink.dir", "must not be empty");
     }
 }
 
@@ -829,6 +840,21 @@ flags:
 "#,
         );
         assert!(locations(&errs).contains(&"flags.redis.url"));
+    }
+
+    #[test]
+    fn diff_sink_dir_must_be_non_empty_but_need_not_exist() {
+        // A directory that does not exist (nor its parent) is fine — the sink
+        // creates it on the first mismatch.
+        let ok = parse("diff_sink:\n  dir: \"/nonexistent-parent/limen-diffs\"\n");
+        assert_eq!(
+            ok.diff_sink.as_ref().unwrap().dir,
+            PathBuf::from("/nonexistent-parent/limen-diffs")
+        );
+        assert!(validate(&ok, &base()).is_ok());
+
+        let errs = errors("diff_sink:\n  dir: \"\"\n");
+        assert!(locations(&errs).contains(&"diff_sink.dir"));
     }
 
     #[test]

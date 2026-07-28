@@ -6,6 +6,8 @@
 //! log. The trait indirection keeps the shadow path testable: a test supplies a
 //! capturing observer to assert on outcomes without scraping metrics or logs.
 
+use std::sync::Arc;
+
 use axum::http::Method;
 use tracing::{debug, warn};
 
@@ -85,6 +87,52 @@ pub trait ShadowObserver: Send + Sync {
     fn shadow_failed(&self, meta: &ShadowMeta, failure: ShadowFailure);
     /// A comparison was not performed (e.g. a response was too large to buffer).
     fn comparison_skipped(&self, meta: &ShadowMeta, reason: SkipReason);
+}
+
+/// Delivers every callback to several observers in order.
+///
+/// The seam that lets an optional surface (today: the
+/// [diff sink][crate::observability::sink::SinkObserver]) be added *alongside*
+/// [`MetricsObserver`] rather than in place of it — metrics and logs keep
+/// working exactly as before whether or not the sink is configured.
+pub struct Fanout {
+    observers: Vec<Arc<dyn ShadowObserver>>,
+}
+
+impl Fanout {
+    /// Fan out to `observers`, in the given order.
+    pub fn new(observers: Vec<Arc<dyn ShadowObserver>>) -> Self {
+        Self { observers }
+    }
+
+    /// Invoke one callback on every observer, in order.
+    fn each(&self, callback: impl Fn(&dyn ShadowObserver)) {
+        for observer in &self.observers {
+            callback(observer.as_ref());
+        }
+    }
+}
+
+impl ShadowObserver for Fanout {
+    fn shadow_dispatched(&self, meta: &ShadowMeta) {
+        self.each(|o| o.shadow_dispatched(meta));
+    }
+
+    fn comparison(&self, meta: &ShadowMeta, result: &ComparisonResult) {
+        self.each(|o| o.comparison(meta, result));
+    }
+
+    fn shadow_skipped(&self, meta: &ShadowMeta, reason: SkipReason) {
+        self.each(|o| o.shadow_skipped(meta, reason));
+    }
+
+    fn shadow_failed(&self, meta: &ShadowMeta, failure: ShadowFailure) {
+        self.each(|o| o.shadow_failed(meta, failure));
+    }
+
+    fn comparison_skipped(&self, meta: &ShadowMeta, reason: SkipReason) {
+        self.each(|o| o.comparison_skipped(meta, reason));
+    }
 }
 
 /// The production observer: records Prometheus metrics and emits the redacted
@@ -225,5 +273,42 @@ mod tests {
         assert!(rendered.contains(r#"reason="timeout""#));
         assert!(rendered.contains("limen_comparison_skipped_total"));
         assert!(rendered.contains(r#"reason="response_too_large""#));
+    }
+
+    #[test]
+    fn fanout_delivers_every_callback_to_every_observer() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[derive(Default)]
+        struct Counting(AtomicUsize);
+        impl ShadowObserver for Counting {
+            fn shadow_dispatched(&self, _: &ShadowMeta) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn comparison(&self, _: &ShadowMeta, _: &ComparisonResult) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn shadow_skipped(&self, _: &ShadowMeta, _: SkipReason) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn shadow_failed(&self, _: &ShadowMeta, _: ShadowFailure) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+            fn comparison_skipped(&self, _: &ShadowMeta, _: SkipReason) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let a = Arc::new(Counting::default());
+        let b = Arc::new(Counting::default());
+        let fanout = Fanout::new(vec![a.clone(), b.clone()]);
+        fanout.shadow_dispatched(&meta());
+        fanout.comparison(&meta(), &result(false));
+        fanout.shadow_skipped(&meta(), SkipReason::ConcurrencyLimit);
+        fanout.shadow_failed(&meta(), ShadowFailure::Error);
+        fanout.comparison_skipped(&meta(), SkipReason::ResponseTooLarge);
+
+        assert_eq!(a.0.load(Ordering::Relaxed), 5);
+        assert_eq!(b.0.load(Ordering::Relaxed), 5);
     }
 }

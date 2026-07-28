@@ -21,7 +21,7 @@ use crate::flags::FlagProvider;
 use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
-use crate::observability::{prometheus, MetricsObserver, ShadowObserver};
+use crate::observability::{prometheus, Fanout, MetricsObserver, ShadowObserver, SinkObserver};
 use crate::resilience::ShadowLimiter;
 use crate::routing::RouteTable;
 
@@ -113,9 +113,22 @@ impl AppState {
 }
 
 /// Build the data-plane application state from a (validated) config, using the
-/// production [`MetricsObserver`]. `base_dir` resolves relative contract refs.
+/// production [`MetricsObserver`] — fanned out alongside a
+/// [`SinkObserver`] when `diff_sink` is configured, so persistence is *added*
+/// to metrics and logs rather than replacing them. `base_dir` resolves relative
+/// contract refs.
 pub fn build_state(config: &Config, base_dir: &Path) -> anyhow::Result<AppState> {
-    let observer: Arc<dyn ShadowObserver> = Arc::new(MetricsObserver::new());
+    let metrics: Arc<dyn ShadowObserver> = Arc::new(MetricsObserver::new());
+    let observer: Arc<dyn ShadowObserver> = match &config.diff_sink {
+        Some(sink) => {
+            info!(dir = %sink.dir.display(), "mismatch diff sink enabled");
+            Arc::new(Fanout::new(vec![
+                metrics,
+                Arc::new(SinkObserver::new(sink.dir.clone())),
+            ]))
+        }
+        None => metrics,
+    };
     build_state_with_observer(config, base_dir, observer)
 }
 

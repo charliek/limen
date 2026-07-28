@@ -33,9 +33,27 @@ pub struct Config {
     /// Feature-flag provider and fail-safe policy.
     #[serde(default)]
     pub flags: FlagsConfig,
+    /// Optional durable sink for comparison mismatches (spec §10.4). Absent =
+    /// mismatches are counted and logged only.
+    #[serde(default)]
+    pub diff_sink: Option<DiffSinkConfig>,
     /// The routing table.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+/// The durable mismatch sink (spec §10.4).
+///
+/// Declaring the block turns the sink on; there is nothing to enable
+/// separately, and no retention policy — files rotate by UTC date and are left
+/// for the operator's existing log-retention tooling to prune.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffSinkConfig {
+    /// Directory the daily `mismatches-<YYYY-MM-DD>.jsonl` files are written
+    /// to. Relative paths resolve against the process working directory (like
+    /// `flags.file.path`), and the directory is created on the first mismatch.
+    pub dir: PathBuf,
 }
 
 /// Data-plane listener configuration.

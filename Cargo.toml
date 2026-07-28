@@ -61,8 +61,9 @@ async-trait = "0.1"
 futures = "0.3"
 rand = "0.9"
 url = "2"
-# RFC3339 parsing for timestamp normalization (convert to UTC before truncating).
-time = { version = "0.3", features = ["parsing"] }
+# RFC3339 parsing for timestamp normalization (convert to UTC before truncating);
+# formatting for the diff sink's record timestamps and daily file names.
+time = { version = "0.3", features = ["parsing", "formatting"] }
 
 # Redis flag provider (async; cached + polled). `redis` is the more ubiquitous
 # of the two options in the spec; the provider sits behind the FlagProvider

@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Method, Request};
-use common::{config_from_yaml, parts, router_with_observer, send};
+use common::{config_from_yaml, parts, router, router_with_observer, send};
 use limen::compare::result::ComparisonResult;
-use limen::observability::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+use limen::observability::{
+    Fanout, ShadowFailure, ShadowMeta, ShadowObserver, SinkObserver, SkipReason,
+};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -227,6 +229,139 @@ async fn shadow_meta_carries_request_id_route_method_and_path() {
     assert_eq!(meta.route_id, "r");
     assert_eq!(meta.method, Method::GET);
     assert_eq!(meta.path, "/devices/42");
+}
+
+/// The `diff_sink` config block wires a [`limen::observability::SinkObserver`]
+/// in *alongside* the production metrics observer (`build_state`'s fan-out), so
+/// a real mismatch through the router lands on disk with the request's own id.
+#[tokio::test]
+async fn diff_sink_persists_a_mismatch_with_the_request_id() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/devices/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"name":"A"}"#))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/devices/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"name":"B"}"#))
+        .mount(&new)
+        .await;
+
+    let dir = tempfile::tempdir().unwrap();
+    let sink_dir = dir.path().join("diffs");
+    let cfg = config_from_yaml(&format!(
+        r#"
+diff_sink:
+  dir: "{}"
+routes:
+  - id: r
+    match: {{ methods: ["GET"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    comparison: {{ enabled: true, sample_rate: 1.0, max_body_bytes: 262144 }}
+"#,
+        sink_dir.display(),
+        legacy.uri(),
+        new.uri()
+    ));
+    // The production builder (not the test observer hook), so this exercises
+    // the real fan-out wiring.
+    let app = router(&cfg);
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .uri("/devices/7")
+            .header("x-request-id", "sink-req-7")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    let (status, _, body) = parts(resp).await;
+    assert_eq!(status, 200);
+    assert_eq!(body, r#"{"name":"A"}"#, "client is unaffected by the sink");
+
+    // The sink writes from the detached shadow task, so poll for the file.
+    let read_sink = || -> Option<String> {
+        let mut entries: Vec<std::path::PathBuf> = std::fs::read_dir(&sink_dir)
+            .ok()?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .collect();
+        entries.sort();
+        let first = entries.first()?;
+        std::fs::read_to_string(first)
+            .ok()
+            .filter(|s| !s.is_empty())
+    };
+    wait_until(|| read_sink().is_some()).await;
+
+    let contents = read_sink().unwrap();
+    assert_eq!(contents.lines().count(), 1);
+    let record: serde_json::Value = serde_json::from_str(contents.lines().next().unwrap()).unwrap();
+    assert_eq!(record["route_id"], "r");
+    assert_eq!(record["request_id"], "sink-req-7");
+    assert_eq!(record["method"], "GET");
+    assert_eq!(record["path"], "/devices/7");
+    assert_eq!(record["body_match"], false);
+    assert_eq!(record["mismatch_kinds"], serde_json::json!(["body"]));
+    assert_eq!(record["differences"][0]["path"], "$.name");
+
+    // And the report reads it back, keyed by route.
+    let report = limen::observability::sink::read_report(
+        &sink_dir,
+        &limen::observability::sink::ReportFilter::default(),
+        3,
+    )
+    .unwrap();
+    assert_eq!(report.total, 1);
+    assert_eq!(report.routes[0].route_id, "r");
+    assert_eq!(report.routes[0].examples[0].request_id, "sink-req-7");
+}
+
+/// A matching comparison through the same wiring leaves the sink directory
+/// untouched — the sink is a mismatch archive, not a request log.
+#[tokio::test]
+async fn diff_sink_writes_nothing_when_the_responses_match() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    for server in [&legacy, &new] {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"name":"A"}"#))
+            .mount(server)
+            .await;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let sink_dir = dir.path().join("diffs");
+    // Sink first, capture second: when the capture has seen the comparison, the
+    // sink has already had its turn — so the assertion below is deterministic
+    // rather than a race against a sleep.
+    let capture = Capture::default();
+    let observer = Fanout::new(vec![
+        Arc::new(SinkObserver::new(&sink_dir)),
+        Arc::new(capture.clone()),
+    ]);
+    let app = router_with_observer(
+        &shadow_config(&legacy.uri(), &new.uri(), 2000),
+        Arc::new(observer),
+    );
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .uri("/devices/1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    wait_until(|| !capture.comparisons().is_empty()).await;
+    assert!(capture.comparisons()[0].1.is_match());
+    assert!(!sink_dir.exists(), "a match must not create the sink dir");
 }
 
 #[tokio::test]

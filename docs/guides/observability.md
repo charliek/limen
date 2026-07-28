@@ -110,6 +110,74 @@ Every request is correlated by an `x-request-id`:
 - standard upstream trace headers (`traceparent`, `b3`, …) are forwarded
   unchanged, so existing distributed traces are preserved.
 
+## Durable mismatch diffs
+
+Metrics tell you *that* a route is diverging; the `limen.response_mismatch` log
+tells you *how* — but only until your log buffer rolls. For triage that outlives
+the logs, turn on the **diff sink** (spec §10.4):
+
+```yaml
+diff_sink:
+  dir: "./limen-diffs"
+```
+
+Every comparison mismatch is then appended as one JSON object to
+`<dir>/mismatches-<UTC date>.jsonl`, *in addition to* the metrics and the log
+line — the sink is fanned out alongside them, never in place of them. Matches
+write nothing; a run with no mismatches never even creates the directory.
+
+```json
+{"timestamp":"2026-07-28T10:00:05Z","route_id":"get-device","request_id":"0f2c…",
+ "method":"GET","path":"/devices/42","legacy_status":200,"new_status":200,
+ "status_match":true,"body_match":false,"mismatch_kinds":["body"],
+ "differences":[{"path":"$.device.name","kind":"changed","legacy":"A","new":"B"}],
+ "header_mismatches":[],"cookie_mismatches":[],"location_mismatches":[],
+ "diff_truncated":false}
+```
+
+!!! warning "Same redaction, one more surface"
+    Sink records carry exactly what the mismatch log carries: values the
+    comparison engine already redacted (`redact_paths`, sensitive headers,
+    sensitive query params, and cookie values — which are *never* rendered, only
+    names and attributes). It is still a file on disk holding response fragments,
+    so treat the directory like a log directory: same permissions, same
+    retention, same review.
+
+Rotation is by date only — **retention is yours**. Point your existing
+log-retention tooling (`logrotate`, a cron `find -mtime +N -delete`, a lifecycle
+policy on the mounted volume) at the directory. The sink never blocks the client:
+it runs inside the fire-and-forget shadow task, and an IO failure logs one
+`limen.diff_sink_write_failed` warning and drops the record rather than
+interfering with traffic.
+
+Read the files back with `limen report` — no config file needed, so it runs
+wherever the files ended up:
+
+```bash
+# What is diverging, and how, since this morning?
+limen report --dir ./limen-diffs --since 2026-07-28T00:00:00Z
+
+# One route, as JSON, for a dashboard or a cross-tool join
+limen report --dir ./limen-diffs --route get-device --format json
+```
+
+```
+3 mismatch(es) across 2 route(s) (2 file(s) read)
+
+ROUTE         COUNT  KINDS
+get-device        2  body 2, set_cookie.value 1
+list-devices      1  status 1
+
+get-device — 2 most recent:
+  2026-07-28T10:00:05Z  GET  /devices/42  0f2c…  body,set_cookie.value
+  2026-07-28T10:00:00Z  GET  /devices/7   9ab1…  body
+```
+
+The per-kind counts use the same neutral vocabulary Pharos reports
+(`status`, `body`, `header`, `set_cookie.*`, `location.*`), so a route's Limen
+diffs and its Pharos verdicts can be read side by side. Full flag reference:
+[CLI → `report`](../reference/cli.md#report).
+
 ## Graceful shutdown
 
 On `SIGINT`/`SIGTERM` Limen drains rather than dropping connections:

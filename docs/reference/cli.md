@@ -1,6 +1,6 @@
 # CLI
 
-Limen exposes four subcommands. All output is structured and scriptable; the
+Limen exposes five subcommands. All output is structured and scriptable; the
 proxy refuses to start (or validate) on invalid input.
 
 ```
@@ -13,6 +13,7 @@ limen <COMMAND> [OPTIONS]
 | `validate-config` | Semantically validate a configuration file. |
 | `print-routes` | Print the resolved routing table for a configuration. |
 | `check-contract` | Validate a behavioral contract and its JSONPath compliance. |
+| `report` | Summarize the mismatches collected in a `diff_sink` directory. |
 
 ## `run`
 
@@ -63,6 +64,41 @@ AI → Pharos → Limen loop confirm a freshly drafted contract is Limen-consuma
 before wiring it into a route. It produces the **same** verdict Pharos's
 `check-contract` would, since both implement the identical
 [JSONPath subset](contract-reference.md#supported-jsonpath-subset).
+
+## `report`
+
+```bash
+limen report --dir ./limen-diffs
+limen report --dir ./limen-diffs --route get-device --since 2026-07-28T00:00:00Z
+limen report --dir ./limen-diffs --format json | jq '.routes[] | {route_id, count}'
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--dir <PATH>` | — | **Required.** The [`diff_sink.dir`](config-reference.md#diff_sink) directory to read. |
+| `--route <ID>` | all routes | Only report this route id. |
+| `--since <RFC3339>` | all time | Only mismatches at or after this instant (offsets honored, e.g. `2026-07-28T12:00:05+02:00`). |
+| `--format <human\|json>` | `human` | `human` prints an aligned summary; `json` prints one document. |
+
+Reads every `mismatches-*.jsonl` file in the directory and prints per-route
+mismatch counts (total and by mismatch kind) plus the most recent examples per
+route. **No config file is involved** — the sink directory is self-describing, so
+a report runs anywhere the files are.
+
+Unparseable lines are counted and reported (`malformed_lines`), never fatal: a
+record torn by a killed process must not cost you the rest of the report.
+
+```
+3 mismatch(es) across 2 route(s) (2 file(s) read)
+
+ROUTE         COUNT  KINDS
+get-device        2  body 2, set_cookie.value 1
+list-devices      1  status 1
+
+get-device — 2 most recent:
+  2026-07-28T10:00:05Z  GET  /devices/42  0f2c…  body,set_cookie.value
+  2026-07-28T10:00:00Z  GET  /devices/7   9ab1…  body
+```
 
 ## Configuration sources & precedence
 

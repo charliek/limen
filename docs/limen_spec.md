@@ -509,6 +509,11 @@ flags:
   stale_ttl_ms: 30000                       # after this, apply fail_safe_mode
   fail_safe_mode: "legacy_only"             # behavior when flags are stale/unavailable
 
+# Optional durable mismatch sink (Section 10.4). Omit to keep mismatches in
+# metrics and logs only.
+diff_sink:
+  dir: "./limen-diffs"                      # daily mismatches-<UTC date>.jsonl files
+
 routes:
   - id: "get-device"
     match:
@@ -570,6 +575,7 @@ migration.get-device.shadow_enabled: true
 - `fail_safe_mode` is a valid mode.
 - A route in `failover_to_legacy` mode whose `match.methods` include non-idempotent methods (POST, and PATCH unless declared idempotent) **must** set `failover_safe: true` explicitly, or validation fails. This forces an operator to consciously affirm that auto-failover is safe for that route (Section 6.5).
 - `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
+- `diff_sink.dir`, if the block is present, is non-empty. The directory (and its parent) need **not** exist — it is created on the first mismatch, so a fresh deploy is not failed for a directory nothing has written to yet.
 
 Validation failures must name the offending field and route.
 
@@ -794,6 +800,53 @@ Via `tracing`. Include: request/trace ID, route ID, route mode, primary upstream
 
 - `/health/live` — process is running.
 - `/health/ready` — config is valid **and** required providers are usable or in a safe fallback mode. Readiness should degrade (not just hard-fail) when a provider is stale-but-within-fail-safe.
+
+### 10.4 Mismatch diff sink and `limen report`
+
+Metrics tell you *that* a route is diverging; the mismatch log tells you *how*, but only until the log buffer rolls. The **diff sink** is the durable half: an optional top-level config block that persists every mismatch for later triage.
+
+```yaml
+diff_sink:
+  dir: "./limen-diffs"    # relative to the process working directory
+```
+
+Behavior:
+
+- When the block is present, a sink observer is installed **alongside** the metrics observer (fan-out) — metrics and logs are unchanged whether or not the sink is on.
+- Every comparison that is **not** a match appends one JSON object to `<dir>/mismatches-<YYYY-MM-DD>.jsonl`, dated by **UTC**. Matches and non-comparison events write nothing; a clean run never even creates the directory.
+- Record shape (one line, no pretty-printing):
+
+```json
+{
+  "timestamp": "2026-07-28T10:00:05Z",
+  "route_id": "get-device",
+  "request_id": "0f2c…",
+  "method": "GET",
+  "path": "/devices/42",
+  "legacy_status": 200,
+  "new_status": 200,
+  "status_match": true,
+  "body_match": false,
+  "mismatch_kinds": ["body", "set_cookie.value"],
+  "differences": [ … ],
+  "header_mismatches": [ … ],
+  "cookie_mismatches": [ … ],
+  "location_mismatches": [ … ],
+  "diff_truncated": false
+}
+```
+
+- Every value written is **already redacted** by the comparison engine (Section 7.5) — the sink adds no new rendering. A dedicated test proves a cookie/`Location` mismatch record contains no raw cookie value and no sensitive query value.
+- The sink runs inside the fire-and-forget shadow task, so its file IO is off the client path by construction (invariant: comparison work never blocks the client). It never panics: an IO failure logs one `warn!`, counts subsequent failures, and drops the record.
+- Rotation is by date only. **Retention is the operator's** (standard log-retention tooling over the directory); an in-proxy retention policy is future work.
+
+`limen report` aggregates a sink directory without needing the proxy's configuration:
+
+```bash
+limen report --dir ./limen-diffs [--route <id>] [--since <RFC3339>] [--format human|json]
+```
+
+It reads every `mismatches-*.jsonl` file in the directory, applies the filters, and prints per-route mismatch counts (total and by `mismatch_kinds`) plus the most recent examples per route. Unparseable lines are **counted and reported**, never fatal — a record torn by a killed process must not cost you the rest of the report. Unknown fields are ignored, so a directory written by a newer Limen still reports against an older binary.
 
 ---
 

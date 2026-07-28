@@ -22,6 +22,7 @@ server: { … }          # data-plane listener + request limits
 metrics: { … }         # control-plane listener
 upstream_tls: { … }    # TLS for upstream calls
 flags: { … }           # feature-flag provider + fail-safe
+diff_sink: { … }       # optional: persist comparison mismatches to JSONL
 routes: [ … ]          # the routing table
 ```
 
@@ -65,6 +66,26 @@ routes: [ … ]          # the routing table
 Only the *selected* provider's settings are validated. Providers and their
 runtime behavior are specified in the [Limen spec](../limen_spec.md) (§8); a
 dedicated guide lands with the flags phase.
+
+## `diff_sink`
+
+Optional. Present = on; there is no separate `enabled` switch.
+
+```yaml
+diff_sink:
+  dir: "./limen-diffs"
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `dir` | path | — | Directory for the daily `mismatches-<UTC date>.jsonl` files. Must be non-empty; need not exist (created on the first mismatch). Relative paths resolve against the process working directory, like `flags.file.path`. |
+
+Every comparison **mismatch** is appended as one JSON line — already redacted by
+the comparison engine — alongside the usual metrics and mismatch log, which are
+unaffected. Read the files back with
+[`limen report`](cli.md#report); the record shape and the retention stance are
+specified in the [Limen spec](../limen_spec.md) (§10.4) and explained in the
+[observability guide](../guides/observability.md#durable-mismatch-diffs).
 
 ## `routes[]`
 
@@ -153,6 +174,7 @@ precedence.
 upstream URL shapes, percentage and ratio ranges, timeout sanity, route-ID
 uniqueness, known methods, per-mode required upstreams, contract reference
 resolution, the contract-vs-inline conflict rule, JSONPath-subset compliance,
-and the `failover_safe` gate — collecting **all** problems and naming the
+a non-empty `diff_sink.dir`, and the `failover_safe` gate — collecting **all**
+problems and naming the
 offending field and route. A full valid example lives at
 `config/limen.example.yaml`.

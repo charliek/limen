@@ -27,6 +27,13 @@ flags:
   stale_ttl_ms: 30000 # after this, apply fail_safe_mode
   fail_safe_mode: "legacy_only"
 
+# Optional durable mismatch sink (spec §10.4). Uncomment to append every
+# comparison mismatch to <dir>/mismatches-<UTC date>.jsonl, on top of the usual
+# metrics and log line. Read it back with `limen report --dir ./limen-diffs`.
+# The directory is created on the first mismatch; retention is yours.
+# diff_sink:
+#   dir: "./limen-diffs"
+
 routes:
   # A read being observed in shadow mode: legacy serves the client, new is
   # shadowed, responses are compared using the referenced contract.

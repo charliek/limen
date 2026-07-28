@@ -7,10 +7,14 @@
 //! - [`prometheus`] — the Prometheus recorder, metric vocabulary, and emission
 //!   helpers rendered on the control-plane `/metrics` endpoint.
 //! - [`request_id`] — request/trace id extraction and propagation.
+//! - [`sink`] — the optional durable mismatch sink (JSONL) and the `limen
+//!   report` aggregation over it.
 
 pub mod logging;
 pub mod metrics;
 pub mod prometheus;
 pub mod request_id;
+pub mod sink;
 
-pub use metrics::{MetricsObserver, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+pub use metrics::{Fanout, MetricsObserver, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+pub use sink::SinkObserver;
