@@ -37,7 +37,7 @@ The two share a **behavioral contract** (Section 4) but are independently deploy
 - Long-term analytics, dashboards, or historical trend storage.
 - Stateful load testing or large-scale performance testing.
 - Protocols beyond HTTP/1.1 and HTTP/2 over TCP. No gRPC, no WebSockets, no GraphQL-specific handling in MVP.
-- Dual-writing or reconciling production *data*. Limen shadows reads; it does not replay or reconcile writes.
+- Dual-writing or reconciling production *data*. Limen shadows reads (and, only where a route explicitly opts a method in, replays a write to the new upstream for comparison); it never reconciles data between the two implementations.
 - Hot-reloading of behavioral comparison rules mid-run (flag *values* hot-reload; comparison *semantics* are fixed for the duration of a run — see Section 4.4).
 - A web UI.
 
@@ -45,7 +45,7 @@ The two share a **behavioral contract** (Section 4) but are independently deploy
 
 Limen is designed for the common, lowest-risk migration shape: **legacy and new share the same backing datastore**, and the migration is a **re-implementation of request-handling logic** (e.g. a framework or language change), not a data migration. A write through either implementation is immediately visible to the other, so correctness reduces to **behavioral parity over shared data** — exactly what the shared contract (Section 4) expresses.
 
-This assumption is why shadowing reads is safe (both read the same data) and why writes route to exactly one implementation rather than being shadowed (Section 6). Migrations that do **not** share a datastore (separate stores requiring synchronization) move into dual-write/reconciliation territory, which is explicitly out of scope; Limen's safety properties are not designed for that case.
+This assumption is why shadowing reads is safe (both read the same data) and why writes route to exactly one implementation unless a route explicitly opts them into shadowing (Section 6.1) — an opt-in that only makes sense once the operator has affirmed the endpoint tolerates being handled twice. Migrations that do **not** share a datastore (separate stores requiring synchronization) move into dual-write/reconciliation territory, which is explicitly out of scope; Limen's safety properties are not designed for that case.
 
 ---
 
@@ -110,7 +110,7 @@ This is a central design decision. Limen has **two deliberately separate code pa
 
 1. **Streaming path (default).** Used when a route has comparison disabled, or when a request is not selected for comparison sampling. Request and response bodies are **streamed** between client and upstream without full buffering. Limen observes only status, headers, and latency. Lowest overhead; unbounded body size is fine. This is the path most production traffic should take.
 
-2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client.
+2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client. The *request* body is buffered under the same bound only for a write the route opted into shadowing (Section 6.1), so the shadow can replay identical bytes; over that limit → shadowing is skipped with reason `request_too_large` and the request body streams to the primary unchanged.
 
 The sampling decision is made **per request**, before buffering, so that on a route with `sample_rate: 0.1` you pay buffering cost on ~10% of traffic and stream the other ~90%.
 
@@ -549,6 +549,7 @@ routes:
       enabled: true                         # operational gate
       sample_rate: 0.1                       # fraction of eligible requests to compare
       max_body_bytes: 262144                 # skip comparison above this
+      shadow_methods: ["POST"]               # opt writes into shadowing; default [] = reads only
     circuit_breaker:
       enabled: true
       failure_rate_threshold: 0.25
@@ -607,13 +608,31 @@ Limen implements five modes. Each route declares exactly one.
 
 **Shadow eligibility (all must hold):**
 
-- Method is `GET` or `HEAD`.
+- Method is `GET` or `HEAD`, **or** a write method the route explicitly opted in via `comparison.shadow_methods` (below).
 - Comparison is enabled for the route.
-- Request body is absent or below the configured buffer limit.
+- Request body is absent (reads) or buffered within `max_body_bytes` (opted-in writes).
 - Shadow concurrency limit not exceeded (if configured).
 - Shutdown is not in progress.
 
-Writes are **never** shadowed by default.
+**Writes are never shadowed by default; a route may opt in per method.**
+
+Reads are replayed bodyless, so a body-bearing `GET`/`HEAD` is never shadowed — its body could not be reproduced faithfully. To shadow a write, a route lists the method in `comparison.shadow_methods` (only `POST` is supported today):
+
+```yaml
+comparison:
+  enabled: true
+  sample_rate: 0.1
+  max_body_bytes: 262144
+  shadow_methods: ["POST"]     # absent/empty (the default) = reads only
+```
+
+For such a request, the body is read **once, bounded by `max_body_bytes`**, and those exact bytes are sent to the primary and replayed to the shadow — identical payload and identical framing (a matching `Content-Length`; the client's own framing headers are hop-by-hop-stripped and re-derived). Only that bounded buffering is on the client path — the same cost the failover-safe path already pays; the shadow dispatch and comparison remain fire-and-forget. A body over the limit is **never fully buffered**: it streams to the primary untouched and shadowing is skipped entirely with reason `request_too_large`.
+
+The buffering is also skipped up front when the shadow concurrency limit (Section 9.3) is *already* saturated — the shadow would be refused anyway, and shedding the preparation is the point of the limit under load. That pre-check is best-effort (the permit is still reserved authoritatively after the primary responds); a lost race costs at most one buffered body whose shadow is then refused, which is the behavior without the check.
+
+Validation refuses `shadow_methods` that could not take effect: a method other than `POST`, a mode that does not shadow, `comparison.enabled: false`, or a method the route's `match.methods` does not even carry (Section 5.3).
+
+The opt-in is deliberately per route and per method: shadowing a write sends a second, real request to the new upstream, so it is only safe where the operator has affirmed that handling it twice is acceptable (typically because the new implementation shares the legacy datastore, Section 2.3, and the endpoint is idempotent or the shadow's effects are inert).
 
 ### 6.2 `legacy_only`
 
@@ -798,7 +817,7 @@ Required metrics (avoid high-cardinality labels — **no** user IDs, tenant IDs,
 - Comparison attempted count.
 - Comparison match count.
 - Comparison mismatch count.
-- Comparison skipped count by reason (`response_too_large`, `not_sampled`, `non_json`, `concurrency_limit`, …).
+- Comparison skipped count by reason (`response_too_large`, `request_too_large`, `not_sampled`, `non_json`, `concurrency_limit`, …).
 - Diff sampled count.
 - Circuit-breaker state by route and upstream.
 - Feature-flag provider health.
@@ -1003,7 +1022,7 @@ The MVP is **done** when all of the following hold:
 
 ### 15.4 Shadowing
 - Client always receives the legacy (primary) response in shadow mode.
-- Eligible reads are shadowed to new; writes are not shadowed by default.
+- Eligible reads are shadowed to new; writes are not shadowed unless the route opted the method into `comparison.shadow_methods`, in which case the buffered request body reaches both upstreams byte-identically.
 - Shadow or comparison failure never affects the client request or latency.
 - Per-request sampling gates buffering and detailed diffing.
 
@@ -1081,7 +1100,7 @@ The MVP is **done** when all of the following hold:
 
 - Baseline streaming overhead vs. SLO defaults.
 - Shadow overhead — client-visible latency statistically unchanged with shadow on.
-- Large-body behavior — bodies above `max_body_bytes` skip comparison (`response_too_large`), no unbounded buffering, client still served.
+- Large-body behavior — bodies above `max_body_bytes` skip comparison (`response_too_large`) or shadowing (`request_too_large`, on a write-shadowing route), no unbounded buffering, client still served.
 - High concurrency — stable, bounded memory, shadows throttled/skipped, no panics or task leaks.
 
 ---
@@ -1093,7 +1112,7 @@ Prioritize a clean MVP with strong tests over breadth or cleverness.
 **Safe default choices:**
 - Default to legacy when uncertain.
 - Never block client responses on shadow/comparison.
-- Never shadow writes by default.
+- Never shadow writes by default; a write is shadowed only where a route opted its method into `comparison.shadow_methods`, and only with a bounded, replayed body.
 - Never replay a failed in-flight request against legacy unless the route is explicitly `failover_safe: true` (idempotent). Routing *subsequent* requests to legacy via the circuit breaker is fine; *retrying the same request* that may already have hit new is not, unless idempotent.
 - Never log sensitive values by default.
 - Bound all buffers.

@@ -6,7 +6,10 @@
 //! request for comparison, the primary (legacy) response is buffered (bounded)
 //! so it can be both served to the client *and* compared against a fire-and-
 //! forget shadow to the new upstream — the shadow and comparison never delay or
-//! affect the client response.
+//! affect the client response. On a route that opted a write method into
+//! shadowing (`comparison.shadow_methods`), the *request* body is likewise
+//! buffered (bounded) so the identical bytes reach both upstreams; that
+//! bounded buffering is the only shadow-related work on the client path.
 
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -197,10 +200,8 @@ async fn dispatch(
 
     // Prepare a shadow plan *before* sending the primary, so the method and
     // headers are available to replay. Only `shadow_legacy_primary` + sampled
-    // eligible reads, not while shutting down, and not for a request that
-    // carries a body — the shadow replays an empty GET/HEAD, so a request body
-    // could not be reproduced faithfully (spec §6.1).
-    let shadow = if state.is_shutting_down() || request_has_body(&parts.headers) {
+    // eligible methods, and not while shutting down.
+    let planned = if state.is_shutting_down() {
         None
     } else {
         route
@@ -212,7 +213,14 @@ async fn dispatch(
             })
     };
 
-    let upstream_body = reqwest::Body::wrap_stream(body.into_data_stream());
+    // Settle how the body reaches the primary, and whether the shadow survives
+    // it (an opted-in write buffers here; see `prepare_request_body`).
+    let Some((upstream_body, shadow)) =
+        prepare_request_body(state, body, &parts.headers, planned).await
+    else {
+        release_breaker(&breaker);
+        return (unreadable_body(), upstream);
+    };
 
     // The timeout bounds time-to-response (connect + send + first byte), not the
     // body transfer — `send()` resolves once headers arrive, then the body
@@ -249,6 +257,71 @@ async fn dispatch(
             );
             (gateway_timeout(), upstream)
         }
+    }
+}
+
+/// Decide how the request body reaches the primary, and finalize the shadow
+/// plan around it. Returns `None` only if the client's body errored mid-read,
+/// leaving nothing to forward.
+///
+/// - **No shadow planned** — stream the body straight through (the zero-copy
+///   default, spec §3.3).
+/// - **Read** — the shadow replays bodyless, so a body-bearing `GET`/`HEAD`
+///   simply isn't shadowed; its body could not be reproduced faithfully.
+/// - **Opted-in write** (`comparison.shadow_methods`) — buffer the body bounded
+///   by `max_body_bytes` and send those same bytes to both upstreams. Only the
+///   buffering is on the client path (bounded, as on the failover-safe path);
+///   the shadow itself stays fire-and-forget (invariant 2). Over the limit the
+///   body is never fully held: it streams to the primary untouched and shadowing
+///   is skipped as `request_too_large` (invariant 6). If the shadow limiter is
+///   *already* saturated, the buffering is skipped up front rather than paid for
+///   a shadow that would be refused anyway.
+async fn prepare_request_body(
+    state: &AppState,
+    body: Body,
+    client_headers: &HeaderMap,
+    shadow: Option<ShadowRequest>,
+) -> Option<(reqwest::Body, Option<ShadowRequest>)> {
+    fn streamed(body: Body) -> reqwest::Body {
+        reqwest::Body::wrap_stream(body.into_data_stream())
+    }
+
+    let Some(mut shadow) = shadow else {
+        return Some((streamed(body), None));
+    };
+    if shadow::method_is_read(&shadow.method) {
+        let keep = (!request_has_body(client_headers)).then_some(shadow);
+        return Some((streamed(body), keep));
+    }
+
+    // Buffering a write's body costs client latency and up to `max_body_bytes`
+    // of memory *before* the real permit is taken (which happens only once the
+    // primary has responded, in `primary_succeeded`). Paying that for a shadow
+    // the limiter would refuse is pure waste under load — exactly when the limit
+    // is doing its job — so check for saturation first. The check is
+    // best-effort: a slot may free up or fill immediately after, in which case
+    // the worst case is either a shadow skipped that could have run, or a body
+    // buffered whose shadow is then refused by `try_acquire` — i.e. no worse
+    // than the behavior without this gate. `try_acquire` stays authoritative.
+    if state.shadow_limiter().is_saturated() {
+        state
+            .observer()
+            .shadow_skipped(&shadow.meta(), SkipReason::ConcurrencyLimit);
+        return Some((streamed(body), None));
+    }
+
+    match body::buffer_request_or_stream(body, shadow.max_body_bytes).await {
+        Buffered::Full(bytes) => {
+            shadow.body = Some(bytes.clone());
+            Some((reqwest::Body::from(bytes), Some(shadow)))
+        }
+        Buffered::TooLarge(rest) => {
+            state
+                .observer()
+                .comparison_skipped(&shadow.meta(), SkipReason::RequestTooLarge);
+            Some((streamed(rest), None))
+        }
+        Buffered::Error => None,
     }
 }
 
@@ -446,6 +519,10 @@ async fn primary_succeeded(
         state
             .observer()
             .shadow_skipped(&shadow_req.meta(), SkipReason::ConcurrencyLimit);
+        // The shadow is dead: release the plan — and with it any buffered
+        // request body (an opted-in write holds up to `max_body_bytes`) —
+        // before the client response, rather than at end of scope.
+        drop(shadow_req);
         return relay_response(resp);
     };
 
@@ -480,10 +557,14 @@ async fn primary_succeeded(
             state
                 .observer()
                 .comparison_skipped(&shadow_req.meta(), SkipReason::ResponseTooLarge);
+            // Same as above: the shadow will not run, so drop its plan (and any
+            // buffered request body) before handing the client its response.
+            drop(shadow_req);
             drop(permit);
             response_from_parts(status, client_headers, streamed)
         }
         Buffered::Error => {
+            drop(shadow_req);
             drop(permit);
             bad_gateway()
         }
@@ -598,6 +679,16 @@ fn response_from_parts(status: StatusCode, headers: HeaderMap, body: Body) -> Re
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "limen: no route matched\n").into_response()
+}
+
+/// The client's request body errored mid-read while being buffered for replay —
+/// there is no complete request to forward, and Limen never invents one.
+fn unreadable_body() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "limen: request body could not be read\n",
+    )
+        .into_response()
 }
 
 fn bad_gateway() -> Response {

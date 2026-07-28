@@ -123,16 +123,51 @@ rollout:
 ```yaml
 comparison:
   enabled: true                  # operational gate
-  sample_rate: 0.1               # 0–1; fraction of eligible reads to buffer & compare
+  sample_rate: 0.1               # 0–1; fraction of eligible requests to buffer & compare
   max_body_bytes: 262144         # skip comparison above this size
+  shadow_methods: []             # writes opted into shadowing; default [] = GET/HEAD only
   # Inline behavioral rules (only if NOT referencing a contract):
   # compare_status / compare_body / compare_headers / json: { … }
 ```
 
-`enabled`, `sample_rate`, and `max_body_bytes` are **operational** — they live
-here. The *behavioral* rules (`json.ignore_paths`, etc.) belong in a
-[contract](contract-reference.md); a route may reference a contract **or** inline
-those rules, never both (a validation error).
+`enabled`, `sample_rate`, `max_body_bytes`, and `shadow_methods` are
+**operational** — they live here. The *behavioral* rules (`json.ignore_paths`,
+etc.) belong in a [contract](contract-reference.md); a route may reference a
+contract **or** inline those rules, never both (a validation error).
+
+### `comparison.shadow_methods` (shadowing a write)
+
+Limen never shadows writes by default: only `GET`/`HEAD` are eligible. A route
+that wants a write compared opts that method in explicitly:
+
+```yaml
+mode: shadow_legacy_primary
+comparison:
+  enabled: true
+  sample_rate: 1.0
+  max_body_bytes: 262144
+  shadow_methods: ["POST"]
+```
+
+- Only `POST` may be listed today; `GET`/`HEAD` must **not** be listed (they are
+  always eligible, and listing one suggests you expected the field to *restrict*
+  eligibility, which it does not).
+- The request body is buffered **once**, bounded by `max_body_bytes`, and the
+  same bytes go to the primary and the shadow — identical payload and identical
+  `Content-Length`. A body over the limit is never fully buffered: it streams to
+  the primary unchanged and shadowing is skipped
+  (`comparison_skipped{reason="request_too_large"}`).
+- Only that bounded buffering is on the client path; the shadow request and the
+  comparison stay fire-and-forget, as for reads. If `shadow_concurrency_limit`
+  is already saturated, the body isn't buffered at all — the request is
+  forwarded straight through and counted as
+  `shadow_skipped{reason="concurrency_limit"}`.
+- Validation rejects a listing that could never take effect: a non-`POST`
+  method, a mode other than `shadow_legacy_primary`, `enabled: false`, or a
+  method missing from the route's `match.methods`.
+
+Opt in only where handling the request twice is acceptable — the new upstream
+receives a *real* write.
 
 ### `budget`
 

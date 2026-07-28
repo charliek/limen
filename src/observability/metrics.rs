@@ -21,6 +21,10 @@ pub enum SkipReason {
     ConcurrencyLimit,
     /// A response body exceeded `max_body_bytes`.
     ResponseTooLarge,
+    /// A request body on a write-shadowing route exceeded `max_body_bytes`, so
+    /// it could not be buffered for replay (spec §6.1); the primary still
+    /// received it, streamed and unchanged.
+    RequestTooLarge,
 }
 
 impl SkipReason {
@@ -29,6 +33,7 @@ impl SkipReason {
         match self {
             SkipReason::ConcurrencyLimit => "concurrency_limit",
             SkipReason::ResponseTooLarge => "response_too_large",
+            SkipReason::RequestTooLarge => "request_too_large",
         }
     }
 }

@@ -80,6 +80,14 @@ fn resolve_one(
         enabled: route.comparison.enabled,
         sample_rate: route.comparison.sample_rate,
         max_body_bytes: route.comparison.max_body_bytes as usize,
+        // Uppercased once here so the per-request eligibility check is a plain
+        // comparison against `Method::as_str`.
+        shadow_methods: route
+            .comparison
+            .shadow_methods
+            .iter()
+            .map(|m| m.to_ascii_uppercase())
+            .collect(),
         rules,
     })
 }

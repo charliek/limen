@@ -1,15 +1,22 @@
 //! Shadow dispatch and comparison (spec §6.1).
 //!
 //! In `shadow_legacy_primary` mode the client is served by legacy. For an
-//! eligible, sampled read, Limen also replays the request to the new upstream
+//! eligible, sampled request, Limen also replays it to the new upstream
 //! **fire-and-forget**, buffers both responses, and compares them — entirely off
 //! the client path. The shadow timeout, comparison, or any error here can never
 //! delay or fail the client response.
+//!
+//! Eligibility is reads (`GET`/`HEAD`) plus whatever write methods the route
+//! opted into via `comparison.shadow_methods` — never writes by default (safety
+//! invariant 3). An opted-in write carries its request body here, already
+//! buffered (bounded) by [`crate::http::proxy`], so the shadow replays exactly
+//! the bytes the primary received.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, Method};
+use bytes::Bytes;
 use tracing::{info_span, Instrument};
 use url::Url;
 
@@ -23,10 +30,18 @@ use crate::observability::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason
 use crate::resilience::ShadowPermit;
 use crate::routing::CompiledRoute;
 
-/// Whether `method` is a shadow-eligible read. Only `GET`/`HEAD` (spec §6.1);
-/// writes are never shadowed by default.
-pub fn method_is_eligible(method: &Method) -> bool {
+/// Whether `method` is a read (`GET`/`HEAD`). Reads are always shadow-eligible
+/// and replay bodyless (spec §6.1).
+pub fn method_is_read(method: &Method) -> bool {
     matches!(*method, Method::GET | Method::HEAD)
+}
+
+/// Whether `method` may be shadowed on a route whose opted-in write methods are
+/// `shadow_methods` (already uppercased). Reads always qualify; a write only
+/// when the route named it — writes are never shadowed *by default* (safety
+/// invariant 3, spec §6.1).
+pub fn method_is_eligible(method: &Method, shadow_methods: &[String]) -> bool {
+    method_is_read(method) || shadow_methods.iter().any(|m| m == method.as_str())
 }
 
 /// Per-request sampling decision (spec §3.3). `>= 1.0` always samples, `<= 0.0`
@@ -50,10 +65,16 @@ pub struct ShadowRequest {
     /// so the comparison can resolve each side's relative `Location` against
     /// its own request URL (spec §4.2).
     pub legacy_url: Url,
-    /// The request method (always GET/HEAD).
+    /// The request method (a read, or a write the route opted in).
     pub method: Method,
     /// Forwarding headers (already filtered).
     pub headers: HeaderMap,
+    /// The buffered request body to replay, byte-identical to the one sent to
+    /// the primary. `None` for a read, which is replayed bodyless exactly as
+    /// before — the shadow request then frames itself exactly like today's.
+    /// Filled in by [`crate::http::proxy`] once the body has been buffered
+    /// within `max_body_bytes`.
+    pub body: Option<Bytes>,
     /// Timeout bounding the shadow's time-to-response.
     pub shadow_timeout: Duration,
     /// Cap on the buffered comparison body.
@@ -85,7 +106,9 @@ impl ShadowRequest {
 
 /// Decide whether to shadow-compare this request and, if so, prepare it. Returns
 /// `None` unless the route is `shadow_legacy_primary`, comparison is enabled, the
-/// method is an eligible read, and the request was sampled.
+/// method is eligible (a read, or a write the route opted in), and the request
+/// was sampled. The returned plan carries no body yet: the caller buffers one
+/// (bounded) for an opted-in write, and may still drop the plan if it cannot.
 pub fn plan(
     route: &CompiledRoute,
     method: &Method,
@@ -97,7 +120,9 @@ pub fn plan(
     if route.mode != RouteMode::ShadowLegacyPrimary || !route.comparison.enabled {
         return None;
     }
-    if !method_is_eligible(method) || !sampled(route.comparison.sample_rate) {
+    if !method_is_eligible(method, &route.comparison.shadow_methods)
+        || !sampled(route.comparison.sample_rate)
+    {
         return None;
     }
     // `request_headers` already carries `X-Forwarded-For`/`X-Forwarded-Proto`
@@ -111,6 +136,7 @@ pub fn plan(
         legacy_url: legacy_url.clone(),
         method: method.clone(),
         headers,
+        body: None,
         shadow_timeout: Duration::from_millis(route.timeouts.shadow_ms),
         max_body_bytes: route.comparison.max_body_bytes,
         route_id: route.id.clone(),
@@ -163,14 +189,20 @@ async fn run(
     // safe here precisely because the shadow body is buffered (bounded), unlike
     // the streaming primary path.
     let new_url = shadow.new_url.clone();
-    let result = client
+    let mut request = client
         .inner()
         .request(shadow.method, shadow.new_url)
         .headers(shadow.headers)
-        .timeout(shadow.shadow_timeout)
-        .send()
-        .await;
-    let resp = match result {
+        .timeout(shadow.shadow_timeout);
+    // An opted-in write replays the primary's exact bytes. A sized body makes
+    // reqwest frame it with a matching `Content-Length` (the client's own
+    // `content-length`/`transfer-encoding` were dropped by `filter_headers`), so
+    // both upstreams see identical framing. A read sets no body at all, which is
+    // byte-for-byte the request Limen sent before write shadowing existed.
+    if let Some(body) = shadow.body {
+        request = request.body(reqwest::Body::from(body));
+    }
+    let resp = match request.send().await {
         Ok(resp) => resp,
         Err(e) if e.is_timeout() => return observer.shadow_failed(&meta, ShadowFailure::Timeout),
         Err(_) => return observer.shadow_failed(&meta, ShadowFailure::Error),
@@ -214,10 +246,29 @@ mod tests {
     }
 
     #[test]
-    fn eligible_methods() {
-        assert!(method_is_eligible(&Method::GET));
-        assert!(method_is_eligible(&Method::HEAD));
-        assert!(!method_is_eligible(&Method::POST));
-        assert!(!method_is_eligible(&Method::DELETE));
+    fn reads_are_eligible_and_writes_are_not_by_default() {
+        let none: [String; 0] = [];
+        assert!(method_is_eligible(&Method::GET, &none));
+        assert!(method_is_eligible(&Method::HEAD, &none));
+        assert!(!method_is_eligible(&Method::POST, &none));
+        assert!(!method_is_eligible(&Method::DELETE, &none));
+    }
+
+    #[test]
+    fn an_opted_in_write_is_eligible_and_only_that_one() {
+        let opted_in = [String::from("POST")];
+        assert!(method_is_eligible(&Method::POST, &opted_in));
+        // Opting POST in says nothing about any other write.
+        assert!(!method_is_eligible(&Method::DELETE, &opted_in));
+        assert!(!method_is_eligible(&Method::PUT, &opted_in));
+        // Reads stay eligible regardless.
+        assert!(method_is_eligible(&Method::GET, &opted_in));
+    }
+
+    #[test]
+    fn only_reads_replay_bodyless() {
+        assert!(method_is_read(&Method::GET));
+        assert!(method_is_read(&Method::HEAD));
+        assert!(!method_is_read(&Method::POST));
     }
 }

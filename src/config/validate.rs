@@ -57,6 +57,13 @@ const KNOWN_METHODS: &[&str] = &[
 /// them must opt into replay explicitly (spec §5.3, §6.5).
 const NON_IDEMPOTENT_METHODS: &[&str] = &["POST", "PATCH"];
 
+/// Write methods a route may opt into shadowing via `comparison.shadow_methods`
+/// (spec §6.1). Deliberately just `POST`: shadowing a write means replaying a
+/// buffered body to a second upstream, and `POST` is the one verb the migration
+/// use case (form/JSON submissions compared read-only against new) actually
+/// needs. Reads are always eligible and are never listed here.
+const SHADOWABLE_WRITE_METHODS: &[&str] = &["POST"];
+
 /// A single semantic validation failure.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ValidationError {
@@ -330,6 +337,54 @@ fn validate_comparison_operational(
         route.comparison.sample_rate,
         errs,
     );
+    validate_shadow_methods(loc, route, errs);
+}
+
+/// Validate the per-route write-shadowing opt-in (spec §6.1). Every rejection
+/// here is a *silently inert* setting: an operator who writes `shadow_methods`
+/// expects those writes to be shadowed, so a listing that can never take effect
+/// must refuse to start rather than look configured.
+fn validate_shadow_methods(loc: &impl Fn(&str) -> String, route: &RouteConfig, errs: &mut Errors) {
+    let opted_in = &route.comparison.shadow_methods;
+    if opted_in.is_empty() {
+        return;
+    }
+    let field = loc("comparison.shadow_methods");
+    let matched: Vec<String> = route
+        .r#match
+        .methods
+        .iter()
+        .map(|m| m.to_ascii_uppercase())
+        .collect();
+    for method in opted_in {
+        let upper = method.to_ascii_uppercase();
+        if !SHADOWABLE_WRITE_METHODS.contains(&upper.as_str()) {
+            errs.push(
+                field.clone(),
+                format!(
+                    "{method:?} cannot be opted into shadowing — only {SHADOWABLE_WRITE_METHODS:?} \
+                     may be listed (GET/HEAD are always eligible and must not be listed)"
+                ),
+            );
+        } else if !matched.contains(&upper) {
+            errs.push(
+                field.clone(),
+                format!("{method:?} is not in match.methods, so the route never sees it"),
+            );
+        }
+    }
+    if route.mode != RouteMode::ShadowLegacyPrimary {
+        errs.push(
+            field.clone(),
+            format!(
+                "only mode shadow_legacy_primary shadows requests (got {:?})",
+                route.mode.as_str()
+            ),
+        );
+    }
+    if !route.comparison.enabled {
+        errs.push(field, "requires comparison.enabled: true");
+    }
 }
 
 fn validate_circuit_breaker(
@@ -789,6 +844,99 @@ routes:
     failover_safe: true
 "#;
         assert!(validate(&parse(ok), &base()).is_ok());
+    }
+
+    /// The supported opt-in: `POST` on a shadowing route with comparison on.
+    #[test]
+    fn shadow_methods_post_on_a_shadow_route_is_accepted() {
+        let ok = r#"
+routes:
+  - id: r
+    match: { methods: ["GET", "POST"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, shadow_methods: ["POST"] }
+"#;
+        assert!(validate(&parse(ok), &base()).is_ok());
+    }
+
+    #[test]
+    fn shadow_methods_rejects_anything_but_post() {
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET", "DELETE"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, shadow_methods: ["DELETE", "GET"] }
+"#,
+        );
+        let messages: Vec<&str> = errs
+            .iter()
+            .filter(|e| e.location.contains("comparison.shadow_methods"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(messages.len(), 2, "{errs:?}");
+        assert!(messages.iter().any(|m| m.contains("\"DELETE\"")));
+        // A read must not be listed: it is eligible anyway, and listing it
+        // suggests the operator expected the field to *restrict* eligibility.
+        assert!(messages.iter().any(|m| m.contains("\"GET\"")));
+    }
+
+    /// Every remaining rejection is about a listing that could never take
+    /// effect: a mode that does not shadow, comparison switched off, or a
+    /// method the route does not even match.
+    #[test]
+    fn shadow_methods_on_an_inert_route_is_caught() {
+        for (yaml, expected) in [
+            (
+                r#"
+routes:
+  - id: r
+    match: { methods: ["POST"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: failover_to_legacy
+    failover_safe: true
+    comparison: { enabled: true, sample_rate: 1.0, shadow_methods: ["POST"] }
+"#,
+                "shadow_legacy_primary",
+            ),
+            (
+                r#"
+routes:
+  - id: r
+    match: { methods: ["POST"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: false, shadow_methods: ["POST"] }
+"#,
+                "comparison.enabled",
+            ),
+            (
+                r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, shadow_methods: ["POST"] }
+"#,
+                "not in match.methods",
+            ),
+        ] {
+            let errs = errors(yaml);
+            assert!(
+                errs.iter()
+                    .any(|e| e.location.contains("shadow_methods") && e.message.contains(expected)),
+                "expected {expected:?} in {errs:?}"
+            );
+        }
     }
 
     #[test]

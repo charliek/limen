@@ -43,6 +43,10 @@ pub struct RouteComparison {
     pub sample_rate: f64,
     /// Skip comparison above this body size.
     pub max_body_bytes: usize,
+    /// Uppercased write methods this route opts into shadowing (spec §6.1).
+    /// Empty for every route that has not opted in — reads stay the only
+    /// shadow-eligible methods (safety invariant 3).
+    pub shadow_methods: Vec<String>,
     /// Merged behavioral rules (what to compare and how).
     pub rules: ComparisonRules,
 }

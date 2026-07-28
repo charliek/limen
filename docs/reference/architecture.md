@@ -31,7 +31,10 @@ deliberately separate paths:
   request is sampled **and** the body is within `max_body_bytes`. The relevant
   responses are buffered, normalized, hashed, and (on a hash mismatch) diffed.
   Over the limit, comparison is skipped (`response_too_large`) and the primary
-  response still streams to the client.
+  response still streams to the client. The *request* body is buffered under the
+  same bound only for a write the route opted into shadowing, so both upstreams
+  receive identical bytes; over the limit, shadowing is skipped
+  (`request_too_large`) and the request streams to the primary unchanged.
 
 The sampling decision is made **per request, before buffering**, so a route with
 `sample_rate: 0.1` pays the buffering cost on ~10% of traffic and streams the
@@ -68,9 +71,11 @@ Each route declares exactly one of five modes (spec §6):
 | `percentage_split` | legacy/new | deterministic per-key split by rollout percentage; breaker/fail-safe can override toward legacy. |
 | `failover_to_legacy` | new | new is primary; fall back to legacy on failure — **only retrying the in-flight request when `failover_safe: true`**. |
 
-**Shadow eligibility** (all must hold): method is `GET`/`HEAD`; comparison is
-enabled; the body is within the buffer limit; shadow concurrency isn't exceeded;
-shutdown isn't in progress. Writes are never shadowed by default.
+**Shadow eligibility** (all must hold): method is `GET`/`HEAD` — or a write the
+route opted into `comparison.shadow_methods`; comparison is enabled; the body is
+within the buffer limit; shadow concurrency isn't exceeded; shutdown isn't in
+progress. Writes are never shadowed by default; an opted-in write replays a
+bounded, buffered body to both upstreams.
 
 !!! warning "Failover and idempotency"
     *Routing* the next request to legacy because the circuit is open is always

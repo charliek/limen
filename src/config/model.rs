@@ -382,6 +382,15 @@ pub struct ComparisonConfig {
     pub sample_rate: f64,
     /// Skip comparison above this body size.
     pub max_body_bytes: u64,
+    /// Write methods this route opts into shadowing (spec §6.1). Empty (the
+    /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
+    /// shadowed. Only `POST` may be listed today, and only on a
+    /// `shadow_legacy_primary` route with `enabled: true` (see
+    /// [`super::validate`]); an opted-in request's body is buffered once,
+    /// bounded by `max_body_bytes`, and replayed byte-identically to both
+    /// upstreams.
+    #[serde(default)]
+    pub shadow_methods: Vec<String>,
     /// Inline: compare HTTP status (behavioral; conflicts with `contract`).
     #[serde(default)]
     pub compare_status: Option<bool>,
@@ -408,6 +417,7 @@ impl Default for ComparisonConfig {
             enabled: false,
             sample_rate: 0.0,
             max_body_bytes: 262_144,
+            shadow_methods: Vec::new(),
             compare_status: None,
             compare_body: None,
             compare_headers: None,

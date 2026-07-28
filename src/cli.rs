@@ -211,6 +211,14 @@ fn print_routes(loaded: &LoadedConfig) {
             route.comparison.sample_rate,
             route.comparison.max_body_bytes
         );
+        // Only shown when the route opted a write into shadowing — the default
+        // (reads only) needs no line.
+        if !route.comparison.shadow_methods.is_empty() {
+            println!(
+                "  shadow_methods: {}",
+                route.comparison.shadow_methods.join(", ")
+            );
+        }
         println!("  behavioral: {behavioral}");
     }
 }

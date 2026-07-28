@@ -461,6 +461,312 @@ routes:
     assert_eq!(new.received_requests().await.unwrap().len(), 0);
 }
 
+/// A route may opt a write method into shadowing (`comparison.shadow_methods`).
+/// The buffered request body must reach **both** upstreams byte-identically,
+/// framed consistently (a `Content-Length` matching the bytes, no
+/// `Transfer-Encoding`), and the comparison must run as it does for reads.
+#[tokio::test]
+async fn opted_in_post_replays_an_identical_body_to_both_upstreams() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/devices"))
+        .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"id":1}"#))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/devices"))
+        .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"id":1}"#))
+        .mount(&new)
+        .await;
+
+    let body = r#"{"name":"probe","tags":["a","b"]}"#;
+    let cfg = config_from_yaml(&format!(
+        r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET", "POST"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 262144
+      shadow_methods: ["POST"]
+"#,
+        legacy.uri(),
+        new.uri()
+    ));
+    let capture = Capture::default();
+    let app = router_with_observer(&cfg, Arc::new(capture.clone()));
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/devices")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap(),
+    )
+    .await;
+    let (status, _, client_body) = parts(resp).await;
+    assert_eq!(status, 201);
+    assert_eq!(client_body, r#"{"id":1}"#, "client is served legacy");
+
+    wait_until(|| !capture.comparisons().is_empty()).await;
+    let (meta, result) = capture.comparisons().pop().unwrap();
+    assert!(result.is_match(), "{result:?}");
+    assert_eq!(meta.method, Method::POST);
+
+    let legacy_reqs = legacy.received_requests().await.unwrap();
+    let new_reqs = new.received_requests().await.unwrap();
+    assert_eq!(new_reqs.len(), 1, "the opted-in write was shadowed");
+    assert_eq!(
+        new_reqs[0].body, legacy_reqs[0].body,
+        "shadow and primary must receive identical bytes"
+    );
+    assert_eq!(new_reqs[0].body, body.as_bytes());
+    for req in [&legacy_reqs[0], &new_reqs[0]] {
+        assert_eq!(
+            req.headers.get("content-length").unwrap(),
+            body.len().to_string().as_str(),
+            "framing must match the replayed bytes"
+        );
+        assert!(req.headers.get("transfer-encoding").is_none());
+        assert_eq!(req.headers.get("content-type").unwrap(), "application/json");
+    }
+    // The shadow copy is still marked as such; the primary never is.
+    assert_eq!(new_reqs[0].headers.get("x-limen-shadow").unwrap(), "1");
+    assert!(legacy_reqs[0].headers.get("x-limen-shadow").is_none());
+}
+
+/// An opted-in write whose body exceeds `max_body_bytes` is not shadowed at all
+/// (invariant 6): the comparison is skipped, and the primary still receives the
+/// complete body — streamed, never fully buffered — with the client served from
+/// it as usual.
+#[tokio::test]
+async fn oversized_post_body_skips_the_shadow_and_streams_to_the_primary() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202).set_body_string("accepted"))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&new)
+        .await;
+
+    let big = "x".repeat(5000);
+    let cfg = config_from_yaml(&format!(
+        r#"
+routes:
+  - id: r
+    match: {{ methods: ["POST"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 64
+      shadow_methods: ["POST"]
+"#,
+        legacy.uri(),
+        new.uri()
+    ));
+    let capture = Capture::default();
+    let app = router_with_observer(&cfg, Arc::new(capture.clone()));
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/devices")
+            .body(Body::from(big.clone()))
+            .unwrap(),
+    )
+    .await;
+    let (status, _, client_body) = parts(resp).await;
+    assert_eq!(status, 202);
+    assert_eq!(client_body, "accepted", "the client gets the primary reply");
+
+    let legacy_reqs = legacy.received_requests().await.unwrap();
+    assert_eq!(legacy_reqs.len(), 1);
+    assert_eq!(
+        legacy_reqs[0].body.len(),
+        5000,
+        "the primary must still receive the whole body"
+    );
+    assert_eq!(capture.skips(), vec!["request_too_large"]);
+    assert!(capture.comparisons().is_empty());
+    assert_eq!(
+        new.received_requests().await.unwrap().len(),
+        0,
+        "an unbufferable body is never shadowed"
+    );
+}
+
+/// When the shadow concurrency limit is already saturated, an opted-in write is
+/// skipped *before* its body is buffered — the limiter exists to shed work under
+/// load, so the client must not pay buffering latency for a shadow that would be
+/// refused anyway. The primary still receives the body, streamed.
+#[tokio::test]
+async fn a_saturated_limiter_skips_an_opted_in_post_without_buffering() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202).set_body_string("accepted"))
+        .mount(&legacy)
+        .await;
+    // The GET shadow occupies the single slot for the rest of the test.
+    Mock::given(method("GET"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(Duration::from_secs(30)),
+        )
+        .mount(&new)
+        .await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(202))
+        .mount(&new)
+        .await;
+
+    let cfg = config_from_yaml(&format!(
+        r#"
+server:
+  shadow_concurrency_limit: 1
+routes:
+  - id: r
+    match: {{ methods: ["GET", "POST"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    timeouts: {{ primary_ms: 2000, shadow_ms: 60000 }}
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 262144
+      shadow_methods: ["POST"]
+"#,
+        legacy.uri(),
+        new.uri()
+    ));
+    let capture = Capture::default();
+    let app = router_with_observer(&cfg, Arc::new(capture.clone()));
+
+    // The permit is taken before the client response is built, so once this
+    // returns the limiter is deterministically saturated by the hanging shadow.
+    let resp = send(
+        &app,
+        Request::builder().uri("/read").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    // Let the detached shadow actually reach `new`, so the request-count
+    // assertion below is about routing rather than about task scheduling.
+    for _ in 0..200 {
+        if !new.received_requests().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(new.received_requests().await.unwrap().len(), 1);
+
+    let started = std::time::Instant::now();
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri("/devices")
+            .body(Body::from(r#"{"name":"probe"}"#))
+            .unwrap(),
+    )
+    .await;
+    let elapsed = started.elapsed();
+    let (status, _, body) = parts(resp).await;
+    assert_eq!(status, 202);
+    assert_eq!(body, "accepted");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the client must not wait on the saturated shadow ({elapsed:?})"
+    );
+
+    assert_eq!(capture.skips(), vec!["concurrency_limit"]);
+    assert!(capture.comparisons().is_empty());
+    let legacy_reqs = legacy.received_requests().await.unwrap();
+    assert_eq!(legacy_reqs.len(), 2, "the primary saw both requests");
+    assert_eq!(legacy_reqs[1].body, br#"{"name":"probe"}"#);
+    let new_reqs = new.received_requests().await.unwrap();
+    assert_eq!(
+        new_reqs.len(),
+        1,
+        "only the in-flight GET shadow reached new"
+    );
+    assert_eq!(new_reqs[0].method.as_str(), "GET");
+}
+
+/// The opt-in relaxes the body gate for the listed write method only: a
+/// body-bearing read is still not shadowed, because the shadow replays a read
+/// bodyless and could not reproduce that body faithfully.
+#[tokio::test]
+async fn a_body_bearing_get_is_still_not_shadowed_on_an_opted_in_route() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    for server in [&legacy, &new] {
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+    }
+
+    let cfg = config_from_yaml(&format!(
+        r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET", "POST"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 262144
+      shadow_methods: ["POST"]
+"#,
+        legacy.uri(),
+        new.uri()
+    ));
+    let capture = Capture::default();
+    let app = router_with_observer(&cfg, Arc::new(capture.clone()));
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri("/devices")
+            .header("content-length", "2")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(new.received_requests().await.unwrap().len(), 0);
+    assert!(capture.comparisons().is_empty());
+    assert!(capture.skips().is_empty(), "not a skip — simply ineligible");
+}
+
+/// The default (no `shadow_methods`) is unchanged: a write on a shadowing route
+/// is never shadowed — safety invariant 3.
 #[tokio::test]
 async fn writes_are_never_shadowed() {
     let legacy = MockServer::start().await;
