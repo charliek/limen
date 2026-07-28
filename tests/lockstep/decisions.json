@@ -813,7 +813,7 @@
       },
       "new": {
         "status": 303,
-        "request_url": "https://legacy.example/authorize",
+        "request_url": "https://new.example/authorize",
         "headers": {
           "set-cookie": "sid=abc123; Path=/; SameSite=None",
           "location": "https://legacy.example/callback?code=new-auth-code&state=new"

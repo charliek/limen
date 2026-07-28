@@ -27,7 +27,7 @@ metrics, not client data.
   fail-safe mode (legacy), which is still safe to serve, so readiness reports
   `degraded` with a `200`. Only a genuinely unsafe state returns `503`.
 
-```
+```text
 $ curl -s localhost:9090/health/ready
 degraded
 ```
@@ -161,7 +161,7 @@ limen report --dir ./limen-diffs --since 2026-07-28T00:00:00Z
 limen report --dir ./limen-diffs --route get-device --format json
 ```
 
-```
+```text
 3 mismatch(es) across 2 route(s) (2 file(s) read)
 
 ROUTE         COUNT  KINDS

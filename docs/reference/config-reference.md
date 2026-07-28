@@ -156,7 +156,7 @@ comparison:
   same bytes go to the primary and the shadow — identical payload and identical
   `Content-Length`. A body over the limit is never fully buffered: it streams to
   the primary unchanged and shadowing is skipped
-  (`comparison_skipped{reason="request_too_large"}`).
+  (`shadow_skipped{reason="request_too_large"}`).
 - Only that bounded buffering is on the client path; the shadow request and the
   comparison stay fire-and-forget, as for reads. If `shadow_concurrency_limit`
   is already saturated, the body isn't buffered at all — the request is

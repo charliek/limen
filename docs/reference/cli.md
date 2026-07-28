@@ -3,7 +3,7 @@
 Limen exposes five subcommands. All output is structured and scriptable; the
 proxy refuses to start (or validate) on invalid input.
 
-```
+```text
 limen <COMMAND> [OPTIONS]
 ```
 
@@ -88,7 +88,7 @@ a report runs anywhere the files are.
 Unparseable lines are counted and reported (`malformed_lines`), never fatal: a
 record torn by a killed process must not cost you the rest of the report.
 
-```
+```text
 3 mismatch(es) across 2 route(s) (2 file(s) read)
 
 ROUTE         COUNT  KINDS

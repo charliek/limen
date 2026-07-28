@@ -15,17 +15,29 @@
 //!   render time — cookie values, sensitive headers, sensitive query params, and
 //!   redacted JSON paths never reach this module in the clear. The sink adds no
 //!   values of its own beyond the request's own method/path and ids.
-//! - **Off the client path (invariant 2).** The observer runs inside the
-//!   detached shadow task, so the blocking file write here is already off the
-//!   client's response path. It still must never panic: an IO failure is warned
-//!   about once and dropped.
+//! - **Off the client path, and off every Tokio worker (invariant 2).** The
+//!   observer runs inside the detached shadow task, already off the client's
+//!   response path — but the file write is *synchronous*, so doing it inline
+//!   would park a Tokio worker per stalled write (a full or unmounted volume
+//!   under concurrent mismatches). Instead [`SinkObserver::comparison`] only
+//!   serializes the record and hands it to a bounded channel; a single dedicated
+//!   OS thread ([`run_writer`]) owns the file handle, date rotation, and the
+//!   blocking IO. The channel is bounded and non-blocking to the producer: a full
+//!   queue drops-and-counts (warn-once), exactly like an IO failure — diagnostics
+//!   must never degrade the proxy, so the shadow task is never blocked. On
+//!   shutdown the observer is simply dropped; the channel closes and the writer
+//!   thread exits (best-effort flush — a diagnostic sink needn't guarantee its
+//!   last line).
 
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::Arc;
+use std::thread;
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
@@ -43,6 +55,12 @@ const FILE_PREFIX: &str = "mismatches-";
 const FILE_SUFFIX: &str = ".jsonl";
 /// How many recent examples `limen report` shows per route.
 pub const REPORT_EXAMPLES_PER_ROUTE: usize = 3;
+
+/// Depth of the bounded channel feeding the writer thread. Deep enough to absorb
+/// a burst of concurrent mismatches while the writer flushes one line at a time,
+/// shallow enough to bound memory: over this many queued records, new mismatches
+/// are dropped-and-counted rather than blocking the shadow task (invariant 2).
+const WRITER_QUEUE_DEPTH: usize = 1024;
 
 /// One mismatch record, as written to the sink.
 ///
@@ -68,9 +86,123 @@ struct MismatchRecord<'a> {
     diff_truncated: bool,
 }
 
-/// The currently open daily file plus the warn-once latch for IO failures.
+/// A serialized, newline-terminated record plus the UTC date that selects its
+/// daily file. The record is serialized on the shadow task (borrowing from the
+/// [`ComparisonResult`]) so the channel only ever carries owned bytes.
+struct QueuedRecord {
+    date: Date,
+    line: String,
+}
+
+/// A message to the writer thread.
+enum WriterMsg {
+    /// Append this record to its daily file.
+    Record(QueuedRecord),
+    /// Test-only rendezvous: the writer acks once it has drained every record
+    /// enqueued before this message (the channel is FIFO and single-consumer),
+    /// so a test can read the file without racing the writer.
+    #[cfg(test)]
+    Flush(SyncSender<()>),
+}
+
+/// Drop counters shared between the producing shadow tasks and the writer thread.
+///
+/// Diagnostics-only: every increment marks a mismatch record that was *dropped*
+/// rather than persisted, so the proxy is never blocked or brought down by the
+/// sink (invariant 2). Exposed to the writer and to tests, never to the client
+/// path's control flow.
 #[derive(Default)]
-struct SinkState {
+struct SinkStats {
+    /// Records dropped because the daily file could not be opened or written
+    /// (full/unmounted volume, a path whose parent is a file, …).
+    io_failures: AtomicU64,
+    /// Records dropped because the writer queue was full — the writer could not
+    /// keep up (a stalled volume) and the shadow task refused to block on it.
+    queue_overflows: AtomicU64,
+}
+
+/// A [`ShadowObserver`] that appends every mismatch to a daily JSONL file.
+///
+/// Matching comparisons and the non-comparison callbacks are no-ops: the sink is
+/// a mismatch archive, not a request log. The observer never touches the
+/// filesystem itself — it serializes each mismatch and hands it to the dedicated
+/// [`run_writer`] thread over a bounded channel.
+pub struct SinkObserver {
+    /// Kept only for log context (the writer thread owns the actual directory).
+    dir: PathBuf,
+    /// Bounded, non-blocking producer end. A full channel drops-and-counts.
+    tx: SyncSender<WriterMsg>,
+    /// Shared drop counters (also read by the writer thread and by tests).
+    stats: Arc<SinkStats>,
+    /// Warn-once latch for a full writer queue: the first overflow warns, the
+    /// rest are counted in `stats.queue_overflows`, not re-logged.
+    overflow_warned: AtomicBool,
+}
+
+impl SinkObserver {
+    /// Create a sink writing under `dir` and spawn its dedicated writer thread.
+    /// The directory is created lazily on the first mismatch, so configuring a
+    /// sink never touches the filesystem at startup (and a proxy that never
+    /// mismatches leaves no trace).
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        let dir = dir.into();
+        let stats = Arc::new(SinkStats::default());
+        let (tx, rx) = sync_channel(WRITER_QUEUE_DEPTH);
+        // A dedicated OS thread — not a Tokio task — owns the file handle and all
+        // blocking IO, so a stalled volume parks only this thread, never a Tokio
+        // worker (invariant 2). It exits when the last `tx` is dropped (the
+        // channel closes), i.e. at shutdown.
+        let writer_dir = dir.clone();
+        let writer_stats = Arc::clone(&stats);
+        thread::Builder::new()
+            .name("limen-diff-sink".to_string())
+            .spawn(move || run_writer(&writer_dir, &rx, &writer_stats))
+            .expect("spawn diff-sink writer thread");
+        Self {
+            dir,
+            tx,
+            stats,
+            overflow_warned: AtomicBool::new(false),
+        }
+    }
+
+    /// Record that a mismatch was dropped because the writer queue was full.
+    /// Warn once, then only count — a stalled sink must not drown the logs.
+    fn note_overflow(&self) {
+        self.stats.queue_overflows.fetch_add(1, Ordering::Relaxed);
+        if !self.overflow_warned.swap(true, Ordering::Relaxed) {
+            warn!(
+                event = "limen.diff_sink_queue_full",
+                dir = %self.dir.display(),
+                "mismatch record dropped; writer queue full, further drops are counted, not logged"
+            );
+        }
+    }
+}
+
+/// The writer thread's loop: drain the channel, appending each record to its
+/// daily file, until every producer has hung up. Owns all blocking IO and the
+/// rotation + warn-once failure latch. Never panics: an IO failure is warned
+/// about (once per run of consecutive failures) and the record dropped.
+fn run_writer(dir: &Path, rx: &Receiver<WriterMsg>, stats: &SinkStats) {
+    let mut state = WriterState::default();
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            WriterMsg::Record(record) => write_record(dir, &mut state, stats, &record),
+            #[cfg(test)]
+            WriterMsg::Flush(ack) => {
+                // Every earlier `Record` has already been handled (FIFO), so the
+                // file reflects them; the receiver can now read it.
+                let _ = ack.send(());
+            }
+        }
+    }
+}
+
+/// The currently open daily file plus the warn-once latch for IO failures.
+/// Lives entirely inside the single writer thread, so it needs no locking.
+#[derive(Default)]
+struct WriterState {
     /// The open file and the UTC date it holds, if any.
     open: Option<(Date, File)>,
     /// Whether the last write failed (so repeated failures warn once, not once
@@ -80,91 +212,74 @@ struct SinkState {
     suppressed: u64,
 }
 
-/// A [`ShadowObserver`] that appends every mismatch to a daily JSONL file.
-///
-/// Matching comparisons and the non-comparison callbacks are no-ops: the sink is
-/// a mismatch archive, not a request log.
-pub struct SinkObserver {
-    dir: PathBuf,
-    state: Mutex<SinkState>,
-}
-
-impl SinkObserver {
-    /// Create a sink writing under `dir`. The directory is created lazily on the
-    /// first mismatch, so configuring a sink never touches the filesystem at
-    /// startup (and a proxy that never mismatches leaves no trace).
-    pub fn new(dir: impl Into<PathBuf>) -> Self {
-        Self {
-            dir: dir.into(),
-            state: Mutex::new(SinkState::default()),
-        }
-    }
-
-    /// Append one serialized, newline-terminated record, rotating the open file
-    /// when the UTC date changes. Never panics: an IO failure is warned about
-    /// (once per run of consecutive failures) and dropped.
-    fn append(&self, date: Date, line: &str) {
-        // The lock is only poisoned if a previous holder panicked; nothing here
-        // can, but recovering the guard keeps a poisoned mutex from taking the
-        // shadow task down with it.
-        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.open.as_ref().is_none_or(|(open, _)| *open != date) {
-            match self.open_file(date) {
-                Ok(file) => state.open = Some((date, file)),
-                Err(e) => {
-                    self.record_failure(&mut state, date, &e);
-                    return;
-                }
+/// Append one serialized, newline-terminated record, rotating the open file when
+/// the UTC date changes.
+fn write_record(dir: &Path, state: &mut WriterState, stats: &SinkStats, record: &QueuedRecord) {
+    let date = record.date;
+    if state.open.as_ref().is_none_or(|(open, _)| *open != date) {
+        match open_file(dir, date) {
+            Ok(file) => state.open = Some((date, file)),
+            Err(e) => {
+                record_failure(dir, state, stats, date, &e);
+                return;
             }
         }
-        let Some((_, file)) = state.open.as_mut() else {
-            return;
-        };
-        // A single `write_all` of the newline-terminated record on an O_APPEND
-        // file keeps concurrent shadow tasks (and other limen processes sharing
-        // the directory) from interleaving partial records.
-        if let Err(e) = file.write_all(line.as_bytes()) {
-            // Drop the handle so the next mismatch reopens rather than retrying
-            // a file descriptor that may be gone (rotated away by an external
-            // log rotator, unmounted volume, …).
-            state.open = None;
-            self.record_failure(&mut state, date, &e);
-        } else if state.failing {
-            warn!(
-                suppressed_failures = state.suppressed,
-                dir = %self.dir.display(),
-                "limen.diff_sink_recovered"
-            );
-            state.failing = false;
-            state.suppressed = 0;
-        }
     }
-
-    /// Open (creating the directory and file as needed) the daily file.
-    fn open_file(&self, date: Date) -> std::io::Result<File> {
-        std::fs::create_dir_all(&self.dir)?;
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(self.dir.join(file_name(date)))
-    }
-
-    /// Warn about an IO failure the first time, then only count it until a write
-    /// succeeds again — a sink on a full disk must not drown the logs.
-    fn record_failure(&self, state: &mut SinkState, date: Date, error: &std::io::Error) {
-        if state.failing {
-            state.suppressed = state.suppressed.saturating_add(1);
-            return;
-        }
-        state.failing = true;
-        state.suppressed = 0;
+    let Some((_, file)) = state.open.as_mut() else {
+        return;
+    };
+    // A single `write_all` of the newline-terminated record on an O_APPEND file
+    // keeps other limen processes sharing the directory from interleaving partial
+    // records. (Within one process only this thread writes.)
+    if let Err(e) = file.write_all(record.line.as_bytes()) {
+        // Drop the handle so the next record reopens rather than retrying a file
+        // descriptor that may be gone (rotated away by an external log rotator,
+        // unmounted volume, …).
+        state.open = None;
+        record_failure(dir, state, stats, date, &e);
+    } else if state.failing {
         warn!(
-            event = "limen.diff_sink_write_failed",
-            path = %self.dir.join(file_name(date)).display(),
-            error = %error,
-            "mismatch record dropped; further failures are counted, not logged"
+            suppressed_failures = state.suppressed,
+            dir = %dir.display(),
+            "limen.diff_sink_recovered"
         );
+        state.failing = false;
+        state.suppressed = 0;
     }
+}
+
+/// Open (creating the directory and file as needed) the daily file.
+fn open_file(dir: &Path, date: Date) -> std::io::Result<File> {
+    std::fs::create_dir_all(dir)?;
+    OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join(file_name(date)))
+}
+
+/// Count a dropped record and warn about the IO failure the first time, then
+/// only count it until a write succeeds again — a sink on a full disk must not
+/// drown the logs.
+fn record_failure(
+    dir: &Path,
+    state: &mut WriterState,
+    stats: &SinkStats,
+    date: Date,
+    error: &std::io::Error,
+) {
+    stats.io_failures.fetch_add(1, Ordering::Relaxed);
+    if state.failing {
+        state.suppressed = state.suppressed.saturating_add(1);
+        return;
+    }
+    state.failing = true;
+    state.suppressed = 0;
+    warn!(
+        event = "limen.diff_sink_write_failed",
+        path = %dir.join(file_name(date)).display(),
+        error = %error,
+        "mismatch record dropped; further failures are counted, not logged"
+    );
 }
 
 /// The daily file name for a UTC date.
@@ -206,23 +321,48 @@ impl ShadowObserver for SinkObserver {
             location_mismatches: &result.location_mismatches,
             diff_truncated: result.diff_truncated,
         };
-        match serde_json::to_string(&record) {
-            Ok(mut line) => {
-                line.push('\n');
-                self.append(now.date(), &line);
-            }
+        let mut line = match serde_json::to_string(&record) {
+            Ok(line) => line,
             // Unreachable: every field is a plain serializable type.
-            Err(e) => warn!(
-                event = "limen.diff_sink_serialize_failed",
-                route_id = %meta.route_id,
-                error = %e,
-            ),
+            Err(e) => {
+                warn!(
+                    event = "limen.diff_sink_serialize_failed",
+                    route_id = %meta.route_id,
+                    error = %e,
+                );
+                return;
+            }
+        };
+        line.push('\n');
+        // Hand the record to the writer thread without ever blocking the shadow
+        // task: a full queue (a stalled volume the writer can't drain) drops-and-
+        // counts, exactly like an IO failure. `Disconnected` means the writer
+        // thread is gone (only possible if it panicked, which it is written not
+        // to) — count that dropped record too rather than resurrecting the thread.
+        match self.tx.try_send(WriterMsg::Record(QueuedRecord {
+            date: now.date(),
+            line,
+        })) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => self.note_overflow(),
         }
     }
 
     fn shadow_skipped(&self, _meta: &ShadowMeta, _reason: SkipReason) {}
     fn shadow_failed(&self, _meta: &ShadowMeta, _failure: ShadowFailure) {}
     fn comparison_skipped(&self, _meta: &ShadowMeta, _reason: SkipReason) {}
+}
+
+#[cfg(test)]
+impl SinkObserver {
+    /// Block until the writer thread has processed every record enqueued so far.
+    /// Test-only: lets a test read the sink file without racing the writer.
+    fn flush(&self) {
+        let (ack_tx, ack_rx) = sync_channel(0);
+        if self.tx.send(WriterMsg::Flush(ack_tx)).is_ok() {
+            let _ = ack_rx.recv();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -522,6 +662,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = SinkObserver::new(dir.path().join("diffs"));
         sink.comparison(&meta("req-1"), &mismatching());
+        sink.flush();
 
         let sink_dir = dir.path().join("diffs");
         let (name, contents) = sole_file(&sink_dir);
@@ -563,6 +704,7 @@ mod tests {
         sink.shadow_skipped(&meta("req-1"), SkipReason::ConcurrencyLimit);
         sink.shadow_failed(&meta("req-1"), ShadowFailure::Timeout);
         sink.comparison_skipped(&meta("req-1"), SkipReason::ResponseTooLarge);
+        sink.flush();
 
         // Not even the directory is created: a clean run leaves no trace.
         assert!(!sink_dir.exists());
@@ -575,6 +717,7 @@ mod tests {
         for i in 0..3 {
             sink.comparison(&meta(&format!("req-{i}")), &mismatching());
         }
+        sink.flush();
         let (_, contents) = sole_file(dir.path());
         assert_eq!(contents.lines().count(), 3);
         assert!(contents.contains("req-0") && contents.contains("req-2"));
@@ -590,10 +733,11 @@ mod tests {
         let sink = SinkObserver::new(blocker.join("sink"));
         sink.comparison(&meta("req-1"), &mismatching());
         sink.comparison(&meta("req-2"), &mismatching());
-        // Second failure was counted, not re-logged.
-        let state = sink.state.lock().unwrap();
-        assert!(state.failing);
-        assert_eq!(state.suppressed, 1);
+        sink.flush();
+        // Both records were dropped by the writer thread (the first warns, the
+        // second is counted, not re-logged) — and nothing panicked.
+        assert_eq!(sink.stats.io_failures.load(Ordering::Relaxed), 2);
+        assert_eq!(sink.stats.queue_overflows.load(Ordering::Relaxed), 0);
     }
 
     /// Safety invariant 5, end to end through the sink: a cookie/Location
@@ -644,6 +788,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sink = SinkObserver::new(dir.path());
         sink.comparison(&meta("req-1"), &result);
+        sink.flush();
         let (_, contents) = sole_file(dir.path());
 
         for secret in [
@@ -673,6 +818,7 @@ mod tests {
         let sink = SinkObserver::new(dir.path());
         sink.comparison(&meta("req-1"), &mismatching());
         sink.comparison(&meta("req-2"), &mismatching());
+        sink.flush();
 
         let report = read_report(dir.path(), &ReportFilter::default(), 3).unwrap();
         assert_eq!(report.total, 2);

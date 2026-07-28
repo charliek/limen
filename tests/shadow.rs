@@ -44,7 +44,13 @@ impl ShadowObserver for Capture {
             .push((meta.clone(), result.clone()));
     }
     fn shadow_skipped(&self, _meta: &ShadowMeta, reason: SkipReason) {
-        self.skips.lock().unwrap().push(reason.as_str().to_string());
+        // Tag with the callback so assertions pin which counter fired — a shadow
+        // skip and a comparison skip carry the same `SkipReason` vocabulary but
+        // are classified onto different metrics.
+        self.skips
+            .lock()
+            .unwrap()
+            .push(format!("shadow_skipped:{}", reason.as_str()));
     }
     fn shadow_failed(&self, _meta: &ShadowMeta, failure: ShadowFailure) {
         self.failures
@@ -53,7 +59,10 @@ impl ShadowObserver for Capture {
             .push(failure.as_str().to_string());
     }
     fn comparison_skipped(&self, _meta: &ShadowMeta, reason: SkipReason) {
-        self.skips.lock().unwrap().push(reason.as_str().to_string());
+        self.skips
+            .lock()
+            .unwrap()
+            .push(format!("comparison_skipped:{}", reason.as_str()));
     }
 }
 
@@ -456,7 +465,10 @@ routes:
     );
     // ...and the comparison is skipped (so the new upstream is not shadowed).
     wait_until(|| !capture.skips().is_empty()).await;
-    assert_eq!(capture.skips(), vec!["response_too_large"]);
+    assert_eq!(
+        capture.skips(),
+        vec!["comparison_skipped:response_too_large"]
+    );
     assert!(capture.comparisons().is_empty());
     assert_eq!(new.received_requests().await.unwrap().len(), 0);
 }
@@ -600,7 +612,7 @@ routes:
         5000,
         "the primary must still receive the whole body"
     );
-    assert_eq!(capture.skips(), vec!["request_too_large"]);
+    assert_eq!(capture.skips(), vec!["shadow_skipped:request_too_large"]);
     assert!(capture.comparisons().is_empty());
     assert_eq!(
         new.received_requests().await.unwrap().len(),
@@ -699,7 +711,7 @@ routes:
         "the client must not wait on the saturated shadow ({elapsed:?})"
     );
 
-    assert_eq!(capture.skips(), vec!["concurrency_limit"]);
+    assert_eq!(capture.skips(), vec!["shadow_skipped:concurrency_limit"]);
     assert!(capture.comparisons().is_empty());
     let legacy_reqs = legacy.received_requests().await.unwrap();
     assert_eq!(legacy_reqs.len(), 2, "the primary saw both requests");

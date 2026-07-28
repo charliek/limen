@@ -237,7 +237,7 @@ None of the three is hop-by-hop, so the header-copy step that strips `Connection
 
 The behavioral contract is the artifact that flows through the migration workflow and gets more trustworthy at each stage:
 
-```
+```text
    AI investigation                Pharos                       Limen
  (docs, OpenAPI, traffic,   (deterministic functional      (production shadow
   code, logs)                validation + refinement)        comparison + rollout)
@@ -813,11 +813,11 @@ Required metrics (avoid high-cardinality labels — **no** user IDs, tenant IDs,
 - Upstream error count by route and upstream.
 - Timeout count by route and upstream.
 - Shadow request count.
-- Shadow skipped count by reason.
+- Shadow skipped count by reason (`concurrency_limit`, `request_too_large`, …). A `request_too_large` body was never replayed to the new upstream, so no comparison is attempted — it is a shadow skip, like `concurrency_limit`.
 - Comparison attempted count.
 - Comparison match count.
 - Comparison mismatch count.
-- Comparison skipped count by reason (`response_too_large`, `request_too_large`, `not_sampled`, `non_json`, `concurrency_limit`, …).
+- Comparison skipped count by reason (`response_too_large`, `not_sampled`, `non_json`, …).
 - Diff sampled count.
 - Circuit-breaker state by route and upstream.
 - Feature-flag provider health.

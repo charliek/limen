@@ -316,9 +316,12 @@ async fn prepare_request_body(
             Some((reqwest::Body::from(bytes), Some(shadow)))
         }
         Buffered::TooLarge(rest) => {
+            // The new upstream is never called (the body could not be buffered
+            // for replay), so no comparison is ever attempted — this is a shadow
+            // skip, consistent with the concurrency-limit gate above.
             state
                 .observer()
-                .comparison_skipped(&shadow.meta(), SkipReason::RequestTooLarge);
+                .shadow_skipped(&shadow.meta(), SkipReason::RequestTooLarge);
             Some((streamed(rest), None))
         }
         Buffered::Error => None,
