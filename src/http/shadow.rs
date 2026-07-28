@@ -44,6 +44,10 @@ pub fn sampled(sample_rate: f64) -> bool {
 pub struct ShadowRequest {
     /// The new upstream URL (origin + the request's path/query).
     pub new_url: Url,
+    /// The legacy upstream URL the primary request was sent to. Carried purely
+    /// so the comparison can resolve each side's relative `Location` against
+    /// its own request URL (spec §4.2).
+    pub legacy_url: Url,
     /// The request method (always GET/HEAD).
     pub method: Method,
     /// Forwarding headers (already filtered).
@@ -68,6 +72,7 @@ pub fn plan(
     method: &Method,
     request_headers: &HeaderMap,
     new_url: Url,
+    legacy_url: &Url,
 ) -> Option<ShadowRequest> {
     if route.mode != RouteMode::ShadowLegacyPrimary || !route.comparison.enabled {
         return None;
@@ -77,6 +82,7 @@ pub fn plan(
     }
     Some(ShadowRequest {
         new_url,
+        legacy_url: legacy_url.clone(),
         method: method.clone(),
         headers: request_headers.clone(),
         shadow_timeout: Duration::from_millis(route.timeouts.shadow_ms),
@@ -115,6 +121,7 @@ async fn run(
     // hold the task (and its concurrency permit) open indefinitely. This is
     // safe here precisely because the shadow body is buffered (bounded), unlike
     // the streaming primary path.
+    let new_url = shadow.new_url.clone();
     let result = client
         .inner()
         .request(shadow.method, shadow.new_url)
@@ -146,6 +153,10 @@ async fn run(
         status,
         headers,
         body,
+        // Each side resolves its own relative `Location` against its own
+        // request URL, so a legacy `/next` and a new `https://new/next` are
+        // recognized as the same target (spec §4.2).
+        request_url: Some(new_url),
     };
     let result = compare::compare(&shadow.rules, &shadow.diff_limits, &legacy, &new);
     observer.comparison(&shadow.route_id, &result);

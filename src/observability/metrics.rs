@@ -102,6 +102,10 @@ impl ShadowObserver for MetricsObserver {
                 // The differences are pre-redacted by the comparison engine.
                 diff = ?result.differences,
                 header_mismatches = ?result.header_mismatches,
+                // Pre-redacted by the comparison engine: cookie values never
+                // appear, only names and attributes.
+                cookie_mismatches = ?result.cookie_mismatches,
+                location_mismatches = ?result.location_mismatches,
             );
         }
     }
@@ -141,6 +145,8 @@ mod tests {
             differences: vec![],
             diff_truncated: false,
             header_mismatches: vec![],
+            cookie_mismatches: vec![],
+            location_mismatches: vec![],
         }
     }
 

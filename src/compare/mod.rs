@@ -9,11 +9,13 @@
 //! - [`normalize`] — JSON normalization driven by merged contract rules.
 //! - [`hash`] — `blake3` over the normalized representation.
 //! - [`diff`] — bounded, redacted JSON-aware structural diff.
+//! - [`headers`] — the optional `Set-Cookie` / `Location` dimensions.
 //! - [`redact`] — header / JSON-path / query redaction.
 //! - [`result`] — [`result::ComparisonResult`] and [`result::Difference`] types.
 
 pub mod diff;
 pub mod hash;
+pub mod headers;
 pub mod jsonpath;
 pub mod normalize;
 pub mod redact;
@@ -22,6 +24,7 @@ pub mod result;
 use axum::http::HeaderMap;
 use bytes::Bytes;
 use serde_json::Value;
+use url::Url;
 
 use crate::contract::model::ComparisonRules;
 use diff::DiffLimits;
@@ -36,6 +39,13 @@ pub struct Captured {
     pub headers: HeaderMap,
     /// The full (bounded) response body.
     pub body: Bytes,
+    /// The URL of the request that produced this response, against which a
+    /// relative `Location` is resolved (RFC 9110 §10.2.2). Always known on the
+    /// proxy's data path — each side carries its *own* upstream URL, which is
+    /// what lets a legacy `/next` and a new `https://new.example/next` compare
+    /// equal. `None` only where no request URL exists (tests, benchmarks); a
+    /// relative `Location` then takes the exact-string fallback.
+    pub request_url: Option<Url>,
 }
 
 /// Compare a legacy and a new response per the merged contract rules.
@@ -51,12 +61,36 @@ pub fn compare(
 ) -> ComparisonResult {
     let status_match = !rules.compare_status || legacy.status == new.status;
     let header_mismatches = compare_headers(&rules.compare_headers, &legacy.headers, &new.headers);
+    // The two optional dimensions: compared only when a contract layer declared
+    // the block (spec §4.2). Absent = not compared at all, not "compared with
+    // defaults".
+    let (cookie_mismatches, cookies_truncated) = rules
+        .set_cookie
+        .as_ref()
+        .map(|r| headers::compare_set_cookie(r, limits, &legacy.headers, &new.headers))
+        .unwrap_or_default();
+    let (location_mismatches, location_truncated) = rules
+        .location
+        .as_ref()
+        .map(|r| {
+            headers::compare_location(
+                r,
+                limits,
+                &legacy.headers,
+                legacy.request_url.as_ref(),
+                &new.headers,
+                new.request_url.as_ref(),
+            )
+        })
+        .unwrap_or_default();
 
-    let (body_match, diff_kind, differences, diff_truncated) = if rules.compare_body {
+    let (body_match, diff_kind, differences, body_truncated) = if rules.compare_body {
         compare_bodies(rules, limits, &legacy.body, &new.body)
     } else {
         (true, None, Vec::new(), false)
     };
+    // One flag for all three bounded surfaces (body diff, cookies, Location).
+    let diff_truncated = body_truncated || cookies_truncated || location_truncated;
 
     ComparisonResult {
         status_match,
@@ -67,6 +101,8 @@ pub fn compare(
         differences,
         diff_truncated,
         header_mismatches,
+        cookie_mismatches,
+        location_mismatches,
     }
 }
 
@@ -157,13 +193,16 @@ fn parse_redact_paths(paths: &[String]) -> Option<Vec<jsonpath::JsonPath>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::model::JsonRules;
+    use crate::contract::model::{
+        CookieValueMode, JsonRules, OriginMode, ResolvedLocationRules, ResolvedSetCookieRules,
+    };
 
     fn captured(status: u16, body: &str) -> Captured {
         Captured {
             status,
             headers: HeaderMap::new(),
             body: Bytes::from(body.to_string()),
+            request_url: None,
         }
     }
 
@@ -247,5 +286,128 @@ mod tests {
         assert!(serialized.contains("application/json")); // non-sensitive shown
         assert!(!serialized.contains("legacy-secret")); // authorization redacted
         assert!(!serialized.contains("new-secret"));
+    }
+
+    #[test]
+    fn optional_dimensions_are_off_unless_a_contract_layer_declares_them() {
+        let mut legacy = captured(200, "{}");
+        let mut new = captured(200, "{}");
+        legacy
+            .headers
+            .insert("set-cookie", "sid=abc; SameSite=Lax".parse().unwrap());
+        new.headers
+            .insert("set-cookie", "other=xyz; SameSite=None".parse().unwrap());
+        legacy
+            .headers
+            .insert("location", "https://legacy.example/a".parse().unwrap());
+        new.headers
+            .insert("location", "https://new.example/b".parse().unwrap());
+
+        // No `set_cookie` / `location` block: neither dimension is compared.
+        let result = compare(&rules(), &DiffLimits::default(), &legacy, &new);
+        assert!(result.is_match());
+        assert!(result.cookie_mismatches.is_empty());
+        assert!(result.location_mismatches.is_empty());
+
+        // Declared: both dimensions now decide the verdict.
+        let mut r = rules();
+        r.set_cookie = Some(ResolvedSetCookieRules {
+            compare: true,
+            ignore_cookies: Vec::new(),
+            ignore_attributes: Vec::new(),
+            compare_values: CookieValueMode::Exact,
+        });
+        r.location = Some(ResolvedLocationRules {
+            compare: true,
+            ignore_query_params: Vec::new(),
+            origin: OriginMode::Exact,
+        });
+        let result = compare(&r, &DiffLimits::default(), &legacy, &new);
+        assert!(!result.is_match());
+        // Two presence mismatches (one cookie per side) collapse into one kind.
+        assert_eq!(result.cookie_mismatches.len(), 2);
+        assert_eq!(
+            result.mismatch_kinds(),
+            ["location.origin", "location.path", "set_cookie.presence"]
+        );
+    }
+
+    /// Limen safety invariant 5, for the new dimension: a `set_cookie` mismatch
+    /// reports the cookie name and the attribute that differed, and **never**
+    /// renders a cookie value — not for a value diff, not for a cookie only one
+    /// side set, and not for an entry too malformed to parse.
+    #[test]
+    fn set_cookie_mismatches_never_render_a_cookie_value() {
+        let mut r = rules();
+        r.set_cookie = Some(ResolvedSetCookieRules {
+            compare: true,
+            ignore_cookies: Vec::new(),
+            ignore_attributes: Vec::new(),
+            compare_values: CookieValueMode::Exact,
+        });
+        let mut legacy = captured(200, "{}");
+        let mut new = captured(200, "{}");
+        for (headers, session, extra) in [
+            (
+                &mut legacy.headers,
+                "session=legacy-secret-value; Path=/api; SameSite=Lax",
+                "orphan=legacy-orphan-secret",
+            ),
+            (
+                &mut new.headers,
+                "session=new-secret-value; Path=/api; SameSite=None",
+                "still-not-a-cookie-new-secret",
+            ),
+        ] {
+            headers.append("set-cookie", session.parse().unwrap());
+            headers.append("set-cookie", extra.parse().unwrap());
+        }
+        legacy
+            .headers
+            .append("set-cookie", "not-a-cookie-legacy-secret".parse().unwrap());
+        // The same response redirects with an OAuth authorization code — a
+        // credential in a query parameter, masked by the `location` dimension.
+        r.location = Some(ResolvedLocationRules {
+            compare: true,
+            ignore_query_params: Vec::new(),
+            origin: OriginMode::Exact,
+        });
+        legacy.headers.insert(
+            "location",
+            "https://app.example/cb?code=legacy-auth-code&next=/home"
+                .parse()
+                .unwrap(),
+        );
+        new.headers.insert(
+            "location",
+            "https://app.example/cb?code=new-auth-code&next=/home"
+                .parse()
+                .unwrap(),
+        );
+
+        let result = compare(&r, &DiffLimits::default(), &legacy, &new);
+        assert!(!result.is_match());
+        let serialized = serde_json::to_string(&result).unwrap();
+        // Every secret-bearing spelling stays out of the rendered result…
+        for secret in [
+            "legacy-secret-value",
+            "new-secret-value",
+            "legacy-orphan-secret",
+            "not-a-cookie-legacy-secret",
+            "still-not-a-cookie-new-secret",
+            "legacy-auth-code",
+            "new-auth-code",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "leaked {secret}: {serialized}"
+            );
+        }
+        // …while the diff still says which cookie and which attribute differed,
+        // and which query parameter carried the masked difference.
+        assert!(serialized.contains("session"));
+        assert!(serialized.contains("SameSite"));
+        assert!(serialized.contains("Lax") && serialized.contains("None"));
+        assert!(serialized.contains("\"param\":\"code\""));
     }
 }

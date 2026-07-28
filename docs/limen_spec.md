@@ -365,6 +365,49 @@ raw string. Redaction (Section 7.5) still applies to rendered values — a
 `set_cookie` mismatch never renders a raw cookie value (name and attribute diff
 only), per the no-secret-value invariant.
 
+**Comparison details (normative, lockstep).** Both engines resolved these while
+implementing the dimensions; they are as binding as the field names:
+
+- **Case sensitivity.** Cookie names — and therefore `ignore_cookies` — are
+  compared **case-sensitively** (RFC 6265). Cookie *attribute* names — and
+  therefore `ignore_attributes` — are compared **ASCII-case-insensitively**;
+  attribute *values* are compared exactly. Query parameter names — and therefore
+  `ignore_query_params` — are compared case-sensitively.
+- **Malformed Set-Cookie** means the name/value pair has no `=`, or the name is
+  empty (the values RFC 6265 §5.2 discards). Unparseable entries are paired with
+  each other **positionally**, never with parsed cookies, and take the
+  exact-string fallback. A duplicated attribute inside one `Set-Cookie` keeps its
+  **last** occurrence, as RFC 6265 §5.2 prescribes.
+- **`compare_values: presence`** compares only whether the two sides *agree*
+  that a value exists: an empty value counts as no value, so `sid=` against
+  `sid=abc` is a value mismatch, while `sid=` on **both** sides matches — that
+  is the cookie-deletion shape (`session=; Max-Age=0`) legacy and new both emit
+  on logout, and it is agreement, not a failure.
+- **Location query.** After `ignore_query_params` removal, the remaining query is
+  compared as a `name -> values` map, so parameter **order never matters**;
+  repeated names compare as an ordered list of values.
+- **Location parts.** `origin: exact` compares the `(scheme, host, effective
+  port)` triple and nothing more — *effective* port, so `https://a` and
+  `https://a:443` are one origin. It is computed from those three parts
+  explicitly rather than from a URL library's `origin` accessor: those return an
+  opaque, never-equal origin for non-special schemes (and disagree between Rust
+  and JavaScript), which would make two identical `mailto:` Locations mismatch.
+  Neither mode compares the URL **fragment** or **userinfo**, which are outside
+  the enumerated parts.
+- **Rendering.** A cookie value is never rendered — a value difference shows
+  `<redacted>` (`<empty>` when the value is empty), a one-sided cookie shows
+  `<present>`, and an unparseable entry shows `<redacted>` because it cannot be
+  masked selectively. Attribute values, `Location` origins, and paths are
+  rendered verbatim; `Location` query values are masked for the standard
+  secret-bearing parameter names (Section 7.5) — which include the OAuth
+  authorization `code`. A rendered `Location` is origin + path only, so a
+  `user:password@` userinfo is never emitted, and an unresolvable `Location`
+  renders `<redacted>` for the same reason as an unparseable cookie.
+- **Bounds.** The cookie and `Location` mismatch lists are each capped at the
+  same `max_differences` bound as the body diff, and the result's
+  `diff_truncated` flag covers all three surfaces — no single response can grow
+  an unbounded log line.
+
 **`compare_headers` conflict:** because these are separate dimensions rather
 than `compare_headers` entries, listing `set-cookie` or `location` (in any
 case) in a `compare_headers` list while the corresponding block is present
@@ -375,7 +418,14 @@ block wins conceptually, and the error keeps the author's intent unambiguous.
 validation semantics — must remain **identical** between Limen and Pharos, the
 same obligation as the JSONPath subset (Section 7.4). The shared fixture in
 `tests/lockstep/` (a byte-identical twin of the Pharos copy) plus its
-`decisions.json` table pin the resolution rules in both engines.
+`decisions.json` table pin the resolution rules in both engines: `merge_cases`
+pins contract resolution and `verdict_cases` pins the comparison itself (a
+response pair and its rules resolve to one verdict plus a **set** of mismatch
+kinds — `status`, `body`, `header`,
+`set_cookie.presence|value|attribute|malformed`,
+`location.presence|origin|path|query|raw`). The set is deliberately
+order-independent: the engines must agree on *which* mismatches exist, not on
+the order in which they find them.
 
 ### 4.3 What lives in the contract vs. in Limen config
 

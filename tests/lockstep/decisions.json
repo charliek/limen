@@ -1,10 +1,14 @@
 {
-  "$comment": "Byte-identical twin of pharos tests/fixtures/lockstep/decisions.json — update BOTH or CI fails. Engine-neutral assertions about lockstep.contract.yaml: plain JSON facts that a Rust test and a TypeScript test can both replay through their own loader and merge code. `merge_cases` pins contract resolution; a `verdict_cases` table (response pair -> expected verdict) is added additively once both comparison engines implement the set_cookie/location dimensions.",
+  "$comment": "Byte-identical twin of pharos tests/fixtures/lockstep/decisions.json — update BOTH or CI fails. Engine-neutral assertions about lockstep.contract.yaml: plain JSON facts that a Rust test and a TypeScript test can both replay through their own loader, merge, and comparison code. `merge_cases` pins contract resolution; `verdict_cases` pins the set_cookie/location comparison dimensions (a response pair -> one verdict).",
   "contract": "lockstep.contract.yaml",
   "notes": {
     "timestamp_precision": "`precision` is spelled canonically here (`milliseconds`), whatever spelling the contract used. Both engines accept `millis` and `milliseconds` and must resolve them to the same precision; each engine canonicalizes before comparing against this table.",
     "resolution": "Every expected_rules block is the full resolution of service `defaults` plus that route's `comparison` — scalars override, lists concatenate defaults-then-route and de-duplicate preserving first occurrence.",
-    "absent_dimension": "`set_cookie`/`location` are null when no layer declared the block: the dimension is not compared at all."
+    "absent_dimension": "`set_cookie`/`location` are null when no layer declared the block: the dimension is not compared at all.",
+    "verdict_rules": "A verdict case's `rules` is a raw comparison block (the same shape a contract route's `comparison` uses), resolved by each engine's own merge over empty service defaults. `legacy`/`new` describe one captured response each: `status`, `headers` (a value is a string, or an array of strings for a repeated header such as set-cookie), `request_url` (the URL of the request that produced the response — what a relative Location resolves against), and an optional `body` (absent = empty on both sides, so the body dimension never decides these verdicts).",
+    "verdict_mismatch_kinds": "`expected.mismatch_kinds` is a SORTED, DE-DUPLICATED SET of kind strings, deliberately order-independent: the two engines need not discover mismatches in the same order, only agree on which kinds exist. Vocabulary: `status`, `body`, `header`, `set_cookie.presence|value|attribute|malformed`, `location.presence|origin|path|query|raw`. An empty list means the responses matched.",
+    "verdict_query_semantics": "The remaining Location query (after ignore_query_params removal) is compared as a name -> values map, so parameter ORDER never matters; repeated names compare as an ordered list of values. Fragments and userinfo are NOT compared by either origin mode — `origin: exact` is the (scheme, host, effective port) triple and nothing else, computed explicitly rather than from a URL library's `origin` accessor, so non-http schemes (`mailto:`) compare equal to themselves in both engines. `ignore_query_params` and `ignore_cookies` match names case-sensitively; `ignore_attributes` and cookie attribute names match ASCII-case-insensitively.",
+    "verdict_cookie_presence_mode": "`compare_values: presence` compares only whether the two sides AGREE that a value exists: an empty value counts as no value, so `sid=` versus `sid=abc` is a `set_cookie.value` mismatch, while `sid=` on BOTH sides matches — the cookie-deletion shape (`session=; Max-Age=0`) both sides emit on logout is agreement, not a failure."
   },
   "merge_cases": [
     {
@@ -255,6 +259,569 @@
           "compare_values": "exact"
         },
         "location": null
+      }
+    }
+  ],
+  "verdict_cases": [
+    {
+      "id": "no-blocks-neither-dimension-is-compared",
+      "asserts": [
+        "with no set_cookie/location block, cookies and Location differences are invisible to the verdict"
+      ],
+      "rules": {},
+      "legacy": {
+        "status": 302,
+        "request_url": "https://legacy.example/start",
+        "headers": {
+          "set-cookie": "sid=legacy-value; Path=/",
+          "location": "https://legacy.example/a"
+        }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://new.example/start",
+        "headers": {
+          "set-cookie": "other=new-value; Path=/x",
+          "location": "https://new.example/b"
+        }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookies-identical-multi-match",
+      "asserts": [
+        "every Set-Cookie value participates, not just the last one",
+        "identical multi-cookie responses match"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": {
+          "set-cookie": [
+            "sid=abc123; Path=/; HttpOnly; Secure; SameSite=Lax",
+            "theme=dark; Path=/",
+            "region=us; Path=/; Max-Age=600"
+          ]
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": {
+          "set-cookie": [
+            "sid=abc123; Path=/; HttpOnly; Secure; SameSite=Lax",
+            "theme=dark; Path=/",
+            "region=us; Path=/; Max-Age=600"
+          ]
+        }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-attribute-diff-samesite",
+      "asserts": [
+        "a differing attribute value is a set_cookie.attribute mismatch",
+        "attribute NAMES are case-insensitive (httponly ~ HttpOnly) while attribute VALUES are exact (Lax != None)"
+      ],
+      "rules": { "set_cookie": { "compare": true } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": { "set-cookie": "sid=abc123; Path=/; httponly; SameSite=Lax" }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "sid=abc123; Path=/; HttpOnly; SameSite=None" }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["set_cookie.attribute"]
+      }
+    },
+    {
+      "id": "cookie-ignore-attributes-lets-a-clock-dependent-diff-pass",
+      "asserts": [
+        "ignore_attributes drops the named attribute from both sides",
+        "ignore_attributes matches attribute names case-insensitively (`expires` ignores `Expires`)"
+      ],
+      "rules": { "set_cookie": { "ignore_attributes": ["expires"] } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": {
+          "set-cookie": "sid=abc123; Path=/; Expires=Wed, 21 Oct 2026 07:28:00 GMT"
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": {
+          "set-cookie": "sid=abc123; Path=/; Expires=Thu, 22 Oct 2026 09:00:00 GMT"
+        }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-ignore-cookies-excludes-a-name-entirely",
+      "asserts": [
+        "an ignored cookie name is excluded even when only one side sets it"
+      ],
+      "rules": { "set_cookie": { "ignore_cookies": ["csrf_token"] } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": {
+          "set-cookie": ["sid=abc123; Path=/", "csrf_token=legacy-only; Path=/"]
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "sid=abc123; Path=/" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-ignore-cookies-is-case-sensitive",
+      "asserts": [
+        "cookie names are case-sensitive (RFC 6265), so ignore_cookies does NOT exclude a differently-cased name"
+      ],
+      "rules": { "set_cookie": { "ignore_cookies": ["csrf_token"] } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": { "set-cookie": "CSRF_TOKEN=legacy-token-value; Path=/" }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "CSRF_TOKEN=new-token-value; Path=/" }
+      },
+      "expected": { "is_match": false, "mismatch_kinds": ["set_cookie.value"] }
+    },
+    {
+      "id": "cookie-presence-mode-passes-different-values",
+      "asserts": [
+        "compare_values: presence compares names and attributes but not values",
+        "the attribute map is still compared in presence mode"
+      ],
+      "rules": { "set_cookie": { "compare_values": "presence" } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": {
+          "set-cookie": "sid=legacy-session-token; Path=/; HttpOnly"
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "sid=new-session-token; Path=/; HttpOnly" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-presence-mode-rejects-an-empty-value",
+      "asserts": [
+        "presence mismatches when exactly ONE side's value is empty — the sides disagree about whether a value exists",
+        "an empty value on one side is reported as set_cookie.value, not set_cookie.presence"
+      ],
+      "rules": { "set_cookie": { "compare_values": "presence" } },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": { "set-cookie": "sid=legacy-session-token; Path=/" }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "sid=; Path=/" }
+      },
+      "expected": { "is_match": false, "mismatch_kinds": ["set_cookie.value"] }
+    },
+    {
+      "id": "cookie-presence-mode-matches-when-both-sides-empty",
+      "asserts": [
+        "presence matches when NEITHER side sets a value: the cookie-deletion shape both sides emit on logout is agreement",
+        "attributes are still compared around an empty value"
+      ],
+      "rules": { "set_cookie": { "compare_values": "presence" } },
+      "legacy": {
+        "status": 204,
+        "request_url": "https://legacy.example/logout",
+        "headers": { "set-cookie": "session=; Path=/; Max-Age=0; HttpOnly" }
+      },
+      "new": {
+        "status": 204,
+        "request_url": "https://new.example/logout",
+        "headers": { "set-cookie": "session=; Path=/; Max-Age=0; HttpOnly" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-missing-on-one-side",
+      "asserts": [
+        "a cookie only one side sets is a set_cookie.presence mismatch"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": {
+          "set-cookie": ["sid=abc123; Path=/", "theme=dark; Path=/"]
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "sid=abc123; Path=/" }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["set_cookie.presence"]
+      }
+    },
+    {
+      "id": "cookie-duplicate-names-pair-positionally-and-match",
+      "asserts": [
+        "duplicate cookie names pair positionally within the name group, in response order"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/flash",
+        "headers": {
+          "set-cookie": ["flash=one; Path=/", "flash=two; Path=/admin"]
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/flash",
+        "headers": {
+          "set-cookie": ["flash=one; Path=/", "flash=two; Path=/admin"]
+        }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-duplicate-names-are-order-sensitive",
+      "asserts": [
+        "swapping two same-name cookies makes both positional pairs differ",
+        "positional pairing reports value and attribute differences, not presence"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/flash",
+        "headers": {
+          "set-cookie": ["flash=one; Path=/", "flash=two; Path=/admin"]
+        }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/flash",
+        "headers": {
+          "set-cookie": ["flash=two; Path=/admin", "flash=one; Path=/"]
+        }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["set_cookie.attribute", "set_cookie.value"]
+      }
+    },
+    {
+      "id": "cookie-malformed-exact-fallback-equal",
+      "asserts": [
+        "an unparseable Set-Cookie (no `=`) falls back to exact-string comparison",
+        "identical malformed entries match"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/weird",
+        "headers": { "set-cookie": ["sid=abc123; Path=/", "totally-broken"] }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/weird",
+        "headers": { "set-cookie": ["sid=abc123; Path=/", "totally-broken"] }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "cookie-malformed-exact-fallback-differs",
+      "asserts": [
+        "differing malformed entries are a set_cookie.malformed mismatch",
+        "malformed entries pair positionally with each other, not with parsed cookies"
+      ],
+      "rules": { "set_cookie": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/weird",
+        "headers": { "set-cookie": ["sid=abc123; Path=/", "totally-broken"] }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/weird",
+        "headers": {
+          "set-cookie": ["sid=abc123; Path=/", "differently-broken"]
+        }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["set_cookie.malformed"]
+      }
+    },
+    {
+      "id": "set-cookie-compare-false-switches-the-dimension-off",
+      "asserts": [
+        "compare: false disables the dimension entirely, lists notwithstanding"
+      ],
+      "rules": {
+        "set_cookie": { "compare": false, "ignore_cookies": ["csrf_token"] }
+      },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/login",
+        "headers": { "set-cookie": "sid=abc123; Path=/; SameSite=Lax" }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/login",
+        "headers": { "set-cookie": "other=xyz; Path=/other; SameSite=None" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-relative-resolves-equal-to-absolute",
+      "asserts": [
+        "a relative Location is resolved against the URL of the request that produced it (RFC 9110 10.2.2)",
+        "a resolved relative Location compares equal to the same absolute URL under origin: exact"
+      ],
+      "rules": { "location": {} },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://app.example/start",
+        "headers": { "location": "/next?x=1" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://app.example/start",
+        "headers": { "location": "https://app.example/next?x=1" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-relative-on-both-sides-resolves-per-side",
+      "asserts": [
+        "each side resolves against its OWN request URL, so two hosts yield two different absolute URLs",
+        "origin: ignore then compares only path and remaining query"
+      ],
+      "rules": { "location": { "origin": "ignore" } },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://legacy.example/start",
+        "headers": { "location": "/next?x=1" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://new.example/start",
+        "headers": { "location": "/next?x=1" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-ignore-query-params-state-and-nonce",
+      "asserts": [
+        "ignore_query_params removes the named params from BOTH sides before comparison",
+        "an ignored param present on only one side does not matter"
+      ],
+      "rules": {
+        "location": { "ignore_query_params": ["state", "nonce"] }
+      },
+      "legacy": {
+        "status": 303,
+        "request_url": "https://app.example/authorize",
+        "headers": {
+          "location": "https://app.example/callback?code=abc&state=legacy-state"
+        }
+      },
+      "new": {
+        "status": 303,
+        "request_url": "https://app.example/authorize",
+        "headers": {
+          "location": "https://app.example/callback?code=abc&state=new-state&nonce=n-1"
+        }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-origin-ignore-tolerates-different-hosts",
+      "asserts": [
+        "origin: ignore compares path and remaining query only — for a legacy and a new service that intentionally redirect to different hosts"
+      ],
+      "rules": { "location": { "origin": "ignore" } },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://legacy.example/go",
+        "headers": { "location": "https://legacy.example/dashboard?tab=main" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://new.example/go",
+        "headers": { "location": "https://new.example/dashboard?tab=main" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-origin-exact-fails-on-a-host-difference",
+      "asserts": [
+        "origin: exact compares scheme+host+port",
+        "the same pair that passes under origin: ignore fails under origin: exact"
+      ],
+      "rules": { "location": { "origin": "exact" } },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://legacy.example/go",
+        "headers": { "location": "https://legacy.example/dashboard?tab=main" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://new.example/go",
+        "headers": { "location": "https://new.example/dashboard?tab=main" }
+      },
+      "expected": { "is_match": false, "mismatch_kinds": ["location.origin"] }
+    },
+    {
+      "id": "location-query-order-does-not-matter",
+      "asserts": [
+        "the remaining query is compared as a name -> values map, so parameter order is irrelevant"
+      ],
+      "rules": { "location": {} },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://app.example/go",
+        "headers": { "location": "https://app.example/next?a=1&b=2" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://app.example/go",
+        "headers": { "location": "https://app.example/next?b=2&a=1" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-path-and-query-differences-are-reported-separately",
+      "asserts": [
+        "a differing path is location.path",
+        "a differing (non-ignored) query value is location.query"
+      ],
+      "rules": { "location": {} },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://app.example/go",
+        "headers": { "location": "https://app.example/next?tab=main" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://app.example/go",
+        "headers": { "location": "https://app.example/other?tab=side" }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["location.path", "location.query"]
+      }
+    },
+    {
+      "id": "location-non-http-schemes-compare-equal",
+      "asserts": [
+        "origin: exact compares the (scheme, host, effective port) triple, NOT a URL library's opaque `origin` for non-special schemes",
+        "two identical non-http Locations match rather than mismatching as two distinct opaque origins"
+      ],
+      "rules": { "location": { "origin": "exact" } },
+      "legacy": {
+        "status": 302,
+        "request_url": "https://legacy.example/contact",
+        "headers": { "location": "mailto:ops@example.com" }
+      },
+      "new": {
+        "status": 302,
+        "request_url": "https://new.example/contact",
+        "headers": { "location": "mailto:ops@example.com" }
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-absent-on-both-sides-matches",
+      "asserts": [
+        "a declared location block over two responses that set no Location is a match"
+      ],
+      "rules": { "location": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/page",
+        "headers": {}
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/page",
+        "headers": {}
+      },
+      "expected": { "is_match": true, "mismatch_kinds": [] }
+    },
+    {
+      "id": "location-present-on-one-side-only",
+      "asserts": ["a Location only one side sends is location.presence"],
+      "rules": { "location": {} },
+      "legacy": {
+        "status": 200,
+        "request_url": "https://legacy.example/page",
+        "headers": { "location": "https://legacy.example/next" }
+      },
+      "new": {
+        "status": 200,
+        "request_url": "https://new.example/page",
+        "headers": {}
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["location.presence"]
+      }
+    },
+    {
+      "id": "both-dimensions-mismatch-together",
+      "asserts": [
+        "the two dimensions are independent and both contribute to one verdict",
+        "an ignored cookie and an ignored query param stay ignored while their neighbours fail"
+      ],
+      "rules": {
+        "set_cookie": { "ignore_cookies": ["csrf_token"] },
+        "location": { "ignore_query_params": ["state"] }
+      },
+      "legacy": {
+        "status": 303,
+        "request_url": "https://legacy.example/authorize",
+        "headers": {
+          "set-cookie": [
+            "sid=abc123; Path=/; SameSite=Lax",
+            "csrf_token=legacy-only"
+          ],
+          "location": "https://legacy.example/callback?code=legacy-auth-code&state=legacy"
+        }
+      },
+      "new": {
+        "status": 303,
+        "request_url": "https://legacy.example/authorize",
+        "headers": {
+          "set-cookie": "sid=abc123; Path=/; SameSite=None",
+          "location": "https://legacy.example/callback?code=new-auth-code&state=new"
+        }
+      },
+      "expected": {
+        "is_match": false,
+        "mismatch_kinds": ["location.query", "set_cookie.attribute"]
       }
     }
   ]

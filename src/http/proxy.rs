@@ -199,7 +199,7 @@ async fn dispatch(
             .new_upstream
             .as_ref()
             .and_then(|new_base| build_upstream_url(new_base, path, uri.query()))
-            .and_then(|new_url| shadow::plan(route, &method, &request_headers, new_url))
+            .and_then(|new_url| shadow::plan(route, &method, &request_headers, new_url, &url))
     };
 
     let upstream_body = reqwest::Body::wrap_stream(body.into_data_stream());
@@ -439,6 +439,9 @@ async fn primary_succeeded(
                 status: status.as_u16(),
                 headers: upstream_headers,
                 body: bytes.clone(),
+                // The legacy request URL, so a relative `Location` resolves
+                // against the host that issued it (spec §4.2).
+                request_url: Some(shadow_req.legacy_url.clone()),
             };
             shadow::spawn(
                 state.client().clone(),

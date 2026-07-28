@@ -29,7 +29,11 @@ pub const SENSITIVE_HEADERS: &[&str] = &[
 ];
 
 /// Query parameter names whose values are always redacted in logs. Lowercase.
-pub const SENSITIVE_QUERY_PARAMS: &[&str] = &["access_token", "token", "api_key", "apikey"];
+///
+/// `code` is here because an OAuth authorization code is a single-use
+/// credential — it appears in redirect `Location` query strings, which the
+/// `location` comparison dimension renders (spec §4.2).
+pub const SENSITIVE_QUERY_PARAMS: &[&str] = &["access_token", "token", "api_key", "apikey", "code"];
 
 /// One step of a concrete location within a JSON document, recorded as a diff
 /// descends. Unlike a [`JsonPath`] pattern (which has wildcards), a location is
