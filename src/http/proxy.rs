@@ -8,10 +8,11 @@
 //! forget shadow to the new upstream — the shadow and comparison never delay or
 //! affect the client response.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +25,7 @@ use crate::compare::Captured;
 use crate::config::model::RouteMode;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
+use crate::http::forwarded;
 use crate::http::shadow::{self, ShadowRequest};
 use crate::observability::request_id::{resolve as resolve_request_id, REQUEST_ID_HEADER};
 use crate::observability::{prometheus, SkipReason};
@@ -160,6 +162,12 @@ async fn dispatch(
     if let Ok(value) = HeaderValue::from_str(request_id) {
         request_headers.insert(REQUEST_ID_HEADER, value);
     }
+    // `X-Forwarded-For`/`X-Forwarded-Proto`, set once here so every upstream
+    // request built from `request_headers` below — primary, failover-safe new
+    // *and* legacy replay, and (via its header clone) the shadow — carries
+    // identical values (spec §6.3, D8). `client_addr` is only populated for
+    // real connections (see `forwarded::apply`).
+    forwarded::apply(&mut request_headers, client_addr(&parts.extensions));
 
     // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
     // request body so a new-side failure can be replayed against legacy. Handled
@@ -242,6 +250,22 @@ async fn dispatch(
             (gateway_timeout(), upstream)
         }
     }
+}
+
+/// The client's address, if this request arrived over a real accepted
+/// connection. Populated by `Router::into_make_service_with_connect_info`
+/// (`src/http/server.rs::serve_with_shutdown`), which inserts a
+/// `ConnectInfo<SocketAddr>` extension per connection; integration tests that
+/// drive the router via `tower::oneshot` have no such connection and so see
+/// `None` here unless a test inserts the extension itself.
+///
+/// Takes `&Extensions` rather than `&Parts` because `dispatch` partially moves
+/// `method`/`uri` out of its `Parts` before this is called — a reference to
+/// the whole `Parts` would no longer borrow-check at that point.
+fn client_addr(extensions: &axum::http::Extensions) -> Option<std::net::IpAddr> {
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
 }
 
 /// Echo the resolved request id on the client response so clients and
@@ -496,7 +520,16 @@ enum Direction {
 /// - `transfer-encoding` (a hop-by-hop header) in both directions, since the
 ///   relay re-frames the body;
 /// - on the **request** leg, `host` and `content-length` — the upstream client
-///   sets Host and frames the streamed request body itself.
+///   sets Host and frames the streamed request body itself;
+/// - on the **request** leg, a client-supplied `X-Limen-Shadow`
+///   unconditionally — Limen is the only party allowed to assert shadow
+///   status (`shadow::plan` sets it on the shadow copy only); without this a
+///   client could spoof the header on the request it sends and mislead the
+///   real upstream into treating primary traffic as a shadow;
+/// - on the **response** leg, `X-Forwarded-For`/`X-Forwarded-Proto`/
+///   `X-Limen-Shadow` — these are Limen-to-upstream request headers
+///   (`http::forwarded`); an upstream that reflects request headers into its
+///   response must not leak them onto the client-facing response.
 ///
 /// Response `content-length` is preserved: the body is relayed unchanged, so the
 /// length still matches (and `HEAD`/`304` keep their meaningful length).
@@ -507,7 +540,12 @@ fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
         let n = name.as_str();
         let drop = HOP_BY_HOP.contains(&n)
             || connection_named.iter().any(|t| t == n)
-            || (direction == Direction::Request && (n == "host" || n == "content-length"));
+            || (direction == Direction::Request
+                && (n == "host" || n == "content-length" || n == forwarded::X_LIMEN_SHADOW))
+            || (direction == Direction::Response
+                && (n == forwarded::X_FORWARDED_FOR
+                    || n == forwarded::X_FORWARDED_PROTO
+                    || n == forwarded::X_LIMEN_SHADOW));
         if drop {
             continue;
         }
@@ -625,6 +663,43 @@ mod tests {
         assert!(out.get("content-length").is_none());
         assert!(out.get("x-secret").is_none()); // named by Connection
         assert_eq!(out.get("x-tenant-id").unwrap(), "t-1");
+    }
+
+    #[test]
+    fn filter_strips_a_client_forged_shadow_marker_from_the_request_leg() {
+        // A client that sends its own `X-Limen-Shadow: 1` must never have it
+        // survive onto the primary request Limen builds — only
+        // `shadow::plan` may set it, and only on the shadow copy.
+        let mut headers = HeaderMap::new();
+        headers.insert(forwarded::X_LIMEN_SHADOW, HeaderValue::from_static("1"));
+        headers.insert("x-tenant-id", HeaderValue::from_static("t-1"));
+
+        let out = filter_headers(&headers, Direction::Request);
+        assert!(out.get(forwarded::X_LIMEN_SHADOW).is_none());
+        assert_eq!(out.get("x-tenant-id").unwrap(), "t-1");
+    }
+
+    #[test]
+    fn filter_strips_forwarded_and_shadow_headers_from_the_response_leg() {
+        // An upstream that reflects request headers back must not leak
+        // Limen's own to-upstream headers onto the client-facing response.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            forwarded::X_FORWARDED_FOR,
+            HeaderValue::from_static("203.0.113.9"),
+        );
+        headers.insert(
+            forwarded::X_FORWARDED_PROTO,
+            HeaderValue::from_static("http"),
+        );
+        headers.insert(forwarded::X_LIMEN_SHADOW, HeaderValue::from_static("1"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let out = filter_headers(&headers, Direction::Response);
+        assert!(out.get(forwarded::X_FORWARDED_FOR).is_none());
+        assert!(out.get(forwarded::X_FORWARDED_PROTO).is_none());
+        assert!(out.get(forwarded::X_LIMEN_SHADOW).is_none());
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
     }
 
     #[test]

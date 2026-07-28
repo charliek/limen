@@ -72,6 +72,21 @@ Point `ca_bundle_path` at a custom CA bundle to trust an internal PKI. Client-
 side TLS termination at Limen (serving HTTPS to clients) is a documented
 post-MVP expansion, not part of the MVP.
 
+## Forwarded headers
+
+Both the primary and shadow upstream requests carry `X-Forwarded-For` (the
+client address appended to any existing value) and `X-Forwarded-Proto`. The
+shadow request additionally carries `X-Limen-Shadow: 1`, letting an upstream's
+access logs (or the upstream itself) tell shadow traffic apart from real
+client traffic (spec §3.6).
+
+If you run Limen behind a TLS-terminating load balancer (the "standalone edge
+proxy" model above), that LB should set `X-Forwarded-Proto: https` on the
+request it forwards to Limen — Limen preserves an existing value rather than
+overwriting it, and only sets `http` (its own listener's scheme; the MVP has
+no listener TLS) when the header is absent. `X-Forwarded-Host` is intentionally
+never set — point upstreams at their own base URL rather than relying on it.
+
 ## Operating it
 
 - Probe `/health/live` for liveness and `/health/ready` for readiness — the

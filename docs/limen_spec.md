@@ -217,6 +217,18 @@ limen/
     docker-compose.yaml     # legacy + new mock + limen, for local trial
 ```
 
+### 3.6 Forwarded headers
+
+Limen sets three headers on every upstream request (`http/forwarded.rs`; injected in `http/proxy.rs::dispatch` before the primary send and before the shadow is planned, so both carry the same values):
+
+- **`X-Forwarded-For`**: the client's address is appended to any existing value, never replacing it — standard proxy semantics, matching a fronting load balancer or CDN. If the incoming request already carries the header as more than one field line, every line is preserved and combined (in order) with the client's address into one comma-joined output line — no hop in the chain is dropped. Set on **both** the primary and shadow requests. Limen learns the client's address from the accepted TCP connection (`axum`'s `ConnectInfo`); if that context is unavailable — e.g. the proxy embedded and driven directly against its router rather than through a bound listener — the header is **omitted entirely** rather than sent with a fabricated value. `X-Forwarded-Proto` is unaffected by this; it never depends on the client address. The value is the bare client IP (no port; an IPv6 address is rendered without brackets, unlike a URI authority).
+- **`X-Forwarded-Proto`**: set to `http` — the scheme of Limen's own data-plane listener, which is plain HTTP in the MVP (Section 11.4; TLS, if any, terminates in front of Limen, and `upstream_tls` config governs calls *to* upstreams, not this listener) — but **only when the client's request doesn't already carry the header**. A value already present came from a proxy upstream of Limen (e.g. a TLS-terminating load balancer) and is authoritative; Limen never overwrites it. Set on **both** the primary and shadow requests.
+- **`X-Limen-Shadow: 1`**: set **only** on the shadow request (never the primary), so an upstream — or its access logs — can distinguish Limen's fire-and-forget comparison traffic from real client traffic (Section 6.1). A client-supplied `X-Limen-Shadow` on an incoming request is **unconditionally stripped** before either the primary or the shadow request is built — a client must never be able to spoof shadow status on a request that actually hits the real upstream as primary traffic.
+
+None of the three is hop-by-hop, so the header-copy step that strips `Connection`-listed and framing headers (Section 3.4, step 5) leaves `X-Forwarded-For`/`X-Forwarded-Proto` untouched on the request leg. That same step, however, explicitly strips all three of `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Limen-Shadow` on the **response** leg — they are only ever written onto the *outbound-to-upstream* request headers, and an upstream that happens to reflect request headers back must not be able to leak them onto the client-facing response.
+
+`X-Forwarded-Host` is deliberately **not** set — upstreams are expected to pin their own base URL rather than trust a forwarded host.
+
 ---
 
 ## 4. The Shared Behavioral Contract
@@ -591,6 +603,7 @@ Limen implements five modes. Each route declares exactly one.
 - For **eligible** read requests, a shadow request → **new** (fire-and-forget).
 - Compare legacy vs. new after normalization; emit metrics/logs/sampled diffs.
 - **Shadow or comparison failure never affects the client response.**
+- The shadow request carries `X-Limen-Shadow: 1` (Section 3.6), which the primary request never does.
 
 **Shadow eligibility (all must hold):**
 
@@ -870,6 +883,7 @@ A `examples/docker-compose.yaml` brings up mock legacy + new + Limen for a day-o
 
 - **MVP: TLS to upstreams** (HTTPS legacy/new), with certificate verification on by default and an optional custom CA bundle for internal PKI.
 - **Post-MVP: client-side TLS termination** at Limen (serving HTTPS to clients) — explicitly a future expansion, designed for but not implemented in MVP.
+- Because Limen's own listener is plain HTTP in the MVP, `X-Forwarded-Proto` set by Limen is always `http` (Section 3.6). There is no listener-TLS config to source another value from; if client-side TLS termination lands post-MVP, that config's resolved scheme becomes this value's source instead of the hardcoded constant.
 
 ---
 

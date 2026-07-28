@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{HeaderMap, Method};
+use axum::http::{HeaderMap, HeaderValue, Method};
 use tracing::{info_span, Instrument};
 use url::Url;
 
@@ -18,6 +18,7 @@ use crate::config::model::RouteMode;
 use crate::contract::model::ComparisonRules;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
+use crate::http::forwarded::X_LIMEN_SHADOW;
 use crate::observability::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
 use crate::resilience::ShadowPermit;
 use crate::routing::CompiledRoute;
@@ -99,11 +100,17 @@ pub fn plan(
     if !method_is_eligible(method) || !sampled(route.comparison.sample_rate) {
         return None;
     }
+    // `request_headers` already carries `X-Forwarded-For`/`X-Forwarded-Proto`
+    // (set once in `proxy::dispatch` before this is called, spec §6.3, D8);
+    // `X-Limen-Shadow` marks *this* copy as the shadow, never the primary —
+    // it is added only to this clone, not back onto `request_headers`.
+    let mut headers = request_headers.clone();
+    headers.insert(X_LIMEN_SHADOW, HeaderValue::from_static("1"));
     Some(ShadowRequest {
         new_url,
         legacy_url: legacy_url.clone(),
         method: method.clone(),
-        headers: request_headers.clone(),
+        headers,
         shadow_timeout: Duration::from_millis(route.timeouts.shadow_ms),
         max_body_bytes: route.comparison.max_body_bytes,
         route_id: route.id.clone(),

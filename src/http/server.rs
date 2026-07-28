@@ -234,8 +234,17 @@ pub async fn serve_with_shutdown(
         "limen listening"
     );
 
-    let data = axum::serve(data_listener, data_app)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    // `with_connect_info` populates a `ConnectInfo<SocketAddr>` extension on
+    // every request from the accepted connection's peer address, which
+    // `proxy::client_addr` reads to build `X-Forwarded-For` (spec §6.3, D8).
+    // Integration tests build `data_plane_router`'s `Router` directly and
+    // drive it via `tower::oneshot`, bypassing this — see
+    // `http::forwarded::apply`'s doc comment for how that's handled.
+    let data = axum::serve(
+        data_listener,
+        data_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let control = axum::serve(control_listener, control_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let servers = async move { tokio::try_join!(data, control) };
