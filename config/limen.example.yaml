@@ -52,6 +52,9 @@ routes:
       enabled: true
       sample_rate: 0.1 # buffer + compare ~10% of eligible reads
       max_body_bytes: 262144
+      # shadow_methods: ["POST"]  # opt a write method into shadowing (spec
+      #   §6.1); only valid on shadow_legacy_primary routes, and the method
+      #   must also appear in match.methods
     circuit_breaker:
       enabled: true
       failure_rate_threshold: 0.25

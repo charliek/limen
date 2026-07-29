@@ -70,6 +70,13 @@ routes:
       json:
         ignore_paths:
           - "$.device.id"             # server-generated on create
+      location:
+        # A 201 Created's Location points at the new device; legacy and new
+        # sit behind different hosts during the migration, so only the path
+        # (and query) need to agree.
+        origin: ignore
+      # set_cookie:                   # uncomment if this route also rotates a
+      #   ignore_attributes: ["Expires"]  # session cookie (clock-dependent)
     expectations:
       typical_status: 201
     tags: [write]

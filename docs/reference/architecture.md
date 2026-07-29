@@ -92,12 +92,12 @@ implements them rather than created empty up front.
 |---|---|
 | `config` | Operational config model, layered loading, semantic validation. |
 | `contract` | The shared behavioral contract: model, loading, merge. |
-| `http` | Data-plane server, upstream client, streaming proxy core, bounded buffers. |
+| `http` | Data-plane server, upstream client, streaming proxy core, bounded buffers, forwarded-header injection (`X-Forwarded-For`/`Proto`, `X-Limen-Shadow`). |
 | `routing` | Route matching, upstream decisioning, rollout hashing. |
-| `compare` | Normalization, JSONPath subset, blake3 hashing, diffing, redaction. |
+| `compare` | Normalization, JSONPath subset, blake3 hashing, diffing, redaction, `set_cookie`/`location` comparison. |
 | `flags` | The `FlagProvider` trait and static / file / Redis providers. |
 | `resilience` | Circuit breaker, timeouts, shadow concurrency limiting. |
-| `observability` | Metrics, structured logging, request-id propagation. |
+| `observability` | Metrics, structured logging, request-id propagation, the durable mismatch diff sink. |
 | `health` | `/health/live`, `/health/ready`, and readiness evaluation. |
 
 ## Technology

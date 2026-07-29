@@ -86,6 +86,6 @@ Limen's defaults all lean toward safety:
   toolchain.
 - [Quickstart](getting-started/quickstart.md) — proxy a single route end to end.
 - [Architecture](reference/architecture.md) — how it's put together.
-- [CLI](reference/cli.md) — the four subcommands.
+- [CLI](reference/cli.md) — the five subcommands.
 
 For the full design, read the [Limen specification](limen_spec.md).

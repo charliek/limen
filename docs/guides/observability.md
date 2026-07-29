@@ -145,10 +145,14 @@ write nothing; a run with no mismatches never even creates the directory.
 
 Rotation is by date only — **retention is yours**. Point your existing
 log-retention tooling (`logrotate`, a cron `find -mtime +N -delete`, a lifecycle
-policy on the mounted volume) at the directory. The sink never blocks the client:
-it runs inside the fire-and-forget shadow task, and an IO failure logs one
-`limen.diff_sink_write_failed` warning and drops the record rather than
-interfering with traffic.
+policy on the mounted volume) at the directory. The sink never blocks the
+client: the shadow task only serializes a record and hands it to a bounded,
+non-blocking channel; a single dedicated writer thread owns the file handle and
+does the actual (synchronous) IO off any Tokio worker. A stalled volume backs
+up that channel instead of the proxy — once it's full, further mismatches are
+dropped and counted rather than queued unboundedly, and an IO failure logs one
+`limen.diff_sink_write_failed` warning (then counts, not re-logs, until a write
+succeeds again) rather than interfering with traffic.
 
 Read the files back with `limen report` — no config file needed, so it runs
 wherever the files ended up:

@@ -20,6 +20,29 @@ Comparison is a two-step, fail-fast process (spec §7.1):
 
 Comparison dimensions default to **HTTP status** and **normalized body**.
 Headers are compared only when a contract lists them in `compare_headers`.
+`Set-Cookie` and `Location` are two further, optional dimensions — see below.
+
+## `set_cookie` and `location`
+
+A contract's `set_cookie` and `location` blocks (`defaults` or per-route
+`comparison`) turn on comparison of every `Set-Cookie` response header and of
+the `Location` header, respectively — read separately from the single-value
+header map `compare_headers` uses, which is why listing `set-cookie` or
+`location` there while the corresponding block is present is a load-time
+validation error.
+
+- `set_cookie` pairs cookies by name and compares their attributes (and, by
+  default, their values — `compare_values: presence` relaxes that to "a value
+  exists on both sides", useful for logout's shared `session=; Max-Age=0`
+  shape). A cookie value is never rendered in a mismatch, only its name and
+  attributes.
+- `location` resolves a relative `Location` against the request URL before
+  comparing part-wise, so a relative redirect on one side and an absolute one
+  on the other can still match. `origin: ignore` drops scheme/host/port from
+  the comparison, for routes that intentionally redirect to different hosts.
+
+Full field reference: [contract reference → `set_cookie` and
+`location`](../reference/contract-reference.md#set_cookie-and-location).
 
 ## Normalization
 

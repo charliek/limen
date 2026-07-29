@@ -145,7 +145,7 @@ limen/
       example-service.contract.yaml
   src/
     main.rs                 # bootstrap, signal handling, listener wiring
-    cli.rs                  # clap subcommands: run, validate-config, print-routes, check-contract
+    cli.rs                  # clap subcommands: run, validate-config, print-routes, check-contract, report
     error.rs                # top-level error types
     config/
       mod.rs
@@ -163,6 +163,8 @@ limen/
       client.rs             # upstream client (reqwest), TLS, timeouts, pooling
       proxy.rs              # streaming proxy core
       body.rs               # bounded buffering helpers, body-limit enforcement
+      forwarded.rs          # X-Forwarded-For/Proto + X-Limen-Shadow injection (§3.6)
+      shadow.rs             # shadow eligibility + fire-and-forget dispatch
     routing/
       mod.rs
       matcher.rs            # method + longest-prefix matching
@@ -183,11 +185,13 @@ limen/
       diff.rs               # JSON-aware structural diff, bounded + redacted
       redact.rs             # header + JSON-path + query redaction
       result.rs             # ComparisonResult, Mismatch types
+      headers.rs            # set_cookie/location comparison dimensions (§4.2)
     observability/
       mod.rs
       metrics.rs            # metric definitions + registration
       logging.rs            # tracing setup, structured fields
       request_id.rs         # request/trace id extraction + propagation
+      sink.rs               # durable mismatch diff sink + `limen report` (§10.4)
     resilience/
       mod.rs
       circuit_breaker.rs    # per-route, per-upstream breaker state machine
@@ -869,7 +873,7 @@ Behavior:
 ```
 
 - Every value written is **already redacted** by the comparison engine (Section 7.5) — the sink adds no new rendering. A dedicated test proves a cookie/`Location` mismatch record contains no raw cookie value and no sensitive query value.
-- The sink runs inside the fire-and-forget shadow task, so its file IO is off the client path by construction (invariant: comparison work never blocks the client). It never panics: an IO failure logs one `warn!`, counts subsequent failures, and drops the record.
+- The sink never does blocking file IO on the shadow task's Tokio worker. `SinkObserver::comparison` only serializes the record and hands it to a bounded (1024-deep) channel; a single dedicated OS thread owns the file handle, date rotation, and the actual write, so a stalled volume parks only that thread, never a Tokio worker (invariant 2). The channel is non-blocking to the producer: a full queue drops-and-counts (warn-once), exactly like an IO failure — a diagnostics sink must never degrade the proxy. On shutdown the observer is dropped, the channel closes, and the writer thread exits (best-effort flush; a diagnostic sink needn't guarantee its last line). It never panics: an IO failure logs one `warn!` (`limen.diff_sink_write_failed`), counts subsequent failures, and drops the record until a write succeeds again.
 - Rotation is by date only. **Retention is the operator's** (standard log-retention tooling over the directory); an in-proxy retention policy is future work.
 
 `limen report` aggregates a sink directory without needing the proxy's configuration:
