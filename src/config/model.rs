@@ -14,7 +14,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::contract::model::{BehavioralRules, JsonRules};
+use crate::contract::model::{BehavioralRules, JsonRules, LocationRules, SetCookieRules};
 use crate::flags::FlagValue;
 
 /// The top-level configuration document.
@@ -33,9 +33,27 @@ pub struct Config {
     /// Feature-flag provider and fail-safe policy.
     #[serde(default)]
     pub flags: FlagsConfig,
+    /// Optional durable sink for comparison mismatches (spec §10.4). Absent =
+    /// mismatches are counted and logged only.
+    #[serde(default)]
+    pub diff_sink: Option<DiffSinkConfig>,
     /// The routing table.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+}
+
+/// The durable mismatch sink (spec §10.4).
+///
+/// Declaring the block turns the sink on; there is nothing to enable
+/// separately, and no retention policy — files rotate by UTC date and are left
+/// for the operator's existing log-retention tooling to prune.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DiffSinkConfig {
+    /// Directory the daily `mismatches-<YYYY-MM-DD>.jsonl` files are written
+    /// to. Relative paths resolve against the process working directory (like
+    /// `flags.file.path`), and the directory is created on the first mismatch.
+    pub dir: PathBuf,
 }
 
 /// Data-plane listener configuration.
@@ -364,6 +382,15 @@ pub struct ComparisonConfig {
     pub sample_rate: f64,
     /// Skip comparison above this body size.
     pub max_body_bytes: u64,
+    /// Write methods this route opts into shadowing (spec §6.1). Empty (the
+    /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
+    /// shadowed. Only `POST` may be listed today, and only on a
+    /// `shadow_legacy_primary` route with `enabled: true` (see
+    /// [`super::validate`]); an opted-in request's body is buffered once,
+    /// bounded by `max_body_bytes`, and replayed byte-identically to both
+    /// upstreams.
+    #[serde(default)]
+    pub shadow_methods: Vec<String>,
     /// Inline: compare HTTP status (behavioral; conflicts with `contract`).
     #[serde(default)]
     pub compare_status: Option<bool>,
@@ -376,6 +403,12 @@ pub struct ComparisonConfig {
     /// Inline: JSON normalization rules (behavioral; conflicts with `contract`).
     #[serde(default)]
     pub json: Option<JsonRules>,
+    /// Inline: `Set-Cookie` comparison (behavioral; conflicts with `contract`).
+    #[serde(default)]
+    pub set_cookie: Option<SetCookieRules>,
+    /// Inline: `Location` comparison (behavioral; conflicts with `contract`).
+    #[serde(default)]
+    pub location: Option<LocationRules>,
 }
 
 impl Default for ComparisonConfig {
@@ -384,10 +417,13 @@ impl Default for ComparisonConfig {
             enabled: false,
             sample_rate: 0.0,
             max_body_bytes: 262_144,
+            shadow_methods: Vec::new(),
             compare_status: None,
             compare_body: None,
             compare_headers: None,
             json: None,
+            set_cookie: None,
+            location: None,
         }
     }
 }
@@ -404,6 +440,8 @@ impl ComparisonConfig {
             || self.compare_body.is_some()
             || self.compare_headers.is_some()
             || self.json.is_some()
+            || self.set_cookie.is_some()
+            || self.location.is_some()
     }
 
     /// The inline behavioral rules expressed as a mergeable layer.
@@ -413,6 +451,8 @@ impl ComparisonConfig {
             compare_body: self.compare_body,
             compare_headers: self.compare_headers.clone(),
             json: self.json.clone(),
+            set_cookie: self.set_cookie.clone(),
+            location: self.location.clone(),
         }
     }
 }

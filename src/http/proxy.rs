@@ -6,12 +6,16 @@
 //! request for comparison, the primary (legacy) response is buffered (bounded)
 //! so it can be both served to the client *and* compared against a fire-and-
 //! forget shadow to the new upstream — the shadow and comparison never delay or
-//! affect the client response.
+//! affect the client response. On a route that opted a write method into
+//! shadowing (`comparison.shadow_methods`), the *request* body is likewise
+//! buffered (bounded) so the identical bytes reach both upstreams; that
+//! bounded buffering is the only shadow-related work on the client path.
 
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -24,6 +28,7 @@ use crate::compare::Captured;
 use crate::config::model::RouteMode;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
+use crate::http::forwarded;
 use crate::http::shadow::{self, ShadowRequest};
 use crate::observability::request_id::{resolve as resolve_request_id, REQUEST_ID_HEADER};
 use crate::observability::{prometheus, SkipReason};
@@ -160,6 +165,12 @@ async fn dispatch(
     if let Ok(value) = HeaderValue::from_str(request_id) {
         request_headers.insert(REQUEST_ID_HEADER, value);
     }
+    // `X-Forwarded-For`/`X-Forwarded-Proto`, set once here so every upstream
+    // request built from `request_headers` below — primary, failover-safe new
+    // *and* legacy replay, and (via its header clone) the shadow — carries
+    // identical values (spec §6.3, D8). `client_addr` is only populated for
+    // real connections (see `forwarded::apply`).
+    forwarded::apply(&mut request_headers, client_addr(&parts.extensions));
 
     // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
     // request body so a new-side failure can be replayed against legacy. Handled
@@ -189,20 +200,27 @@ async fn dispatch(
 
     // Prepare a shadow plan *before* sending the primary, so the method and
     // headers are available to replay. Only `shadow_legacy_primary` + sampled
-    // eligible reads, not while shutting down, and not for a request that
-    // carries a body — the shadow replays an empty GET/HEAD, so a request body
-    // could not be reproduced faithfully (spec §6.1).
-    let shadow = if state.is_shutting_down() || request_has_body(&parts.headers) {
+    // eligible methods, and not while shutting down.
+    let planned = if state.is_shutting_down() {
         None
     } else {
         route
             .new_upstream
             .as_ref()
             .and_then(|new_base| build_upstream_url(new_base, path, uri.query()))
-            .and_then(|new_url| shadow::plan(route, &method, &request_headers, new_url))
+            .and_then(|new_url| {
+                shadow::plan(route, &method, &request_headers, new_url, &url, request_id)
+            })
     };
 
-    let upstream_body = reqwest::Body::wrap_stream(body.into_data_stream());
+    // Settle how the body reaches the primary, and whether the shadow survives
+    // it (an opted-in write buffers here; see `prepare_request_body`).
+    let Some((upstream_body, shadow)) =
+        prepare_request_body(state, body, &parts.headers, planned).await
+    else {
+        release_breaker(&breaker);
+        return (unreadable_body(), upstream);
+    };
 
     // The timeout bounds time-to-response (connect + send + first byte), not the
     // body transfer — `send()` resolves once headers arrive, then the body
@@ -218,10 +236,7 @@ async fn dispatch(
     match tokio::time::timeout(timeout, send).await {
         Ok(Ok(resp)) => {
             record_breaker(&breaker, !resp.status().is_server_error());
-            (
-                primary_succeeded(state, route_id, shadow, resp).await,
-                upstream,
-            )
+            (primary_succeeded(state, shadow, resp).await, upstream)
         }
         Ok(Err(error)) => {
             // A non-failover-safe failover route returns the new-side failure to
@@ -243,6 +258,90 @@ async fn dispatch(
             (gateway_timeout(), upstream)
         }
     }
+}
+
+/// Decide how the request body reaches the primary, and finalize the shadow
+/// plan around it. Returns `None` only if the client's body errored mid-read,
+/// leaving nothing to forward.
+///
+/// - **No shadow planned** — stream the body straight through (the zero-copy
+///   default, spec §3.3).
+/// - **Read** — the shadow replays bodyless, so a body-bearing `GET`/`HEAD`
+///   simply isn't shadowed; its body could not be reproduced faithfully.
+/// - **Opted-in write** (`comparison.shadow_methods`) — buffer the body bounded
+///   by `max_body_bytes` and send those same bytes to both upstreams. Only the
+///   buffering is on the client path (bounded, as on the failover-safe path);
+///   the shadow itself stays fire-and-forget (invariant 2). Over the limit the
+///   body is never fully held: it streams to the primary untouched and shadowing
+///   is skipped as `request_too_large` (invariant 6). If the shadow limiter is
+///   *already* saturated, the buffering is skipped up front rather than paid for
+///   a shadow that would be refused anyway.
+async fn prepare_request_body(
+    state: &AppState,
+    body: Body,
+    client_headers: &HeaderMap,
+    shadow: Option<ShadowRequest>,
+) -> Option<(reqwest::Body, Option<ShadowRequest>)> {
+    fn streamed(body: Body) -> reqwest::Body {
+        reqwest::Body::wrap_stream(body.into_data_stream())
+    }
+
+    let Some(mut shadow) = shadow else {
+        return Some((streamed(body), None));
+    };
+    if shadow::method_is_read(&shadow.method) {
+        let keep = (!request_has_body(client_headers)).then_some(shadow);
+        return Some((streamed(body), keep));
+    }
+
+    // Buffering a write's body costs client latency and up to `max_body_bytes`
+    // of memory *before* the real permit is taken (which happens only once the
+    // primary has responded, in `primary_succeeded`). Paying that for a shadow
+    // the limiter would refuse is pure waste under load — exactly when the limit
+    // is doing its job — so check for saturation first. The check is
+    // best-effort: a slot may free up or fill immediately after, in which case
+    // the worst case is either a shadow skipped that could have run, or a body
+    // buffered whose shadow is then refused by `try_acquire` — i.e. no worse
+    // than the behavior without this gate. `try_acquire` stays authoritative.
+    if state.shadow_limiter().is_saturated() {
+        state
+            .observer()
+            .shadow_skipped(&shadow.meta(), SkipReason::ConcurrencyLimit);
+        return Some((streamed(body), None));
+    }
+
+    match body::buffer_request_or_stream(body, shadow.max_body_bytes).await {
+        Buffered::Full(bytes) => {
+            shadow.body = Some(bytes.clone());
+            Some((reqwest::Body::from(bytes), Some(shadow)))
+        }
+        Buffered::TooLarge(rest) => {
+            // The new upstream is never called (the body could not be buffered
+            // for replay), so no comparison is ever attempted — this is a shadow
+            // skip, consistent with the concurrency-limit gate above.
+            state
+                .observer()
+                .shadow_skipped(&shadow.meta(), SkipReason::RequestTooLarge);
+            Some((streamed(rest), None))
+        }
+        Buffered::Error => None,
+    }
+}
+
+/// The client's address, if this request arrived over a real accepted
+/// connection. Populated by `Router::into_make_service_with_connect_info`
+/// (`src/http/server.rs::serve_with_shutdown`), which inserts a
+/// `ConnectInfo<SocketAddr>` extension per connection; integration tests that
+/// drive the router via `tower::oneshot` have no such connection and so see
+/// `None` here unless a test inserts the extension itself.
+///
+/// Takes `&Extensions` rather than `&Parts` because `dispatch` partially moves
+/// `method`/`uri` out of its `Parts` before this is called — a reference to
+/// the whole `Parts` would no longer borrow-check at that point.
+fn client_addr(extensions: &axum::http::Extensions) -> Option<std::net::IpAddr> {
+    extensions
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ConnectInfo(addr)| addr.ip())
 }
 
 /// Echo the resolved request id on the client response so clients and
@@ -404,7 +503,6 @@ async fn send_buffered(
 /// compare against a fire-and-forget shadow to the new upstream.
 async fn primary_succeeded(
     state: &AppState,
-    route_id: &str,
     shadow: Option<ShadowRequest>,
     resp: reqwest::Response,
 ) -> Response {
@@ -423,7 +521,11 @@ async fn primary_succeeded(
     let Some(permit) = state.shadow_limiter().try_acquire() else {
         state
             .observer()
-            .shadow_skipped(route_id, SkipReason::ConcurrencyLimit);
+            .shadow_skipped(&shadow_req.meta(), SkipReason::ConcurrencyLimit);
+        // The shadow is dead: release the plan — and with it any buffered
+        // request body (an opted-in write holds up to `max_body_bytes`) —
+        // before the client response, rather than at end of scope.
+        drop(shadow_req);
         return relay_response(resp);
     };
 
@@ -439,6 +541,9 @@ async fn primary_succeeded(
                 status: status.as_u16(),
                 headers: upstream_headers,
                 body: bytes.clone(),
+                // The legacy request URL, so a relative `Location` resolves
+                // against the host that issued it (spec §4.2).
+                request_url: Some(shadow_req.legacy_url.clone()),
             };
             shadow::spawn(
                 state.client().clone(),
@@ -454,11 +559,15 @@ async fn primary_succeeded(
             // (prefix + remaining stream) and skip the comparison.
             state
                 .observer()
-                .comparison_skipped(route_id, SkipReason::ResponseTooLarge);
+                .comparison_skipped(&shadow_req.meta(), SkipReason::ResponseTooLarge);
+            // Same as above: the shadow will not run, so drop its plan (and any
+            // buffered request body) before handing the client its response.
+            drop(shadow_req);
             drop(permit);
             response_from_parts(status, client_headers, streamed)
         }
         Buffered::Error => {
+            drop(shadow_req);
             drop(permit);
             bad_gateway()
         }
@@ -495,7 +604,16 @@ enum Direction {
 /// - `transfer-encoding` (a hop-by-hop header) in both directions, since the
 ///   relay re-frames the body;
 /// - on the **request** leg, `host` and `content-length` — the upstream client
-///   sets Host and frames the streamed request body itself.
+///   sets Host and frames the streamed request body itself;
+/// - on the **request** leg, a client-supplied `X-Limen-Shadow`
+///   unconditionally — Limen is the only party allowed to assert shadow
+///   status (`shadow::plan` sets it on the shadow copy only); without this a
+///   client could spoof the header on the request it sends and mislead the
+///   real upstream into treating primary traffic as a shadow;
+/// - on the **response** leg, `X-Forwarded-For`/`X-Forwarded-Proto`/
+///   `X-Limen-Shadow` — these are Limen-to-upstream request headers
+///   (`http::forwarded`); an upstream that reflects request headers into its
+///   response must not leak them onto the client-facing response.
 ///
 /// Response `content-length` is preserved: the body is relayed unchanged, so the
 /// length still matches (and `HEAD`/`304` keep their meaningful length).
@@ -506,7 +624,12 @@ fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
         let n = name.as_str();
         let drop = HOP_BY_HOP.contains(&n)
             || connection_named.iter().any(|t| t == n)
-            || (direction == Direction::Request && (n == "host" || n == "content-length"));
+            || (direction == Direction::Request
+                && (n == "host" || n == "content-length" || n == forwarded::X_LIMEN_SHADOW))
+            || (direction == Direction::Response
+                && (n == forwarded::X_FORWARDED_FOR
+                    || n == forwarded::X_FORWARDED_PROTO
+                    || n == forwarded::X_LIMEN_SHADOW));
         if drop {
             continue;
         }
@@ -559,6 +682,16 @@ fn response_from_parts(status: StatusCode, headers: HeaderMap, body: Body) -> Re
 
 fn not_found() -> Response {
     (StatusCode::NOT_FOUND, "limen: no route matched\n").into_response()
+}
+
+/// The client's request body errored mid-read while being buffered for replay —
+/// there is no complete request to forward, and Limen never invents one.
+fn unreadable_body() -> Response {
+    (
+        StatusCode::BAD_REQUEST,
+        "limen: request body could not be read\n",
+    )
+        .into_response()
 }
 
 fn bad_gateway() -> Response {
@@ -624,6 +757,43 @@ mod tests {
         assert!(out.get("content-length").is_none());
         assert!(out.get("x-secret").is_none()); // named by Connection
         assert_eq!(out.get("x-tenant-id").unwrap(), "t-1");
+    }
+
+    #[test]
+    fn filter_strips_a_client_forged_shadow_marker_from_the_request_leg() {
+        // A client that sends its own `X-Limen-Shadow: 1` must never have it
+        // survive onto the primary request Limen builds — only
+        // `shadow::plan` may set it, and only on the shadow copy.
+        let mut headers = HeaderMap::new();
+        headers.insert(forwarded::X_LIMEN_SHADOW, HeaderValue::from_static("1"));
+        headers.insert("x-tenant-id", HeaderValue::from_static("t-1"));
+
+        let out = filter_headers(&headers, Direction::Request);
+        assert!(out.get(forwarded::X_LIMEN_SHADOW).is_none());
+        assert_eq!(out.get("x-tenant-id").unwrap(), "t-1");
+    }
+
+    #[test]
+    fn filter_strips_forwarded_and_shadow_headers_from_the_response_leg() {
+        // An upstream that reflects request headers back must not leak
+        // Limen's own to-upstream headers onto the client-facing response.
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            forwarded::X_FORWARDED_FOR,
+            HeaderValue::from_static("203.0.113.9"),
+        );
+        headers.insert(
+            forwarded::X_FORWARDED_PROTO,
+            HeaderValue::from_static("http"),
+        );
+        headers.insert(forwarded::X_LIMEN_SHADOW, HeaderValue::from_static("1"));
+        headers.insert("content-type", HeaderValue::from_static("application/json"));
+
+        let out = filter_headers(&headers, Direction::Response);
+        assert!(out.get(forwarded::X_FORWARDED_FOR).is_none());
+        assert!(out.get(forwarded::X_FORWARDED_PROTO).is_none());
+        assert!(out.get(forwarded::X_LIMEN_SHADOW).is_none());
+        assert_eq!(out.get("content-type").unwrap(), "application/json");
     }
 
     #[test]

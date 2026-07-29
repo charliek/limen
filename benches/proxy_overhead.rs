@@ -95,6 +95,7 @@ fn captured(body: Bytes) -> Captured {
         status: 200,
         headers: HeaderMap::new(),
         body,
+        request_url: None,
     }
 }
 

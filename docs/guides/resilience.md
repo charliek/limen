@@ -140,15 +140,21 @@ Each route sets `timeouts.primary_ms` and `timeouts.shadow_ms` (spec §9.2):
 
 Limen never buffers unbounded data (spec §9.3–9.4):
 
-- **Request bodies** are buffered only when a route needs to replay them
-  (`failover_safe`), up to `server.request_body_limit_bytes`; the default
-  streaming path buffers nothing.
+- **Request bodies** are buffered only when a route needs to replay them —
+  `failover_safe`, up to `server.request_body_limit_bytes`, or a write method
+  the route opted into shadowing via `comparison.shadow_methods`, up to
+  `comparison.max_body_bytes` so the identical bytes reach both upstreams. The
+  default streaming path buffers nothing. A shadow-eligible write's body over
+  the limit is never fully buffered: it streams to the primary unchanged and
+  shadowing is skipped, incrementing `shadow_skipped{reason="request_too_large"}`.
 - **Comparison buffering** for shadows is bounded per route by
   `comparison.max_body_bytes`; an over-limit response is streamed to the client
   with the comparison skipped.
 - **Concurrent shadows** are capped by `server.shadow_concurrency_limit`. Over
   the cap, shadows are **skipped** (never queued unboundedly), incrementing
-  `shadow_skipped{reason="concurrency_limit"}`.
+  `shadow_skipped{reason="concurrency_limit"}` — checked *before* a
+  write-shadowing route buffers its request body, too, so an already-saturated
+  limit doesn't pay that buffering cost for a shadow it will refuse anyway.
 
 These bounds protect the proxy's memory and shield the new upstream from a
 shadow-traffic stampede while it's still warming up.

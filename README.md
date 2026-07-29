@@ -43,10 +43,13 @@ but have no build-time dependency on each other.
 ## Status
 
 Limen implements the full MVP from the [spec](docs/limen_spec.md): all five
-route modes, the shadow comparison engine, deterministic percentage rollout, the
-circuit breaker and `failover_to_legacy`, Prometheus metrics, structured logs,
-health endpoints, and bounded graceful shutdown. See the spec's Section 14 for
-the phased build and `CLAUDE.md` for conventions.
+route modes, the shadow comparison engine (including `set_cookie` and
+`Location` as first-class comparison dimensions), a per-route opt-in to shadow
+write methods, deterministic percentage rollout, the circuit breaker and
+`failover_to_legacy`, Prometheus metrics, structured logs, an optional durable
+mismatch diff sink with the `report` command, health endpoints, and bounded
+graceful shutdown. See the spec's Section 14 for the phased build and
+`CLAUDE.md` for conventions.
 
 ## Quickstart
 
@@ -109,11 +112,14 @@ limen run --config limen.config.yaml         # serve (data + control planes)
 limen validate-config -c limen.config.yaml   # semantic validation
 limen print-routes -c limen.config.yaml      # resolved routing table
 limen check-contract path/to.contract.yaml   # validate a behavioral contract
+limen report --dir ./limen-diffs             # summarize a diff_sink directory
 ```
 
 Configuration is layered (defaults < file < environment < CLI). See the
 [configuration reference](docs/reference/config-reference.md) and the example
-config under `config/`.
+config under `config/`. `report` needs no config file — it reads the
+[`diff_sink`](docs/reference/config-reference.md#diff_sink) directory directly;
+see the [CLI reference](docs/reference/cli.md#report).
 
 ## Performance
 

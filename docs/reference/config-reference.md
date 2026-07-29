@@ -22,6 +22,7 @@ server: { … }          # data-plane listener + request limits
 metrics: { … }         # control-plane listener
 upstream_tls: { … }    # TLS for upstream calls
 flags: { … }           # feature-flag provider + fail-safe
+diff_sink: { … }       # optional: persist comparison mismatches to JSONL
 routes: [ … ]          # the routing table
 ```
 
@@ -66,6 +67,26 @@ Only the *selected* provider's settings are validated. Providers and their
 runtime behavior are specified in the [Limen spec](../limen_spec.md) (§8); a
 dedicated guide lands with the flags phase.
 
+## `diff_sink`
+
+Optional. Present = on; there is no separate `enabled` switch.
+
+```yaml
+diff_sink:
+  dir: "./limen-diffs"
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `dir` | path | — | Directory for the daily `mismatches-<UTC date>.jsonl` files. Must be non-empty; need not exist (created on the first mismatch). Relative paths resolve against the process working directory, like `flags.file.path`. |
+
+Every comparison **mismatch** is appended as one JSON line — already redacted by
+the comparison engine — alongside the usual metrics and mismatch log, which are
+unaffected. Read the files back with
+[`limen report`](cli.md#report); the record shape and the retention stance are
+specified in the [Limen spec](../limen_spec.md) (§10.4) and explained in the
+[observability guide](../guides/observability.md#durable-mismatch-diffs).
+
 ## `routes[]`
 
 Each route declares exactly one mode and the upstreams it needs.
@@ -102,16 +123,51 @@ rollout:
 ```yaml
 comparison:
   enabled: true                  # operational gate
-  sample_rate: 0.1               # 0–1; fraction of eligible reads to buffer & compare
+  sample_rate: 0.1               # 0–1; fraction of eligible requests to buffer & compare
   max_body_bytes: 262144         # skip comparison above this size
+  shadow_methods: []             # writes opted into shadowing; default [] = GET/HEAD only
   # Inline behavioral rules (only if NOT referencing a contract):
   # compare_status / compare_body / compare_headers / json: { … }
 ```
 
-`enabled`, `sample_rate`, and `max_body_bytes` are **operational** — they live
-here. The *behavioral* rules (`json.ignore_paths`, etc.) belong in a
-[contract](contract-reference.md); a route may reference a contract **or** inline
-those rules, never both (a validation error).
+`enabled`, `sample_rate`, `max_body_bytes`, and `shadow_methods` are
+**operational** — they live here. The *behavioral* rules (`json.ignore_paths`,
+etc.) belong in a [contract](contract-reference.md); a route may reference a
+contract **or** inline those rules, never both (a validation error).
+
+### `comparison.shadow_methods` (shadowing a write)
+
+Limen never shadows writes by default: only `GET`/`HEAD` are eligible. A route
+that wants a write compared opts that method in explicitly:
+
+```yaml
+mode: shadow_legacy_primary
+comparison:
+  enabled: true
+  sample_rate: 1.0
+  max_body_bytes: 262144
+  shadow_methods: ["POST"]
+```
+
+- Only `POST` may be listed today; `GET`/`HEAD` must **not** be listed (they are
+  always eligible, and listing one suggests you expected the field to *restrict*
+  eligibility, which it does not).
+- The request body is buffered **once**, bounded by `max_body_bytes`, and the
+  same bytes go to the primary and the shadow — identical payload and identical
+  `Content-Length`. A body over the limit is never fully buffered: it streams to
+  the primary unchanged and shadowing is skipped
+  (`shadow_skipped{reason="request_too_large"}`).
+- Only that bounded buffering is on the client path; the shadow request and the
+  comparison stay fire-and-forget, as for reads. If `shadow_concurrency_limit`
+  is already saturated, the body isn't buffered at all — the request is
+  forwarded straight through and counted as
+  `shadow_skipped{reason="concurrency_limit"}`.
+- Validation rejects a listing that could never take effect: a non-`POST`
+  method, a mode other than `shadow_legacy_primary`, `enabled: false`, or a
+  method missing from the route's `match.methods`.
+
+Opt in only where handling the request twice is acceptable — the new upstream
+receives a *real* write.
 
 ### `budget`
 
@@ -153,6 +209,7 @@ precedence.
 upstream URL shapes, percentage and ratio ranges, timeout sanity, route-ID
 uniqueness, known methods, per-mode required upstreams, contract reference
 resolution, the contract-vs-inline conflict rule, JSONPath-subset compliance,
-and the `failover_safe` gate — collecting **all** problems and naming the
+a non-empty `diff_sink.dir`, and the `failover_safe` gate — collecting **all**
+problems and naming the
 offending field and route. A full valid example lives at
 `config/limen.example.yaml`.

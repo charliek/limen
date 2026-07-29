@@ -241,6 +241,8 @@ A route marked `has-external-side-effects` (email, third-party call, payment, jo
 
 Some services use POST for complex queries that don't mutate state. If you can **confirm** (from code) that such a route is side-effect-free, it may be treated as a read for shadowing — but this requires explicit confirmation, not assumption, and should be noted in the route inventory.
 
+Limen makes that confirmation explicit in config: the route opts the method in with `comparison.shadow_methods: ["POST"]` (see the [config reference](reference/config-reference.md)). The request body is buffered within `max_body_bytes` and replayed byte-identically to both upstreams; a larger body streams to the primary and is not shadowed (`shadow_skipped{reason="request_too_large"}`). Nothing changes for routes that don't opt in.
+
 ---
 
 ## 7. Data Consistency Validation

@@ -57,7 +57,10 @@ These are the point of the project — never regress them:
    stale flags, ambiguous config).
 2. **Never block the client response on shadow or comparison work** — shadowing
    is fire-and-forget and off the client path.
-3. **Never shadow writes by default**; only `GET`/`HEAD` reads are eligible.
+3. **Never shadow writes by default**; only `GET`/`HEAD` reads are eligible
+   unless a route explicitly opts a method into `comparison.shadow_methods`
+   (`POST` only today), which replays a bounded, buffered body to both
+   upstreams. Absent that opt-in, a write is never sent to the new upstream.
 4. **Never replay a failed in-flight request against legacy** unless the route
    is explicitly `failover_safe: true` (idempotent). Routing *subsequent*
    requests to legacy via the circuit breaker is fine; retrying *the same*

@@ -31,7 +31,10 @@ deliberately separate paths:
   request is sampled **and** the body is within `max_body_bytes`. The relevant
   responses are buffered, normalized, hashed, and (on a hash mismatch) diffed.
   Over the limit, comparison is skipped (`response_too_large`) and the primary
-  response still streams to the client.
+  response still streams to the client. The *request* body is buffered under the
+  same bound only for a write the route opted into shadowing, so both upstreams
+  receive identical bytes; over the limit, shadowing is skipped
+  (`request_too_large`) and the request streams to the primary unchanged.
 
 The sampling decision is made **per request, before buffering**, so a route with
 `sample_rate: 0.1` pays the buffering cost on ~10% of traffic and streams the
@@ -68,9 +71,11 @@ Each route declares exactly one of five modes (spec §6):
 | `percentage_split` | legacy/new | deterministic per-key split by rollout percentage; breaker/fail-safe can override toward legacy. |
 | `failover_to_legacy` | new | new is primary; fall back to legacy on failure — **only retrying the in-flight request when `failover_safe: true`**. |
 
-**Shadow eligibility** (all must hold): method is `GET`/`HEAD`; comparison is
-enabled; the body is within the buffer limit; shadow concurrency isn't exceeded;
-shutdown isn't in progress. Writes are never shadowed by default.
+**Shadow eligibility** (all must hold): method is `GET`/`HEAD` — or a write the
+route opted into `comparison.shadow_methods`; comparison is enabled; the body is
+within the buffer limit; shadow concurrency isn't exceeded; shutdown isn't in
+progress. Writes are never shadowed by default; an opted-in write replays a
+bounded, buffered body to both upstreams.
 
 !!! warning "Failover and idempotency"
     *Routing* the next request to legacy because the circuit is open is always
@@ -87,12 +92,12 @@ implements them rather than created empty up front.
 |---|---|
 | `config` | Operational config model, layered loading, semantic validation. |
 | `contract` | The shared behavioral contract: model, loading, merge. |
-| `http` | Data-plane server, upstream client, streaming proxy core, bounded buffers. |
+| `http` | Data-plane server, upstream client, streaming proxy core, bounded buffers, forwarded-header injection (`X-Forwarded-For`/`Proto`, `X-Limen-Shadow`). |
 | `routing` | Route matching, upstream decisioning, rollout hashing. |
-| `compare` | Normalization, JSONPath subset, blake3 hashing, diffing, redaction. |
+| `compare` | Normalization, JSONPath subset, blake3 hashing, diffing, redaction, `set_cookie`/`location` comparison. |
 | `flags` | The `FlagProvider` trait and static / file / Redis providers. |
 | `resilience` | Circuit breaker, timeouts, shadow concurrency limiting. |
-| `observability` | Metrics, structured logging, request-id propagation. |
+| `observability` | Metrics, structured logging, request-id propagation, the durable mismatch diff sink. |
 | `health` | `/health/live`, `/health/ready`, and readiness evaluation. |
 
 ## Technology

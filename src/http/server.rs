@@ -21,7 +21,7 @@ use crate::flags::FlagProvider;
 use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
-use crate::observability::{prometheus, MetricsObserver, ShadowObserver};
+use crate::observability::{prometheus, Fanout, MetricsObserver, ShadowObserver, SinkObserver};
 use crate::resilience::ShadowLimiter;
 use crate::routing::RouteTable;
 
@@ -113,9 +113,22 @@ impl AppState {
 }
 
 /// Build the data-plane application state from a (validated) config, using the
-/// production [`MetricsObserver`]. `base_dir` resolves relative contract refs.
+/// production [`MetricsObserver`] — fanned out alongside a
+/// [`SinkObserver`] when `diff_sink` is configured, so persistence is *added*
+/// to metrics and logs rather than replacing them. `base_dir` resolves relative
+/// contract refs.
 pub fn build_state(config: &Config, base_dir: &Path) -> anyhow::Result<AppState> {
-    let observer: Arc<dyn ShadowObserver> = Arc::new(MetricsObserver::new());
+    let metrics: Arc<dyn ShadowObserver> = Arc::new(MetricsObserver::new());
+    let observer: Arc<dyn ShadowObserver> = match &config.diff_sink {
+        Some(sink) => {
+            info!(dir = %sink.dir.display(), "mismatch diff sink enabled");
+            Arc::new(Fanout::new(vec![
+                metrics,
+                Arc::new(SinkObserver::new(sink.dir.clone())),
+            ]))
+        }
+        None => metrics,
+    };
     build_state_with_observer(config, base_dir, observer)
 }
 
@@ -221,8 +234,17 @@ pub async fn serve_with_shutdown(
         "limen listening"
     );
 
-    let data = axum::serve(data_listener, data_app)
-        .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
+    // `with_connect_info` populates a `ConnectInfo<SocketAddr>` extension on
+    // every request from the accepted connection's peer address, which
+    // `proxy::client_addr` reads to build `X-Forwarded-For` (spec §6.3, D8).
+    // Integration tests build `data_plane_router`'s `Router` directly and
+    // drive it via `tower::oneshot`, bypassing this — see
+    // `http::forwarded::apply`'s doc comment for how that's handled.
+    let data = axum::serve(
+        data_listener,
+        data_app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let control = axum::serve(control_listener, control_app)
         .with_graceful_shutdown(wait_for_shutdown(shutdown_rx.clone()));
     let servers = async move { tokio::try_join!(data, control) };

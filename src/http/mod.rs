@@ -11,9 +11,12 @@
 //! - [`client`] — the upstream client (TLS, timeouts, pooling).
 //! - [`proxy`] — the streaming proxy core.
 //! - [`body`] — bounded buffering helpers and body-limit enforcement.
+//! - [`forwarded`] — `X-Forwarded-For`/`X-Forwarded-Proto` injection shared by
+//!   the primary and shadow upstream requests.
 
 pub mod body;
 pub mod client;
+pub mod forwarded;
 pub mod proxy;
 pub mod server;
 pub mod shadow;

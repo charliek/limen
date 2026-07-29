@@ -71,7 +71,8 @@ Limen's defaults all lean toward safety:
 
 1. Default to **legacy** when uncertain.
 2. **Never** block the client response on shadow or comparison work.
-3. **Never** shadow writes by default.
+3. **Never** shadow writes by default — only where a route opts the method into
+   `comparison.shadow_methods`, with a bounded body replayed to both upstreams.
 4. **Never** replay a failed in-flight request against legacy unless the route
    is explicitly marked idempotent (`failover_safe: true`).
 5. **Never** log secret values — redaction applies to every output surface.
@@ -85,6 +86,6 @@ Limen's defaults all lean toward safety:
   toolchain.
 - [Quickstart](getting-started/quickstart.md) — proxy a single route end to end.
 - [Architecture](reference/architecture.md) — how it's put together.
-- [CLI](reference/cli.md) — the four subcommands.
+- [CLI](reference/cli.md) — the five subcommands.
 
 For the full design, read the [Limen specification](limen_spec.md).

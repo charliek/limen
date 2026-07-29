@@ -26,6 +26,19 @@ impl ShadowLimiter {
         }
     }
 
+    /// Whether the limiter currently has no free slot. A **best-effort**
+    /// snapshot, deliberately not a reservation: it exists so a caller can skip
+    /// *expensive preparation* for a shadow that would almost certainly be
+    /// refused (buffering an opted-in write's request body, see
+    /// [`crate::http::proxy`]). Racy by design — a slot may free up or fill the
+    /// instant after — so [`Self::try_acquire`] stays the authoritative gate.
+    /// With no limit configured, never saturated.
+    pub fn is_saturated(&self) -> bool {
+        self.semaphore
+            .as_ref()
+            .is_some_and(|sem| sem.available_permits() == 0)
+    }
+
     /// Try to reserve a shadow slot without waiting. Returns a permit to hold
     /// for the shadow's lifetime, or `None` if the limit is currently saturated
     /// (the caller should skip the shadow rather than queue). With no limit
@@ -66,6 +79,20 @@ mod tests {
         let _p1 = limiter.try_acquire().expect("first permit");
         let _p2 = limiter.try_acquire().expect("second permit");
         assert!(limiter.try_acquire().is_none(), "third should be refused");
+    }
+
+    #[test]
+    fn saturation_is_observable_without_reserving() {
+        let limiter = ShadowLimiter::new(1);
+        assert!(!limiter.is_saturated());
+        let p = limiter.try_acquire().expect("permit");
+        assert!(limiter.is_saturated());
+        // Asking must not consume a slot.
+        assert!(limiter.is_saturated());
+        drop(p);
+        assert!(!limiter.is_saturated());
+        // An unlimited limiter is never saturated.
+        assert!(!ShadowLimiter::new(0).is_saturated());
     }
 
     #[test]
