@@ -145,7 +145,7 @@ even that stays well inside budget for bodies up to the configured limit.
 
 ## Documentation
 
-The full site lives under `docs/` and builds with `mkdocs-material`
+The full site lives under `docs/` and builds with [Zensical](https://zensical.org)
 (`mise exec -- make docs-serve` → http://127.0.0.1:7071):
 
 - **Getting started** — installation, quickstart

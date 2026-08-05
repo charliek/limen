@@ -27,7 +27,7 @@ All via the `Makefile` (run with `mise exec -- make <target>`):
 | `test` | `cargo test --all` |
 | `bench` | `cargo bench` (criterion) |
 | `check` | `fmt-check` + `lint` + `test` |
-| `docs` / `docs-serve` | build / live-serve the mkdocs site |
+| `docs` / `docs-serve` | build / live-serve the docs site |
 
 The quality gate before any commit is `mise exec -- make check`. CI enforces the
 identical checks plus a release build.
@@ -42,7 +42,7 @@ limen/
   benches/              # criterion SLO benchmarks
   config/               # example config, flags, and contract files
   examples/             # docker-compose local trial
-  docs/                 # this documentation site (mkdocs-material)
+  docs/                 # this documentation site (Zensical)
 ```
 
 ## How the build is structured
