@@ -56,7 +56,7 @@ mise exec -- cargo test --all
 
 ## Documentation site
 
-The docs you are reading build with `mkdocs-material` via `uv`:
+The docs you are reading build with [Zensical](https://zensical.org) via `uv`:
 
 ```bash
 mise exec -- make docs-serve   # live reload at http://127.0.0.1:7071

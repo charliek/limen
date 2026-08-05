@@ -20,7 +20,9 @@ describes the companion test suite that shares the behavioral contract.
   `mise exec -- make …`). `.cargo/config.toml` sets
   `resolver.incompatible-rust-versions = "fallback"` so the dependency graph
   resolves against the pinned compiler.
-- Docs tooling is Python via `uv` (`pyproject.toml`, `mkdocs-material`).
+- Docs tooling is Python via `uv` (`pyproject.toml`, `zensical` + the shared
+  [stridelabs-docs-theme](https://github.com/charliek/stridelabs-docs-theme)
+  package, pinned by tag). Not part of the Rust gates.
 
 ## Quality gate (run before every commit)
 

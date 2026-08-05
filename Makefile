@@ -46,10 +46,10 @@ bench:  ## Run the criterion benchmarks
 
 .PHONY: docs docs-serve
 docs:  ## Build the mkdocs site into site-build/
-	uv sync --group docs && uv run mkdocs build
+	uv sync --locked --group docs && uv run --locked zensical build --strict
 
 docs-serve:  ## Serve the docs locally with live reload
-	uv sync --group docs && uv run mkdocs serve
+	uv sync --locked --group docs && uv run --locked zensical serve
 
 # ---- misc --------------------------------------------------------------
 
