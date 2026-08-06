@@ -62,11 +62,13 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     let method = parts.method.clone();
     let request_id = resolve_request_id(&parts.headers);
 
-    // Match a route by method + longest path prefix. An unmatched request has no
-    // route label, so it is not counted in the per-route request metric.
-    let Some(route) = state
-        .routes()
-        .match_route(method.as_str(), parts.uri.path())
+    // Match a route by method + longest path prefix, narrowed by any query
+    // conditions the route declares. An unmatched request has no route label, so
+    // it is not counted in the per-route request metric.
+    let Some(route) =
+        state
+            .routes()
+            .match_route(method.as_str(), parts.uri.path(), parts.uri.query())
     else {
         return finish_response(not_found(), &request_id);
     };

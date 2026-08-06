@@ -1,5 +1,6 @@
 //! Cross-cutting proxy behavior: path-traversal refusal, hop-by-hop / Connection
-//! header stripping, and response content-length preservation.
+//! header stripping, response content-length preservation, and query-aware route
+//! selection.
 
 mod common;
 
@@ -117,4 +118,64 @@ async fn preserves_response_content_length() {
         Some(body.len().to_string()),
         "the upstream content-length should be relayed to the client",
     );
+}
+
+/// The `/oauth2/auth` split (spec §5.2), end to end: the request's query — not
+/// just its path — picks the route, so the one-time-token hops can be pinned to
+/// legacy while the ordinary authorize bounces move.
+#[tokio::test]
+async fn query_conditions_select_the_route() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    for server in [&legacy, &new] {
+        Mock::given(method("GET"))
+            .and(path("/oauth2/auth"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    let config = config_from_yaml(&format!(
+        r#"
+routes:
+  - id: oauth-verifier
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["consent_verifier"]
+    legacy_upstream: "{legacy}"
+    mode: legacy_only
+  - id: oauth-authorize
+    match: {{ methods: ["GET"], path_prefix: "/oauth2/auth" }}
+    new_upstream: "{new}"
+    mode: new_only
+"#,
+        legacy = legacy.uri(),
+        new = new.uri()
+    ));
+    let app = router(&config);
+
+    for uri in [
+        "/oauth2/auth?consent_verifier=tok",
+        "/oauth2/auth?client_id=app&scope=openid",
+    ] {
+        let resp = send(
+            &app,
+            Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "{uri}");
+    }
+
+    // Same path, same method: only the query separates the two hops.
+    let to_legacy = legacy.received_requests().await.unwrap();
+    let to_new = new.received_requests().await.unwrap();
+    assert_eq!(to_legacy.len(), 1);
+    assert_eq!(to_new.len(), 1);
+    assert_eq!(to_legacy[0].url.query(), Some("consent_verifier=tok"));
+    assert_eq!(to_new[0].url.query(), Some("client_id=app&scope=openid"));
 }

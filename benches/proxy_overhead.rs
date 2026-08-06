@@ -66,6 +66,54 @@ routes:
     RouteTable::build(&config, comparisons).expect("build route table")
 }
 
+/// The same table plus the `/oauth2/auth` split, so one route conditions on the
+/// query. That flips `any_query_conditions`, which is what makes matching parse
+/// the query at all — the cost the unconditioned table above never pays.
+fn query_conditioned_route_table() -> RouteTable {
+    let config: Config = serde_yaml::from_str(
+        r#"
+routes:
+  - id: oauth-verifier
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["login_verifier"]
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: oauth-authorize
+    match: { methods: ["GET"], path_prefix: "/oauth2/auth" }
+    legacy_upstream: "https://legacy.internal"
+    new_upstream: "https://new.internal"
+    mode: legacy_only
+  - id: get-device
+    match: { methods: ["GET"], path_prefix: "/devices/" }
+    legacy_upstream: "https://legacy.internal"
+    new_upstream: "https://new.internal"
+    mode: legacy_only
+  - id: list-devices
+    match: { methods: ["GET"], path_prefix: "/devices" }
+    legacy_upstream: "https://legacy.internal"
+    new_upstream: "https://new.internal"
+    mode: legacy_only
+  - id: users
+    match: { methods: ["GET", "POST"], path_prefix: "/users" }
+    legacy_upstream: "https://legacy.internal"
+    new_upstream: "https://new.internal"
+    mode: legacy_only
+"#,
+    )
+    .expect("valid bench config");
+    let comparisons = resolve_comparisons(&config, Path::new(".")).expect("resolve comparisons");
+    RouteTable::build(&config, comparisons).expect("build route table")
+}
+
+/// A realistically-shaped OAuth authorize query: eight parameters, with the
+/// percent- and `+`-encoding a real redirect URI and scope list carry.
+const AUTHORIZE_QUERY: &str = "client_id=console&response_type=code&\
+     redirect_uri=https%3A%2F%2Fapp.example.com%2Fcallback&scope=openid+profile+email&\
+     state=Sc0pe-4b2f&nonce=9f13ac&code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM&\
+     code_challenge_method=S256";
+
 /// A response body: a JSON array of `n` device objects. When `vary` is set, one
 /// item's value differs (to exercise the diff path on a mismatch).
 fn json_body(n: usize, vary: bool) -> Bytes {
@@ -104,10 +152,34 @@ fn streaming_route_match(c: &mut Criterion) {
     let table = route_table();
     let mut group = c.benchmark_group("streaming_route_match");
     group.bench_function("hit_longest_prefix", |b| {
-        b.iter(|| table.match_route(black_box("GET"), black_box("/devices/abc-123")))
+        b.iter(|| table.match_route(black_box("GET"), black_box("/devices/abc-123"), None))
     });
     group.bench_function("no_match", |b| {
-        b.iter(|| table.match_route(black_box("GET"), black_box("/widgets/xyz")))
+        b.iter(|| table.match_route(black_box("GET"), black_box("/widgets/xyz"), None))
+    });
+
+    // Query-aware matching (spec §5.2). Once any route conditions on the query,
+    // matching parses it once per request; `unconditioned_hit_in_conditioned_table`
+    // is the case that pays for a narrow exception it never consults, so a
+    // regression there shows up as a gap against `hit_longest_prefix` above.
+    let conditioned = query_conditioned_route_table();
+    group.bench_function("conditioned_hit", |b| {
+        b.iter(|| {
+            conditioned.match_route(
+                black_box("GET"),
+                black_box("/oauth2/auth"),
+                black_box(Some("login_verifier=b3f1a9c2")),
+            )
+        })
+    });
+    group.bench_function("unconditioned_hit_in_conditioned_table", |b| {
+        b.iter(|| {
+            conditioned.match_route(
+                black_box("GET"),
+                black_box("/devices/abc-123"),
+                black_box(Some(AUTHORIZE_QUERY)),
+            )
+        })
     });
     group.finish();
 }

@@ -96,6 +96,8 @@ Each route declares exactly one mode and the upstreams it needs.
 | `id` | string | — | Unique; also a metric label. |
 | `match.methods` | list | — | HTTP methods; at least one, all known verbs. |
 | `match.path_prefix` | string | — | Must start with `/`; longest prefix wins. |
+| `match.query_present` | list | `[]` | Query parameter names that must **all** be present (see below). |
+| `match.query_absent` | list | `[]` | Query parameter names of which **none** may be present. |
 | `legacy_upstream` | url | — | Required unless mode is `new_only`. |
 | `new_upstream` | url | — | Required unless mode is `legacy_only`. |
 | `mode` | enum | — | `legacy_only` \| `new_only` \| `shadow_legacy_primary` \| `percentage_split` \| `failover_to_legacy`. |
@@ -106,6 +108,59 @@ Each route declares exactly one mode and the upstreams it needs.
 | `comparison` | block | disabled | Operational gate + optional inline behavioral rules. |
 | `circuit_breaker` | block | disabled | Per-route breaker (spec §9.1). |
 | `budget` | block | `null` | Forward-looking rollout budget (validated, not enforced in MVP). |
+
+### `match.query_present` / `match.query_absent` (query-aware matching)
+
+Two optional presence conditions that narrow a route beyond method + path
+(spec §5.2). Presence only — values never participate, so `?prompt=` counts
+exactly like `?prompt=login`, and names are compared after the same
+percent-decoding the comparison engine applies.
+
+Write names **as they decode**: `login_verifier`, never `login%5Fverifier` or
+`a+b`, and with no leading or trailing whitespace. The decoding is
+one-directional — the request side is decoded, the config side is a literal — so
+an encoded name here would match nothing. Validation rejects those spellings
+rather than normalizing them, because a condition that silently matches nothing
+lets the traffic it was meant to except fall through to a shadowing sibling.
+
+```yaml
+# The verifier hops relay; everything else on the path stays compared.
+- id: "oauth-login-hop"
+  match:
+    methods: ["GET"]
+    path_prefix: "/oauth2/auth"
+    query_present: ["login_verifier"]   # all of these must be present
+  legacy_upstream: "https://legacy.internal"
+  mode: "legacy_only"
+
+- id: "oauth-authorize"
+  match:
+    methods: ["GET"]
+    path_prefix: "/oauth2/auth"
+    query_absent: ["login_verifier"]    # none of these may be present
+  legacy_upstream: "https://legacy.internal"
+  new_upstream: "https://new.internal"
+  mode: "shadow_legacy_primary"
+  comparison: { enabled: true, sample_rate: 0.1 }
+```
+
+Reach for this when one path carries traffic that is not uniformly safe to
+shadow. The field case is an OAuth authorize endpoint: the initial bounce is
+safely comparable, but the `login_verifier` / `consent_verifier` hops replay
+one-time tokens, so the shadow's copy deterministically fails at the shared
+authorization server ("The consent verifier has already been used"). Splitting
+the route relays those hops uncompared and keeps the bounces compared.
+
+**Precedence.** Longest `path_prefix` still wins outright; at an *equal* prefix
+a query-conditioned route beats an unconditioned one (in either config order);
+config order is the final tiebreak. Two conditioned routes on the same prefix
+and method are rejected at load time unless **provably disjoint** — some
+parameter appears in one route's `query_present` and the other's `query_absent`.
+The check is conservative on purpose: anything it cannot prove disjoint is an
+error, rather than letting config order silently decide.
+
+A route declaring neither field matches exactly as it did before these fields
+existed.
 
 ### `rollout`
 
@@ -209,7 +264,9 @@ precedence.
 upstream URL shapes, percentage and ratio ranges, timeout sanity, route-ID
 uniqueness, known methods, per-mode required upstreams, contract reference
 resolution, the contract-vs-inline conflict rule, JSONPath-subset compliance,
-a non-empty `diff_sink.dir`, and the `failover_safe` gate — collecting **all**
-problems and naming the
-offending field and route. A full valid example lives at
-`config/limen.example.yaml`.
+a non-empty `diff_sink.dir`, the query-condition rules (non-empty unique names,
+written as **literal decoded names** — no `%`, `+`, or edge whitespace, since the
+request's query is percent-decoded before comparison and an encoded spelling
+could never match; no name in both fields; provably disjoint conditioned routes
+on one prefix), and the `failover_safe` gate — collecting **all** problems and naming the offending
+field and route. A full valid example lives at `config/limen.example.yaml`.

@@ -192,6 +192,17 @@ fn print_routes(loaded: &LoadedConfig) {
         };
         println!("{}", route.id);
         println!("  match:      {methods}  {}", route.r#match.path_prefix);
+        // Only shown when the route conditions on the query — an unconditioned
+        // route (the default) needs no line.
+        if !route.r#match.query_present.is_empty() {
+            println!(
+                "  query_present: {}",
+                route.r#match.query_present.join(", ")
+            );
+        }
+        if !route.r#match.query_absent.is_empty() {
+            println!("  query_absent:  {}", route.r#match.query_absent.join(", "));
+        }
         println!("  mode:       {}", route.mode.as_str());
         println!(
             "  legacy:     {}",

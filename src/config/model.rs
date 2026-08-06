@@ -310,7 +310,8 @@ pub struct RouteConfig {
     pub budget: Option<BudgetConfig>,
 }
 
-/// Match predicate: method + path prefix (longest prefix wins; spec §5.2).
+/// Match predicate: method + path prefix, optionally narrowed by which query
+/// parameters the request carries (longest prefix wins; spec §5.2).
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
@@ -318,6 +319,28 @@ pub struct RouteMatch {
     pub methods: Vec<String>,
     /// Path prefix this route matches.
     pub path_prefix: String,
+    /// Query parameter names that must **all** be present for this route to
+    /// match (presence only — values are irrelevant). Empty (the default) =
+    /// unconditioned. Exists so a path whose hops are not equally safe to
+    /// shadow can be split into a conditioned route that only relays and an
+    /// unconditioned one that stays compared (spec §5.2).
+    #[serde(default)]
+    pub query_present: Vec<String>,
+    /// Query parameter names of which **none** may be present for this route to
+    /// match. Empty (the default) = unconditioned. A name may not appear in both
+    /// `query_present` and `query_absent` (see [`super::validate`]).
+    #[serde(default)]
+    pub query_absent: Vec<String>,
+}
+
+impl RouteMatch {
+    /// Whether this match declares any query condition. A route that does not
+    /// behaves byte-identically to one written before the fields existed; a
+    /// route that does wins the tiebreak against an unconditioned route on the
+    /// same prefix (spec §5.2).
+    pub fn is_query_conditioned(&self) -> bool {
+        !self.query_present.is_empty() || !self.query_absent.is_empty()
+    }
 }
 
 /// Rollout configuration for `percentage_split` (spec §5.2, §6.4).
@@ -548,6 +571,33 @@ routes:
         assert!(r.comparison.enabled);
         assert!(!r.comparison.has_inline_behavioral());
         assert!(!r.failover_safe);
+    }
+
+    #[test]
+    fn query_conditions_default_to_absent_and_parse_when_given() {
+        let yaml = r#"
+routes:
+  - id: plain
+    match: { methods: ["GET"], path_prefix: "/oauth2/auth" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: verifier
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["login_verifier"]
+      query_absent: ["prompt"]
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        // Omitting the fields must stay indistinguishable from writing them empty.
+        assert!(cfg.routes[0].r#match.query_present.is_empty());
+        assert!(cfg.routes[0].r#match.query_absent.is_empty());
+        assert!(!cfg.routes[0].r#match.is_query_conditioned());
+        assert_eq!(cfg.routes[1].r#match.query_present, vec!["login_verifier"]);
+        assert_eq!(cfg.routes[1].r#match.query_absent, vec!["prompt"]);
+        assert!(cfg.routes[1].r#match.is_query_conditioned());
     }
 
     #[test]

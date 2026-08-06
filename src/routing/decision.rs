@@ -246,7 +246,7 @@ routes:
     #[tokio::test]
     async fn percentage_split_zero_and_hundred() {
         let table = split_table();
-        let route = table.match_route("GET", "/x").unwrap();
+        let route = table.match_route("GET", "/x", None).unwrap();
 
         let all_new = Fake {
             stale: false,
@@ -273,7 +273,7 @@ routes:
     #[tokio::test]
     async fn same_tenant_is_stable() {
         let table = split_table();
-        let route = table.match_route("GET", "/x").unwrap();
+        let route = table.match_route("GET", "/x", None).unwrap();
         let flags = Fake {
             stale: false,
             percentage: Some(50.0),
@@ -294,7 +294,7 @@ routes:
     #[tokio::test]
     async fn stale_flags_fail_safe_to_legacy_even_at_100_percent() {
         let table = split_table();
-        let route = table.match_route("GET", "/x").unwrap();
+        let route = table.match_route("GET", "/x", None).unwrap();
         // Stale provider with a 100% rollout must still route to legacy.
         let stale = Fake {
             stale: true,
@@ -309,7 +309,7 @@ routes:
     #[tokio::test]
     async fn missing_flag_uses_default_percentage() {
         let table = split_table();
-        let route = table.match_route("GET", "/x").unwrap();
+        let route = table.match_route("GET", "/x", None).unwrap();
         // No flag value -> default_percentage (0) -> legacy.
         let no_value = Fake {
             stale: false,
