@@ -107,6 +107,52 @@ routes:
         header: "x-tenant-id"
         fallback: "request_random"
 
+  # One path, two kinds of traffic (spec §5.2). An OAuth authorize endpoint
+  # serves both the initial browser bounce — safely comparable — and the
+  # login/consent hops, which replay one-time verifier tokens: the shadow's copy
+  # of a verifier deterministically fails at the shared authorization server
+  # ("The consent verifier has already been used"), so those hops must be
+  # relayed, never shadowed. `query_present` / `query_absent` split them without
+  # giving up comparison on the bounces.
+  #
+  # Two query-conditioned routes on the same prefix must be *provably disjoint*
+  # (spec §5.3): some parameter appears in one route's `query_present` and the
+  # other's `query_absent`. That holds pairwise here, and between them the three
+  # routes cover every request — including one carrying both verifiers, which the
+  # first route takes.
+  - id: "oauth-login-hop"
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["login_verifier"] # AND across the list; values ignored
+    legacy_upstream: "https://legacy-device.internal"
+    mode: "legacy_only" # relay only: a one-time token cannot be replayed
+
+  - id: "oauth-consent-hop"
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["consent_verifier"]
+      query_absent: ["login_verifier"]
+    legacy_upstream: "https://legacy-device.internal"
+    mode: "legacy_only"
+
+  # The comparable traffic. The `query_absent` guard is redundant with matching
+  # — a query-conditioned route already wins the tie on an equal prefix — but
+  # stating it keeps "this route never sees a verifier" true locally, where the
+  # comparison is switched on.
+  - id: "oauth-authorize"
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_absent: ["login_verifier", "consent_verifier"] # none may be present
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "shadow_legacy_primary"
+    comparison:
+      enabled: true
+      sample_rate: 0.1
+
   # A health endpoint with no legacy equivalent: served only by the new service.
   - id: "health"
     match:

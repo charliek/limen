@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use crate::compare::jsonpath;
 use crate::config::model::{
     BudgetConfig, CircuitBreakerConfig, Config, DiffSinkConfig, FlagProviderKind, FlagsConfig,
-    RolloutConfig, RouteConfig, RouteMode, TimeoutsConfig, UpstreamTlsConfig,
+    RolloutConfig, RouteConfig, RouteMatch, RouteMode, TimeoutsConfig, UpstreamTlsConfig,
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
@@ -121,6 +121,7 @@ pub fn validate(config: &Config, base_dir: &Path) -> Result<(), Vec<ValidationEr
     for (i, route) in config.routes.iter().enumerate() {
         validate_route(i, route, base_dir, &mut seen_ids, &mut contracts, &mut errs);
     }
+    validate_query_disjointness(config, &mut errs);
 
     // Validate each referenced contract's semantics once (version, service,
     // unique route ids), independent of how many routes point at it.
@@ -271,6 +272,137 @@ fn validate_match(loc: &impl Fn(&str) -> String, route: &RouteConfig, errs: &mut
             format!("must start with '/' (got {prefix:?})"),
         );
     }
+    validate_query_conditions(loc, &route.r#match, errs);
+}
+
+/// Validate a route's own query conditions (spec §5.2): names are non-empty and
+/// unique within a field, and no name appears in both fields — a route asking
+/// for a parameter to be both present and absent could never match, so it is a
+/// typo rather than an intent.
+fn validate_query_conditions(loc: &impl Fn(&str) -> String, m: &RouteMatch, errs: &mut Errors) {
+    validate_query_names(loc, "match.query_present", &m.query_present, errs);
+    validate_query_names(loc, "match.query_absent", &m.query_absent, errs);
+    for name in &m.query_present {
+        if m.query_absent.contains(name) {
+            errs.push(
+                loc("match.query_present"),
+                format!(
+                    "query parameter {name:?} is also listed in match.query_absent — \
+                     the route could never match"
+                ),
+            );
+        }
+    }
+}
+
+/// Validate one query-condition list: names are non-empty, unique, and spelled
+/// as they will actually be compared.
+///
+/// Matching compares these config literals against request parameter names that
+/// have already been percent-decoded (see [`crate::routing::matcher`]), so a name
+/// carrying `%`, `+`, or edge whitespace could never equal a decoded name. Such a
+/// route silently matches nothing — and "matches nothing" is the fail-open
+/// direction here: the traffic it was meant to except falls through to whatever
+/// sibling route would otherwise have shadowed it. Per safety invariant 7 these
+/// are rejected at startup rather than normalized, so the operator fixes the
+/// spelling instead of learning about it from a comparison that should never
+/// have run.
+fn validate_query_names(
+    loc: &impl Fn(&str) -> String,
+    field: &str,
+    names: &[String],
+    errs: &mut Errors,
+) {
+    let mut seen: HashSet<&str> = HashSet::new();
+    for name in names {
+        if name.trim().is_empty() {
+            errs.push(loc(field), "query parameter names must not be empty");
+            continue;
+        }
+        if name != name.trim() {
+            errs.push(
+                loc(field),
+                format!(
+                    "query parameter name {name:?} must not carry leading or trailing \
+                     whitespace — it is compared literally against the request's decoded \
+                     parameter names, so it could never match"
+                ),
+            );
+        }
+        if name.contains(['%', '+']) {
+            errs.push(
+                loc(field),
+                format!(
+                    "query parameter name {name:?} must be the literal decoded name: write \
+                     `login_verifier`, not `login%5Fverifier` or `a+b` — request-side \
+                     percent-decoding is applied before comparison, so an encoded spelling \
+                     here could never match"
+                ),
+            );
+        }
+        if !seen.insert(name.as_str()) {
+            errs.push(
+                loc(field),
+                format!("duplicate query parameter name {name:?}"),
+            );
+        }
+    }
+}
+
+/// Reject any pair of query-conditioned routes that could both match the same
+/// request (spec §5.2).
+///
+/// Matching breaks a prefix-length tie in favour of the query-conditioned route
+/// — an unambiguous rule only while at most one conditioned route can match a
+/// given request, which is what this check enforces. Rather than model
+/// query-condition satisfiability, it is deliberately conservative: two conditioned
+/// routes sharing a `path_prefix` and at least one method are accepted **only**
+/// when they are *provably disjoint* — some parameter appears in one route's
+/// `query_present` and the other's `query_absent`, so no single request can
+/// satisfy both. Everything else (two `query_present` sets that a request could
+/// carry together, a `query_present` / `query_absent` pair over unrelated
+/// names) is an error, even where a cleverer analysis might prove it safe.
+/// Routes on *different* prefixes never need this: longest prefix still decides.
+fn validate_query_disjointness(config: &Config, errs: &mut Errors) {
+    for (i, a) in config.routes.iter().enumerate() {
+        if !a.r#match.is_query_conditioned() {
+            continue;
+        }
+        for (j, b) in config.routes.iter().enumerate().skip(i + 1) {
+            if !b.r#match.is_query_conditioned()
+                || a.r#match.path_prefix != b.r#match.path_prefix
+                || !methods_overlap(&a.r#match.methods, &b.r#match.methods)
+                || provably_disjoint(&a.r#match, &b.r#match)
+            {
+                continue;
+            }
+            errs.push(
+                format!("routes[{j}] {:?}.match", b.id),
+                format!(
+                    "query conditions overlap route {:?} (routes[{i}]) on path_prefix {:?}: \
+                     two query-conditioned routes on the same prefix and method must be \
+                     provably disjoint, i.e. some parameter must appear in one route's \
+                     query_present and the other's query_absent so no request can satisfy \
+                     both. Add such a parameter, or give the routes different prefixes or \
+                     methods",
+                    a.id, a.r#match.path_prefix
+                ),
+            );
+        }
+    }
+}
+
+/// Whether the two routes' conditions can be *proven* mutually exclusive by the
+/// one rule the disjointness check recognizes (see
+/// [`validate_query_disjointness`]).
+fn provably_disjoint(a: &RouteMatch, b: &RouteMatch) -> bool {
+    a.query_present.iter().any(|n| b.query_absent.contains(n))
+        || b.query_present.iter().any(|n| a.query_absent.contains(n))
+}
+
+fn methods_overlap(a: &[String], b: &[String]) -> bool {
+    a.iter()
+        .any(|m| b.iter().any(|other| other.eq_ignore_ascii_case(m)))
 }
 
 fn validate_upstreams(loc: &impl Fn(&str) -> String, route: &RouteConfig, errs: &mut Errors) {
@@ -950,6 +1082,203 @@ routes:
     mode: failover_to_legacy
 "#;
         assert!(validate(&parse(ok), &base()).is_ok());
+    }
+
+    /// The field-motivated split (spec §5.2): the verifier hops relay
+    /// uncompared, everything else on the path stays compared. The pair is
+    /// provably disjoint on `login_verifier`, so it validates.
+    #[test]
+    fn provably_disjoint_query_conditioned_routes_are_accepted() {
+        let ok = r#"
+routes:
+  - id: oauth-verifier
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["login_verifier"]
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: oauth-authorize
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_absent: ["login_verifier"]
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0 }
+"#;
+        assert!(validate(&parse(ok), &base()).is_ok());
+    }
+
+    #[test]
+    fn empty_or_duplicated_query_names_are_caught() {
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match:
+      methods: ["GET"]
+      path_prefix: "/x"
+      query_present: ["a", "a", ""]
+      query_absent: ["b", "b"]
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+        );
+        let present: Vec<&str> = errs
+            .iter()
+            .filter(|e| e.location.contains("match.query_present"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(present.len(), 2, "{errs:?}");
+        assert!(present.iter().any(|m| m.contains("duplicate")));
+        assert!(present.iter().any(|m| m.contains("must not be empty")));
+        assert!(errs
+            .iter()
+            .any(|e| e.location.contains("match.query_absent") && e.message.contains("duplicate")));
+    }
+
+    /// A name that cannot survive the request-side percent-decoding is rejected,
+    /// not normalized: it would otherwise validate, match nothing, and let the
+    /// traffic it was meant to except fall through to a shadowing sibling.
+    #[test]
+    fn query_names_that_could_never_match_a_decoded_name_are_caught() {
+        for (name, expected) in [
+            ("login_verifier ", "whitespace"),
+            (" login_verifier", "whitespace"),
+            ("login%5Fverifier", "literal decoded name"),
+            ("a+b", "literal decoded name"),
+        ] {
+            let errs = errors(&format!(
+                r#"
+routes:
+  - id: r
+    match:
+      methods: ["GET"]
+      path_prefix: "/x"
+      query_present: ["{name}"]
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#
+            ));
+            assert!(
+                errs.iter()
+                    .any(|e| e.location.contains("match.query_present")
+                        && e.message.contains(expected)),
+                "expected {expected:?} for {name:?} in {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_name_in_both_query_fields_is_caught() {
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match:
+      methods: ["GET"]
+      path_prefix: "/x"
+      query_present: ["prompt"]
+      query_absent: ["prompt"]
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+        );
+        assert!(errs.iter().any(|e| e.location.contains("\"r\"")
+            && e.location.contains("match.query_present")
+            && e.message.contains("could never match")));
+    }
+
+    /// Not provably disjoint: a request carrying both `a` and `b` satisfies each
+    /// route, so which one wins would be config-order luck.
+    #[test]
+    fn two_satisfiable_query_present_routes_on_one_prefix_are_rejected() {
+        let errs = errors(
+            r#"
+routes:
+  - id: first
+    match: { methods: ["GET"], path_prefix: "/x", query_present: ["a"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: { methods: ["GET", "HEAD"], path_prefix: "/x", query_present: ["b"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+        );
+        let overlap: Vec<&ValidationError> = errs
+            .iter()
+            .filter(|e| e.message.contains("provably disjoint"))
+            .collect();
+        assert_eq!(overlap.len(), 1, "{errs:?}");
+        assert!(overlap[0].location.contains("\"second\""));
+        assert!(overlap[0].message.contains("\"first\""));
+    }
+
+    /// `query_present: [a]` vs `query_absent: [b]` over unrelated names is also
+    /// rejected: a request with `a` and without `b` satisfies both.
+    #[test]
+    fn unrelated_present_and_absent_names_on_one_prefix_are_rejected() {
+        let errs = errors(
+            r#"
+routes:
+  - id: first
+    match: { methods: ["GET"], path_prefix: "/x", query_present: ["a"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: { methods: ["GET"], path_prefix: "/x", query_absent: ["b"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+        );
+        assert!(errs.iter().any(|e| e.message.contains("provably disjoint")));
+    }
+
+    /// The check only fires where two conditioned routes really compete: a
+    /// different prefix (longest prefix decides), disjoint methods, or an
+    /// unconditioned counterpart (the conditioned route simply wins the tie).
+    #[test]
+    fn query_conditioned_routes_that_cannot_compete_are_accepted() {
+        for yaml in [
+            r#"
+routes:
+  - id: first
+    match: { methods: ["GET"], path_prefix: "/x/a", query_present: ["a"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: { methods: ["GET"], path_prefix: "/x", query_present: ["b"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+            r#"
+routes:
+  - id: first
+    match: { methods: ["GET"], path_prefix: "/x", query_present: ["a"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: { methods: ["POST"], path_prefix: "/x", query_present: ["b"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+            r#"
+routes:
+  - id: first
+    match: { methods: ["GET"], path_prefix: "/x", query_present: ["a"] }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: { methods: ["GET"], path_prefix: "/x" }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#,
+        ] {
+            assert!(validate(&parse(yaml), &base()).is_ok(), "{yaml}");
+        }
     }
 
     #[test]

@@ -118,7 +118,7 @@ The sampling decision is made **per request**, before buffering, so that on a ro
 
 For each incoming client request:
 
-1. **Match route** by method + path (longest path-prefix wins; see 5.2). No match → configured not-found response.
+1. **Match route** by method + path, narrowed by any query conditions the route declares (longest path-prefix wins, then a query-conditioned route over an unconditioned one; see 5.2). No match → configured not-found response.
 2. **Resolve route mode** and, for `percentage_split`, resolve the rollout percentage from the flag provider.
 3. **Decide primary upstream** (legacy or new) per mode + rollout + circuit-breaker state.
 4. **Decide shadow eligibility** (see 6.1).
@@ -535,6 +535,8 @@ routes:
     match:
       methods: ["GET"]
       path_prefix: "/devices/"
+      query_present: []                     # all of these must be in the query (default [] = no condition)
+      query_absent: []                      # none of these may be in the query (default [] = no condition)
     legacy_upstream: "https://legacy-device.internal"
     new_upstream: "https://new-device.internal"
     mode: "shadow_legacy_primary"           # see Section 6
@@ -569,6 +571,23 @@ routes:
       max_mismatch_rate: 0.001                # parity ceiling (fraction of compared requests)
 ```
 
+**Query-aware matching.** A route's `match` may narrow beyond method + path with two optional presence conditions over the request's query parameters:
+
+- `query_present: [name, …]` — the route matches only if **every** named parameter is present (AND semantics). Presence only: `?prompt=` counts exactly like `?prompt=login`.
+- `query_absent: [name, …]` — the route matches only if **none** of the named parameters is present.
+
+Both default to `[]`, and a route declaring neither behaves exactly as it did before the fields existed. Parameter names are compared after the same percent-decoding the comparison engine applies to query parameters, and values never participate — there are no value predicates and no regex. Decoding is one-directional: the *request's* names are decoded, the configured names are literals, so a route naming `login_verifier` matches a request spelling it `login%5Fverifier` but a config name written `login%5Fverifier` matches nothing — which is why validation refuses it (Section 5.3).
+
+The motivating case is a path whose hops are not equally safe to shadow. Shadow-comparing `/oauth2/auth` works for the initial authorize bounce, but the `login_verifier` / `consent_verifier` hops replay one-time tokens, so the shadow's copy deterministically fails at the shared authorization server ("The consent verifier has already been used", recorded in slauth's dual-lens campaign v1). Splitting the path into a conditioned route that relays the verifier hops and an unconditioned one that keeps comparing the bounces recovers the comparison without touching the tokens.
+
+**Precedence.** Among the routes whose method, path prefix, and query conditions all match:
+
+1. Longest `path_prefix` wins — unchanged, and it outranks every query condition, so a longer unconditioned prefix still beats a shorter conditioned one.
+2. At an **equal** prefix, a query-**conditioned** route (declaring either field) beats an unconditioned one. This is what lets a narrow exception sit alongside the general route for a path, in either config order.
+3. Config order remains the final stable tiebreak.
+
+Two conditioned routes that could both match one request are rejected at load time (Section 5.3), so this ordering never has to choose between them.
+
 Local flags file:
 
 ```yaml
@@ -590,6 +609,9 @@ migration.get-device.shadow_enabled: true
 - A route does not declare **both** a `contract` reference and an inline behavioral `comparison.json` block.
 - All JSONPath expressions (in contract or inline) are within the supported subset (Section 7.4).
 - `fail_safe_mode` is a valid mode.
+- `match.query_present` / `match.query_absent` names are non-empty and unique within their field, and no name appears in **both** on one route (it could never match).
+- Those names are **literal decoded names**: no `%`, no `+`, no leading or trailing whitespace. The request's query is percent-decoded before comparison and config names are not, so an encoded spelling could never match — and a condition that matches nothing fails *open*, letting the traffic it was meant to except fall through to a sibling route. Rejected at startup rather than normalized (safety invariant: refuse invalid config).
+- Two query-conditioned routes sharing a `path_prefix` and at least one method must be **provably disjoint**: some parameter appears in one route's `query_present` and the other's `query_absent`, so no single request can satisfy both. The check is deliberately conservative — anything not provably disjoint (two `query_present` sets a request could carry together; a `query_present` / `query_absent` pair over unrelated names) fails validation, even where a cleverer analysis might prove it safe. Routes on different prefixes never need this: longest prefix still decides.
 - A route in `failover_to_legacy` mode whose `match.methods` include non-idempotent methods (POST, and PATCH unless declared idempotent) **must** set `failover_safe: true` explicitly, or validation fails. This forces an operator to consciously affirm that auto-failover is safe for that route (Section 6.5).
 - `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
 - `diff_sink.dir`, if the block is present, is non-empty. The directory (and its parent) need **not** exist — it is created on the first mismatch, so a fresh deploy is not failed for a directory nothing has written to yet.
@@ -1061,9 +1083,9 @@ The MVP is **done** when all of the following hold:
 
 ### 16.1 Unit tests
 
-**Route matching:** exact match; prefix match; longest prefix wins; method-specific over method-agnostic; header predicate (if implemented); no match; duplicate route IDs fail validation.
+**Route matching:** exact match; prefix match; longest prefix wins; method-specific over method-agnostic; header predicate (if implemented); no match; duplicate route IDs fail validation; query conditions (`query_present` AND semantics, `query_absent`, presence regardless of value, percent-decoded names); a conditioned route beats an unconditioned one at an equal prefix but not a longer prefix; a table with no conditions routes identically whatever the query.
 
-**Config validation:** valid minimal config; invalid upstream URL; percentage out of range; missing required route fields; invalid timeouts; out-of-subset JSONPath; duplicate route IDs; unknown route mode; both contract-ref and inline behavioral block on one route fails; `failover_to_legacy` route with non-idempotent methods missing `failover_safe: true` fails; out-of-range `budget` values fail.
+**Config validation:** valid minimal config; invalid upstream URL; percentage out of range; missing required route fields; invalid timeouts; out-of-subset JSONPath; duplicate route IDs; unknown route mode; both contract-ref and inline behavioral block on one route fails; `failover_to_legacy` route with non-idempotent methods missing `failover_safe: true` fails; out-of-range `budget` values fail; empty/duplicate query-condition names fail; percent-encoded, `+`-bearing, or whitespace-padded query-condition names fail; a name in both `query_present` and `query_absent` fails; two query-conditioned routes on one prefix fail unless provably disjoint.
 
 **Contract:** valid contract loads; reference resolves; merge of defaults + per-route comparison; conflict (contract + inline) rejected; `check-contract` flags out-of-subset paths.
 
