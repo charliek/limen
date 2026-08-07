@@ -195,7 +195,7 @@ validation error).
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `min_comparisons` | int | `1` | The minimum number of comparisons [`limen verdict`](cli.md#verdict) requires this route to have recorded for its floors check to pass. `0` opts the route out of the floor explicitly — a visible exemption, not a silent gap. **Read only by `limen verdict`**; the proxy itself ignores it, so it has no effect on `run`, `validate-config`, or `print-routes`. A campaign config in which no enabled route carries a non-zero floor fails the floors check outright — a verdict over a config that compares nothing proves nothing. |
+| `min_comparisons` | int | unset (= `1`) | The minimum number of comparisons [`limen verdict`](cli.md#verdict) requires this route to have recorded for its floors check to pass. `0` opts the route out of the floor explicitly — a visible exemption, not a silent gap. **Read only by `limen verdict`**; the proxy itself ignores it, so it has no effect on `run`, `validate-config`, or `print-routes`. A campaign config in which no enabled route carries a non-zero floor fails the floors check outright — a verdict over a config that compares nothing proves nothing. An explicit positive floor on a `enabled: false` route is a validation error — it could never be met, and silently dropping it from the floors check would fake coverage. |
 
 ### `comparison.shadow_methods` (shadowing a write)
 

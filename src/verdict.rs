@@ -458,7 +458,18 @@ pub fn evaluate(
         .filter(|r| r.route_id == CANARY_ROUTE_ID)
         .map(|r| r.count as u64)
         .sum::<u64>();
-    let mismatches_total = report.total as u64 - canary_records;
+    // The whole reserved namespace is subtracted (not just the canary), so
+    // this total and `sink_mismatches_by_route` always agree on what counts
+    // as a real mismatch. A non-canary reserved record still fails the
+    // per-route integrity reconciliation (no counter will match it) — it is
+    // excluded from the *mismatch* answer, not from scrutiny.
+    let reserved_records = report
+        .routes
+        .iter()
+        .filter(|r| r.route_id.starts_with(RESERVED_ROUTE_ID_PREFIX))
+        .map(|r| r.count as u64)
+        .sum::<u64>();
+    let mismatches_total = report.total as u64 - reserved_records;
     let sink_mismatches_by_route: BTreeMap<String, u64> = report
         .routes
         .iter()
@@ -534,7 +545,7 @@ fn evaluate_floors(config: &Config, scrape: &Scrape) -> (Check, Vec<RouteFloor>)
     let floored: Vec<&crate::config::model::RouteConfig> = config
         .routes
         .iter()
-        .filter(|r| r.comparison.enabled && r.comparison.min_comparisons > 0)
+        .filter(|r| r.comparison.enabled && r.comparison.effective_min_comparisons() > 0)
         .collect();
     if floored.is_empty() {
         return (
@@ -553,7 +564,7 @@ fn evaluate_floors(config: &Config, scrape: &Scrape) -> (Check, Vec<RouteFloor>)
         let comparisons = scrape
             .sum(COMPARISONS_TOTAL, &[("route", &route.id)])
             .unwrap_or(0.0) as u64;
-        let floor = route.comparison.min_comparisons;
+        let floor = route.comparison.effective_min_comparisons();
         let met = comparisons >= floor;
         if !met {
             starved.push(route.id.clone());

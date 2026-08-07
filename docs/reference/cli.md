@@ -141,11 +141,18 @@ unavailable is never read as "0 mismatches."
   started.** Verdict reconciles the sink against the engine's live counters
   per route; stale records from a previous run make that reconciliation fail
   — correctly, since it cannot tell a stale record from a lost one.
-- **At most one canary injection per `--canary` invocation.** The canary check
-  is relative (sink count == engine's `__limen_canary__` mismatch counter, and
-  both ≥ 1), so it stays re-runnable across sink resets, but running
-  `--canary` twice against the same undrained sink will not double-count
-  correctly — one invocation, one injection.
+- **One canary injection per `--canary` invocation, and verdicts run
+  sequentially.** The canary check is relative (sink count == engine's
+  `__limen_canary__` mismatch counter, and both ≥ 1), so sequential
+  `--canary` verdicts against the same live proxy each pass — the record
+  and counter grow together. What breaks the reconciliation is a proxy
+  *restart* with a retained sink (counters reset to zero, records persist):
+  reset the sink whenever the proxy starts. Do not run verdicts
+  concurrently.
+- **The drain deadline must allow at least two scrapes.** Quiescence needs
+  two consecutive identical balanced scrapes, so a `--drain-deadline-ms`
+  below roughly twice `--poll-interval-ms` exits 40 even over an idle
+  pipeline.
 
 ### Exit codes
 

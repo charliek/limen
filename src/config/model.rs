@@ -434,11 +434,15 @@ pub struct ComparisonConfig {
     pub max_body_bytes: u64,
     /// Floor asserted by `limen verdict`: the minimum number of comparisons
     /// this route must have recorded for a campaign verdict to count it as
-    /// exercised (spec §12.1's operator-checked-gate territory). `0` opts the
-    /// route out of the floor explicitly. Ignored by the proxy itself — this
-    /// is a verdict-time expectation, not a runtime behavior knob.
-    #[serde(default = "default_min_comparisons")]
-    pub min_comparisons: u64,
+    /// exercised (spec §12.1's operator-checked-gate territory). Unset means
+    /// a floor of 1 whenever comparison is enabled; `0` opts the route out
+    /// explicitly. An `Option` rather than a defaulted integer so validation
+    /// can tell an explicit floor from the default: a positive floor on a
+    /// comparison-disabled route could never be met and refuses to start
+    /// instead of silently vanishing from the verdict. Ignored by the proxy
+    /// itself — this is a verdict-time expectation, not a runtime knob.
+    #[serde(default)]
+    pub min_comparisons: Option<u64>,
     /// Write methods this route opts into shadowing (spec §6.1). Empty (the
     /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
     /// shadowed. Only `POST` may be listed today, and only on a
@@ -468,17 +472,13 @@ pub struct ComparisonConfig {
     pub location: Option<LocationRules>,
 }
 
-fn default_min_comparisons() -> u64 {
-    1
-}
-
 impl Default for ComparisonConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             sample_rate: 0.0,
             max_body_bytes: 262_144,
-            min_comparisons: default_min_comparisons(),
+            min_comparisons: None,
             shadow_methods: Vec::new(),
             compare_status: None,
             compare_body: None,
@@ -491,6 +491,13 @@ impl Default for ComparisonConfig {
 }
 
 impl ComparisonConfig {
+    /// The floor `limen verdict` asserts for this route: the explicit value,
+    /// else 1. Meaningful only when comparison is enabled (validation rejects
+    /// a positive explicit floor on a disabled route).
+    pub fn effective_min_comparisons(&self) -> u64 {
+        self.min_comparisons.unwrap_or(1)
+    }
+
     /// Whether the route declares an inline behavioral block (which is mutually
     /// exclusive with a contract reference). A present-but-empty `json: {}`
     /// still counts: per spec §4.4 the conflict is about the *block* being

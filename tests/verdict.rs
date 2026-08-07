@@ -151,7 +151,7 @@ async fn verdict_phases_against_a_live_proxy() {
         .find(|r| r.id == "starved")
         .unwrap()
         .comparison
-        .min_comparisons = 3;
+        .min_comparisons = Some(3);
     let v2 = verdict::run_verdict(&refloored, &opts)
         .await
         .expect("phase 2");
