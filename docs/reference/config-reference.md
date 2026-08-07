@@ -24,6 +24,7 @@ upstream_tls: { … }    # TLS for upstream calls
 flags: { … }           # feature-flag provider + fail-safe
 diff_sink: { … }       # optional: persist comparison mismatches to JSONL
 routes: [ … ]          # the routing table
+debug: { … }           # optional: debug-only affordances (never in production)
 ```
 
 ## `server`
@@ -180,15 +181,21 @@ comparison:
   enabled: true                  # operational gate
   sample_rate: 0.1               # 0–1; fraction of eligible requests to buffer & compare
   max_body_bytes: 262144         # skip comparison above this size
+  min_comparisons: 1             # limen verdict's per-route floor; 0 = explicit exemption
   shadow_methods: []             # writes opted into shadowing; default [] = GET/HEAD only
   # Inline behavioral rules (only if NOT referencing a contract):
   # compare_status / compare_body / compare_headers / json: { … }
 ```
 
-`enabled`, `sample_rate`, `max_body_bytes`, and `shadow_methods` are
-**operational** — they live here. The *behavioral* rules (`json.ignore_paths`,
-etc.) belong in a [contract](contract-reference.md); a route may reference a
-contract **or** inline those rules, never both (a validation error).
+`enabled`, `sample_rate`, `max_body_bytes`, `min_comparisons`, and
+`shadow_methods` are **operational** — they live here. The *behavioral* rules
+(`json.ignore_paths`, etc.) belong in a [contract](contract-reference.md); a
+route may reference a contract **or** inline those rules, never both (a
+validation error).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `min_comparisons` | int | `1` | The minimum number of comparisons [`limen verdict`](cli.md#verdict) requires this route to have recorded for its floors check to pass. `0` opts the route out of the floor explicitly — a visible exemption, not a silent gap. **Read only by `limen verdict`**; the proxy itself ignores it, so it has no effect on `run`, `validate-config`, or `print-routes`. A campaign config in which no enabled route carries a non-zero floor fails the floors check outright — a verdict over a config that compares nothing proves nothing. |
 
 ### `comparison.shadow_methods` (shadowing a write)
 
@@ -240,6 +247,43 @@ or `PATCH`) **must** set `failover_safe: true`, or validation fails. This forces
 the operator to consciously affirm that retrying a failed in-flight request
 against legacy cannot double a side effect (spec §6.5). Routing *subsequent*
 requests to legacy via the circuit breaker is always safe and never gated.
+
+## `debug`
+
+Optional. Absent (the normal case) means every debug affordance is off.
+`limen run` logs a loud warning at startup for anything enabled here — these
+switches exist to prove the comparison pipeline bites during a migration
+campaign (see [Prove your lens bites](../guides/prove-your-lens-bites.md)),
+never for production operation.
+
+```yaml
+debug:
+  sink_canary: true
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `sink_canary` | bool | `false` | Exposes `POST /debug/canary` on the control plane, which injects one synthetic mismatch through the real compare → observer → sink pipeline under the reserved route id `__limen_canary__`. Drives [`limen verdict --canary`](cli.md#verdict). |
+
+**Never enable in production.** `limen run` emits a `warn`-level log
+(`"debug sink canary enabled — POST /debug/canary injects synthetic
+mismatches into the live pipeline; never enable in production"`) whenever
+`sink_canary` is true, so an accidental production enablement is loud rather
+than silent.
+
+**Why config-gated, not compile-gated.** The obvious alternative —
+`cfg(debug_assertions)` or a Cargo feature — was rejected for a load-bearing
+reason: campaign runners build limen with `--release`, where
+`debug_assertions` is off. A compile-time gate would make the canary
+unavailable exactly where the falsification story needs it. Config-gating
+keeps the endpoint out of release builds' *default* behavior (off unless a
+config explicitly turns it on) without making it unreachable in a release
+binary.
+
+Route IDs starting with `__` are reserved for limen-internal records (today:
+the sink canary's `__limen_canary__`); config validation rejects any user
+route declaring one, so a canary record can never be confused with a real
+mismatch.
 
 ## Environment overrides
 

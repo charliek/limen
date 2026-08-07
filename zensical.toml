@@ -36,6 +36,7 @@ nav = [
     { "Flags & Rollout" = "guides/flags-and-rollout.md" },
     { "Resilience & Failover" = "guides/resilience.md" },
     { "Observability & Operations" = "guides/observability.md" },
+    { "Prove Your Lens Bites" = "guides/prove-your-lens-bites.md" },
     { "Deployment" = "guides/deployment.md" },
   ] },
   { "Reference" = [
