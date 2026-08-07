@@ -499,6 +499,10 @@ fn a_config_whose_sample_rate_contradicts_the_profile_is_exit_fifty() {
 
 #[test]
 fn a_sampled_profile_classifies_nothing_at_all() {
+    // Every route lands on relay_only/partial-sample — R0 refused to classify
+    // any of them — so this is the exit-20 case: a draft nobody's traffic
+    // informed is not evidence, and automation must not read it as a
+    // successful classification.
     let dir = workspace(
         &HOSTILE_CONFIG.replace("observe: {}", "observe: { sample_rate: 0.25 }"),
         &profile_document(
@@ -510,13 +514,18 @@ fn a_sampled_profile_classifies_nothing_at_all() {
         ),
     );
     let output = suggest(dir.path(), &["--format", "json"]);
-    assert_eq!(code(&output), 0);
+    assert_eq!(code(&output), 20);
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json report");
     for entry in report.as_array().expect("array") {
         assert_eq!(entry["disposition"], "relay_only");
         assert_eq!(entry["reason"], "partial-sample");
     }
-    assert!(String::from_utf8_lossy(&output.stderr).contains("no route reached compare_candidate"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("nothing was profiled"), "{stderr}");
+    assert!(
+        stderr.contains("no route reached compare_candidate"),
+        "{stderr}"
+    );
 }
 
 #[test]

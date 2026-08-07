@@ -268,17 +268,27 @@ fn evaluate(config: &Config, profile: &ObserveProfile, opts: &SuggestOptions) ->
     }
 
     // Exit 20 is the floors doctrine applied to suggestions: a draft nobody's
-    // traffic informed is not evidence. Both halves matter — a config with no
-    // routes at all, and a config whose every route landed on "we saw nothing"
-    // or "we saw too little", produce the same worthless draft.
+    // traffic informed is not evidence. Three reasons collapse to the same
+    // worthless draft: a config with no routes at all, a config whose every
+    // route landed on "we saw nothing" or "we saw too little", and a config
+    // whose every route was sampled rather than fully observed — R0 already
+    // refuses to classify a sampled profile (relay_only/partial-sample on
+    // every route), and a draft resting entirely on that refusal was traffic
+    // nobody's evidence informed just as surely as no traffic at all. Exiting
+    // 0 there previously let automation read a sampled run as a successful
+    // classification.
     let observations: u64 = suggestions.iter().map(|s| s.evidence.observations).sum();
-    let unprofiled = suggestions
-        .iter()
-        .all(|s| matches!(s.reason, Reason::NoObservations | Reason::InsufficientReads));
+    let unprofiled = suggestions.iter().all(|s| {
+        matches!(
+            s.reason,
+            Reason::NoObservations | Reason::InsufficientReads | Reason::PartialSample
+        )
+    });
     let exit_code = if observations == 0 || unprofiled {
         warnings.push(
-            "nothing was profiled: no route cleared the read floor, so this draft rests on no \
-             evidence at all — drive traffic through the proxy and re-run"
+            "nothing was profiled: every route either cleared no traffic, fell below the read \
+             floor, or was only sampled (observe.sample_rate < 1.0) — this draft rests on no \
+             evidence at all. Drive full, unsampled traffic through the proxy and re-run"
                 .to_string(),
         );
         EXIT_NOTHING_PROFILED
@@ -1314,6 +1324,24 @@ routes:
         );
     }
 
+    /// True if any value in the document (recursively) is YAML `null`. Walking
+    /// the parsed structure — rather than scanning the rendered text for the
+    /// substring `null` — means a future host name, contract path, or comment
+    /// that happens to contain that substring cannot fail this check for a
+    /// reason unrelated to `skip_serializing_if`: only an actual serialized
+    /// null *value* counts.
+    fn contains_null(value: &serde_yaml::Value) -> bool {
+        match value {
+            serde_yaml::Value::Null => true,
+            serde_yaml::Value::Sequence(seq) => seq.iter().any(contains_null),
+            serde_yaml::Value::Mapping(map) => {
+                map.values().any(contains_null) || map.keys().any(contains_null)
+            }
+            serde_yaml::Value::Tagged(tagged) => contains_null(&tagged.value),
+            _ => false,
+        }
+    }
+
     #[test]
     fn the_draft_renders_no_nulls() {
         // `skip_serializing_if` is not cosmetics policy: a draft is a document
@@ -1326,7 +1354,8 @@ routes:
             &candidate_profile("pat-validate"),
             &DraftOptions::default(),
         );
-        assert!(!draft.contains("null"), "{draft}");
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&draft).expect("valid yaml");
+        assert!(!contains_null(&parsed), "{draft}");
     }
 
     #[test]
@@ -1440,9 +1469,11 @@ routes:
         let outcome = evaluate(&config, &profile, &opts());
         assert_eq!(outcome.suggestions[0].reason, Reason::PartialSample);
         assert_eq!(outcome.suggestions[0].disposition, Disposition::RelayOnly);
-        // Sampled is not unprofiled: traffic was seen, it just cannot be
-        // reasoned from.
-        assert_eq!(outcome.exit_code, EXIT_OK);
+        // A sampled profile is unprofiled in every way that matters here: R0
+        // already refused to classify any route, so a draft resting on it is
+        // exactly the "nothing was profiled" case exit 20 exists for.
+        // Automation must not read this as a successful classification.
+        assert_eq!(outcome.exit_code, EXIT_NOTHING_PROFILED);
     }
 
     #[test]

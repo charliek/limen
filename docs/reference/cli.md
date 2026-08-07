@@ -240,11 +240,13 @@ because response metadata can prove a route unsafe to compare but never safe.
 into a shadowing config.
 
 Like `verdict`, a config file is required: it supplies the route table
-classified, the control-plane address, and the `observe.sample_rate` the
-profile is cross-checked against. Unlike `verdict`, the third threshold
-(sample rate) is never taken from a CLI flag or config override — it is read
-off the profile document itself, since the proxy that recorded it is the only
-authority on whether it is complete.
+classified and the `observe.sample_rate` the profile is cross-checked
+against. The control-plane address is used only when polling a live proxy
+(`--control-url`, the default source); `--profile` reads a saved document
+instead and never contacts the control plane at all — see the two rows below.
+Unlike `verdict`, the third threshold (sample rate) is never taken from a CLI
+flag or config override — it is read off the profile document itself, since
+the proxy that recorded it is the only authority on whether it is complete.
 
 | Option | Default | Description |
 |---|---|---|
@@ -276,14 +278,16 @@ authority on whether it is complete.
   classification are mutually exclusive — see [classifying
   routes](../guides/classifying-routes.md#what-observation-can-and-cannot-tell-you).
   Every route in such a profile lands on `relay_only` with reason
-  `partial-sample`.
+  `partial-sample`, and the run exits `20`: a draft resting entirely on a
+  refusal to classify is not evidence, and automation must not read the exit
+  code alone as a successful classification.
 
 ### Exit codes
 
 | Code | Meaning |
 |---|---|
 | `0` | Draft emitted. |
-| `20` | Nothing was profiled: no observations at all, or every route's reason is `no-observations`/`insufficient-reads`. A draft nobody's traffic informed is not evidence. |
+| `20` | Nothing was profiled: no observations at all, or every route's reason is `no-observations`/`insufficient-reads`/`partial-sample`. A sampled profile counts here too — R0 already refused to classify every route, so a draft resting on it rests on no evidence. A draft nobody's traffic informed is not evidence. |
 | `40` | The profile never quiesced within `--drain-deadline-ms`. |
 | `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy. |
 | `1` | Unexpected tooling error (anyhow). |

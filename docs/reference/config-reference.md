@@ -288,8 +288,12 @@ mismatch.
 
 ## `observe`
 
-Optional. Present = on; there is no separate `enabled` switch, following
-[`diff_sink`](#diff_sink) and [`debug`](#debug). Turns on a strictly passive,
+Optional. Present = on; there is no separate `enabled` switch, like
+[`diff_sink`](#diff_sink) — block presence alone is the trigger. This is
+**unlike [`debug`](#debug)**: an empty `debug: {}` does *not* enable
+`sink_canary`, since that field is a bool defaulting to `false` inside the
+block; an empty `observe: {}` *does* enable observation, since `observe` has
+no such inner switch. Turns on a strictly passive,
 bounded per-route traffic profile — no shadow request, no second upstream
 contact, no body byte read — served as JSON from `GET /observe/profile` on the
 control plane and consumed by [`limen suggest-routes`](cli.md#suggest-routes).

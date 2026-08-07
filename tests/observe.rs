@@ -30,6 +30,15 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Build both planes over one shared state, wiring the observe recorder into
 /// the control plane exactly as `serve_with_shutdown` does.
+///
+/// `prometheus::install()` hands back one process-wide recorder, and the
+/// tests in this file run in parallel against it. Every test here must
+/// therefore use route ids nobody else in this file uses — otherwise the
+/// exact per-route counter assertions in
+/// `the_observation_counter_is_zero_registered_per_route` become
+/// intermittently flaky, since a route id shared across two concurrently
+/// running tests would let one test's traffic land on the counter another
+/// test is asserting an exact value for.
 fn planes(cfg: &Config) -> (Router, Router) {
     let handle = limen::observability::prometheus::install();
     let state = build_state(cfg, Path::new(".")).expect("build state");

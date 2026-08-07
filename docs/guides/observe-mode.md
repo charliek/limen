@@ -36,8 +36,11 @@ silent — the same posture as [`debug.sink_canary`](../reference/config-referen
 ## 1. Turn the block on
 
 Presence of `observe:` is the whole switch — there is no separate `enabled`
-field, following [`diff_sink`](../reference/config-reference.md#diff_sink) and
-[`debug`](../reference/config-reference.md#debug):
+field, like [`diff_sink`](../reference/config-reference.md#diff_sink). This
+differs from [`debug`](../reference/config-reference.md#debug): an empty
+`debug: {}` does *not* enable `sink_canary`, which is a bool defaulting to
+`false` inside that block, whereas an empty `observe: {}` does enable
+observation:
 
 ```yaml
 observe:
@@ -50,9 +53,16 @@ observe:
 All four fields default to the values shown, so `observe: {}` is a complete,
 valid block. Observation is orthogonal to routing: it is legal under every
 route [`mode`](../reference/config-reference.md#routes), and a route with no
-`new` upstream at all can still be observed — every field in a `RouteProfile`
-comes from the response Limen already sends the client, whether that response
-came from `legacy`, `new`, both, or neither.
+`new` upstream at all can still be observed — a `RouteProfile` combines two
+sources, neither of which requires a response to exist. Bounded **request**
+metadata (`methods`, `query_names`, `distinct_read_paths`) is recorded for
+every request regardless of what answers it. Everything else — status class,
+content type, `Set-Cookie`/redirect/`Location` presence, the
+`Content-Length`-based stability signal — comes from the final **response**
+Limen sends the client, whether that response came from `legacy`, `new`,
+both, or neither; when no upstream answers at all, none of that response
+metadata is recorded and `transport_errors` counts the silent upstream
+instead.
 
 ## 2. Drive representative traffic
 
@@ -61,8 +71,9 @@ means here matters more than volume: the classifier's dangerous rules are
 *existential* — one redirecting or cookie-minting read is enough to demote a
 route — so a corpus that never exercises a route's flow-hop paths will tell you
 nothing about them, no matter how many times it hits the route's happy path.
-A route seen fewer than `--min-samples` times (5 by default) is not classified
-at all; a functional test suite driven once through each endpoint will trip
+A route with fewer than `--min-samples` reads (`GET`/`HEAD`; 5 by default) is
+not classified at all — writes and transport errors do not count toward the
+floor. A functional test suite driven once through each endpoint will trip
 that floor on nearly every route, which is the correct, unhelpful answer for
 that corpus.
 
@@ -78,6 +89,16 @@ other floor. A sampled profile is not a smaller version of the truth — it is a
 version with the decisive observation possibly missing. So: observe cheaply
 with `sample_rate < 1.0` to watch shape and volume over time, or observe at
 `sample_rate: 1.0` to eventually classify. Not both from the same window.
+
+**The implemented behavior, precisely** (this is the single contract both
+this guide and [CLI → `suggest-routes`](../reference/cli.md#suggest-routes)
+state): every route in a sampled profile is suggested `relay_only` with
+reason `partial-sample`, and the run **exits `20`** — the same "nothing was
+profiled" code a config with zero observations gets, because a draft resting
+entirely on a refusal to classify rests on no evidence either way.
+Automation driving `suggest-routes` must treat exit `20` as "no usable draft
+was produced," not as a successful classification that merely says
+relay-only everywhere.
 
 ## 3. Read the profile
 
@@ -259,6 +280,21 @@ Full field-by-field reference: [config reference →
 `observe`](../reference/config-reference.md#observe); the counter and
 endpoint's place among Limen's other control-plane surfaces:
 [observability → observe mode](observability.md#observe-mode).
+
+## Cost: one process-wide lock on the response path
+
+Recording an observation takes one lock shared by every route's aggregate,
+on the response path, for every request a profiled proxy serves. The
+critical section is deliberately small — a handful of bounded map updates,
+no I/O and no `await` — so it can neither block on anything nor be held
+across a yield point; it is not zero cost, but it is not proportional to the
+body and not a round trip. For most deployments this is not something you
+need to think about. A deployment running at very high request concurrency
+should validate throughput with observe mode on before enabling it broadly,
+rather than assume the lock is free at any scale. If contention ever shows
+up in practice, the recorder is the isolated place to shard — sharding the
+map by route or by a hash of the route id is the escape hatch, not a metric
+added ahead of need.
 
 ## The draft is a starting point, not a verdict
 
