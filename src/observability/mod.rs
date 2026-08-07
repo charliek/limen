@@ -19,4 +19,5 @@ pub mod request_id;
 pub mod sink;
 
 pub use metrics::{Fanout, MetricsObserver, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+pub use observe::{Observation, ObserveProfile, ObserveRecorder, ResponseOrigin, RouteProfile};
 pub use sink::SinkObserver;

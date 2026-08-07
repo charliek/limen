@@ -21,7 +21,7 @@ use crate::config::model::{
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
 use crate::health::endpoints::CONTROL_PLANE_RESERVED_PATHS;
-use crate::observability::observe::OBSERVE_PROFILE_PATH;
+use crate::observability::observe::{MAX_OBSERVE_BOUND, OBSERVE_PROFILE_PATH};
 use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// Loads each distinct contract file at most once per `validate()` call. A
@@ -232,6 +232,11 @@ fn validate_observe(observe: Option<&ObserveConfig>, metrics: &MetricsConfig, er
     // Each bound caps a map keyed by live traffic, so `0` records nothing at
     // all rather than meaning "no limit". An operator writing it expects a
     // narrower profile, not an empty one.
+    //
+    // The ceiling matters just as much: invariant 6 requires these maps to be
+    // bounded, and a cap an operator can set to `999999999` removes the bound
+    // it exists to impose. See `MAX_OBSERVE_BOUND` for why four figures is the
+    // line.
     for (field, value) in [
         ("max_query_names", observe.max_query_names),
         ("max_path_shapes", observe.max_path_shapes),
@@ -239,6 +244,14 @@ fn validate_observe(observe: Option<&ObserveConfig>, metrics: &MetricsConfig, er
     ] {
         if value == 0 {
             errs.push(format!("observe.{field}"), "must be greater than 0");
+        } else if value > MAX_OBSERVE_BOUND {
+            errs.push(
+                format!("observe.{field}"),
+                format!(
+                    "must be at most {MAX_OBSERVE_BOUND} — this bounds a per-route map keyed by \
+                     live traffic, and a larger value is not a bound"
+                ),
+            );
         }
     }
 
@@ -1628,6 +1641,34 @@ observe:
         ] {
             assert!(locations(&errs).contains(&field), "{field}");
         }
+    }
+
+    #[test]
+    fn observe_bounds_above_the_ceiling_are_caught() {
+        // A cap the operator can raise without limit is not a cap: invariant 6
+        // requires these traffic-keyed maps to be bounded, so the config may not
+        // remove the bound.
+        let errs = errors(&format!(
+            "observe:\n  max_query_names: {}\n  max_path_shapes: 999999999\n  max_fingerprints: \
+             {}\n",
+            MAX_OBSERVE_BOUND + 1,
+            MAX_OBSERVE_BOUND + 1
+        ));
+        for field in [
+            "observe.max_query_names",
+            "observe.max_path_shapes",
+            "observe.max_fingerprints",
+        ] {
+            assert!(locations(&errs).contains(&field), "{field}");
+        }
+        // The ceiling itself is legal — the rejection starts one past it.
+        assert!(validate(
+            &parse(&format!(
+                "observe:\n  max_query_names: {MAX_OBSERVE_BOUND}\n"
+            )),
+            &base()
+        )
+        .is_ok());
     }
 
     #[test]

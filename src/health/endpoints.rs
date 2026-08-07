@@ -19,8 +19,9 @@ use crate::compare::{self, Captured};
 use crate::contract::model::ComparisonRules;
 use crate::flags::FlagProvider;
 use crate::health::readiness;
+use crate::observability::observe::OBSERVE_PROFILE_PATH;
 use crate::observability::request_id;
-use crate::observability::{prometheus, ShadowMeta, ShadowObserver};
+use crate::observability::{prometheus, ObserveRecorder, ShadowMeta, ShadowObserver};
 use crate::routing::RouteTable;
 use crate::verdict::CANARY_ROUTE_ID;
 
@@ -59,6 +60,12 @@ pub struct ControlState {
     /// with the block off the control plane cannot reach the pipeline at all,
     /// rather than holding a capability it promises not to use.
     canary_observer: Option<Arc<dyn ShadowObserver>>,
+    /// The observe-mode recorder, present **only** when the `observe:` block
+    /// is configured. Same `Some`-is-the-switch idiom, one step further: this
+    /// one also decides whether [`router`] registers the profile route, which
+    /// is what keeps `validate_observe`'s conditional `metrics.path` collision
+    /// check honest — with observation off, nothing claims that path.
+    observe: Option<Arc<ObserveRecorder>>,
 }
 
 impl ControlState {
@@ -75,6 +82,7 @@ impl ControlState {
             routes,
             metrics,
             canary_observer: None,
+            observe: None,
         }
     }
 
@@ -83,6 +91,14 @@ impl ControlState {
     /// or the canary would prove something about a pipeline nobody runs.
     pub fn with_sink_canary(mut self, observer: Arc<dyn ShadowObserver>) -> Self {
         self.canary_observer = Some(observer);
+        self
+    }
+
+    /// Serve `GET /observe/profile` from `recorder` — which must be the *same*
+    /// recorder the proxy writes to, or the profile would describe traffic
+    /// nobody sent.
+    pub fn with_observe(mut self, recorder: Arc<ObserveRecorder>) -> Self {
+        self.observe = Some(recorder);
         self
     }
 }
@@ -196,15 +212,38 @@ async fn debug_canary(State(control): State<ControlState>, headers: HeaderMap) -
         .into_response()
 }
 
+/// `GET /observe/profile` — the whole observe-mode profile as one JSON
+/// document: every configured route, zero-filled until observed, canonically
+/// ordered and carrying no wall-clock field so two scrapes of an idle proxy are
+/// byte-identical (`limen suggest-routes` polls for exactly that).
+///
+/// Registered only while observe mode is on, so with the block absent the path
+/// does not exist at all — which is also why `metrics.path` may collide with it
+/// only under the same condition.
+async fn observe_profile(State(control): State<ControlState>) -> Response {
+    // Unreachable: `router` registers this path only when the recorder is
+    // present. The arm exists because `ControlState` cannot express "present
+    // on this route", not as a second enablement check.
+    let Some(recorder) = control.observe.as_ref() else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+    Json(recorder.profile()).into_response()
+}
+
 /// The control-plane router: health checks, the metrics endpoint at
-/// `metrics_path`, and the debug canary (which 404s unless enabled).
+/// `metrics_path`, the debug canary (which 404s unless enabled), and — only
+/// while observe mode is on — the profile endpoint.
 pub fn router(control: ControlState, metrics_path: &str) -> Router {
-    Router::new()
+    let observing = control.observe.is_some();
+    let mut router = Router::new()
         .route(HEALTH_LIVE_PATH, get(live))
         .route(HEALTH_READY_PATH, get(ready))
         .route(metrics_path, get(metrics))
-        .route(DEBUG_CANARY_PATH, post(debug_canary))
-        .with_state(control)
+        .route(DEBUG_CANARY_PATH, post(debug_canary));
+    if observing {
+        router = router.route(OBSERVE_PROFILE_PATH, get(observe_profile));
+    }
+    router.with_state(control)
 }
 
 #[cfg(test)]
@@ -304,6 +343,48 @@ mod tests {
     #[tokio::test]
     async fn unknown_control_path_404s() {
         assert_eq!(get_path("/nope").await.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn observe_profile_is_absent_unless_enabled() {
+        // Not "registered and 404ing from inside": with observe off the route
+        // is never registered, which is what lets `metrics.path` legitimately
+        // take `/observe/profile` in that configuration.
+        assert_eq!(
+            get_path(OBSERVE_PROFILE_PATH).await.status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_observe_profile_serves_every_configured_route_zero_filled() {
+        use crate::config::model::ObserveConfig;
+        use crate::observability::ObserveRecorder;
+
+        let recorder = Arc::new(ObserveRecorder::new(
+            ObserveConfig::default(),
+            ["alpha", "beta"],
+        ));
+        let resp = router(control().with_observe(recorder), "/metrics")
+            .oneshot(
+                Request::builder()
+                    .uri(OBSERVE_PROFILE_PATH)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["routes"]["alpha"]["observations"], 0);
+        assert_eq!(json["routes"]["beta"]["observations"], 0);
+        assert!(
+            json["routes"]["gamma"].is_null(),
+            "a route nobody configured must be absent, not zero"
+        );
     }
 
     #[tokio::test]

@@ -51,6 +51,8 @@ pub const DIFF_SINK_ENQUEUED_TOTAL: &str = "limen_diff_sink_enqueued_total";
 pub const DIFF_SINK_WRITTEN_TOTAL: &str = "limen_diff_sink_written_total";
 /// Mismatch records that never reached the file, by reason.
 pub const DIFF_SINK_DROPPED_TOTAL: &str = "limen_diff_sink_dropped_total";
+/// Requests profiled by observe mode, by route.
+pub const OBSERVE_OBSERVATIONS_TOTAL: &str = "limen_observe_observations_total";
 /// Circuit-breaker state by route/upstream (0 closed, 1 half-open, 2 open).
 pub const CIRCUIT_BREAKER_STATE: &str = "limen_circuit_breaker_state";
 /// Whether the flag provider is stale (1) or fresh (0).
@@ -287,6 +289,30 @@ pub fn register_verdict_series() {
     gauge!(SHADOW_IN_FLIGHT).set(0.0);
 }
 
+/// One request was observed by observe mode (after its sampling gate), so this
+/// counts the same events the profile's `observations` field does.
+///
+/// The route id is the only label — the cardinality doctrine at the top of this
+/// module applies unchanged, and observe mode's richer material (paths, query
+/// names, content types) stays in the profile document where it is bounded per
+/// route, never in a label.
+pub fn observe_observation(route_id: &str) {
+    counter!(OBSERVE_OBSERVATIONS_TOTAL, "route" => route_id.to_string()).increment(1);
+}
+
+/// Touch the observe counter for every configured route, so a profiled fleet
+/// renders zeros rather than nothing.
+///
+/// Same reasoning as [`register_verdict_series`], applied per route: a lazily
+/// registered counter makes "the observer saw nothing on this route" and "this
+/// binary has no observe instrumentation" render identically, and the first is
+/// a finding while the second is a broken deployment.
+pub fn register_observe_series<'a>(route_ids: impl IntoIterator<Item = &'a str>) {
+    for route_id in route_ids {
+        counter!(OBSERVE_OBSERVATIONS_TOTAL, "route" => route_id.to_string()).increment(0);
+    }
+}
+
 /// Set the circuit-breaker state gauge for a route's new upstream.
 pub fn set_breaker_state(route_id: &str, state: BreakerState) {
     let value = match state {
@@ -333,6 +359,28 @@ mod tests {
             r#"limen_diff_sink_dropped_total{reason="io_error"} 0"#,
             r#"limen_diff_sink_dropped_total{reason="writer_gone"} 0"#,
             "limen_shadow_in_flight 0",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == line),
+                "expected `{line}` in the exposition:\n{rendered}"
+            );
+        }
+    }
+
+    /// The observe counter must render at zero for every configured route
+    /// before any traffic — absence≠zero applied to the per-route series.
+    #[test]
+    fn registration_renders_the_observe_series_at_zero_per_route() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_observe_series(["alpha", "beta"]);
+        });
+        let rendered = handle.render();
+
+        for line in [
+            r#"limen_observe_observations_total{route="alpha"} 0"#,
+            r#"limen_observe_observations_total{route="beta"} 0"#,
         ] {
             assert!(
                 rendered.lines().any(|l| l == line),
