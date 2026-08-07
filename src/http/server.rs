@@ -180,6 +180,9 @@ pub async fn serve_with_shutdown(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let metrics_handle = prometheus::install();
+    // Immediately after installing the recorder, so the verdict series render on
+    // the very first scrape rather than only once traffic has produced one.
+    prometheus::register_verdict_series();
     let state = build_state(&config, base_dir)?;
 
     let data_addr: SocketAddr = config.server.listen_addr.parse().map_err(|e| {
@@ -219,8 +222,20 @@ pub async fn serve_with_shutdown(
         None => None,
     };
 
-    let control_state =
+    let mut control_state =
         ControlState::new(state.flags().clone(), state.routes_arc(), metrics_handle);
+    if config.sink_canary_enabled() {
+        // Loud on purpose: this exposes an endpoint that writes synthetic
+        // mismatch records into the live sink. It exists for campaign
+        // falsification, never for a production deployment.
+        warn!(
+            "debug sink canary enabled — POST /debug/canary injects synthetic mismatches \
+             into the live pipeline; never enable in production"
+        );
+        // The *same* observer the shadow path publishes to (metrics + sink
+        // fanout), so the canary rides the real pipeline end to end.
+        control_state = control_state.with_sink_canary(state.observer());
+    }
     let data_app = data_plane_router(state.clone());
     let control_app = control_plane_router(control_state, &config.metrics.path);
 

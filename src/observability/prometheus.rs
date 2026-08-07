@@ -31,6 +31,8 @@ pub const UPSTREAM_ERRORS_TOTAL: &str = "limen_upstream_errors_total";
 pub const UPSTREAM_TIMEOUTS_TOTAL: &str = "limen_upstream_timeouts_total";
 /// In-flight client requests right now.
 pub const IN_FLIGHT: &str = "limen_in_flight_requests";
+/// Shadow tasks in flight right now (dispatch through comparison).
+pub const SHADOW_IN_FLIGHT: &str = "limen_shadow_in_flight";
 /// Shadow requests dispatched to new, by route.
 pub const SHADOW_TOTAL: &str = "limen_shadow_requests_total";
 /// Shadows skipped, by route/reason.
@@ -43,6 +45,12 @@ pub const COMPARISONS_TOTAL: &str = "limen_comparisons_total";
 pub const COMPARISON_SKIPPED_TOTAL: &str = "limen_comparison_skipped_total";
 /// Mismatches whose diff was sampled (and logged, redacted), by route.
 pub const DIFF_SAMPLED_TOTAL: &str = "limen_diff_sampled_total";
+/// Mismatch records *offered* to the diff sink's writer queue.
+pub const DIFF_SINK_ENQUEUED_TOTAL: &str = "limen_diff_sink_enqueued_total";
+/// Mismatch records appended to a daily sink file.
+pub const DIFF_SINK_WRITTEN_TOTAL: &str = "limen_diff_sink_written_total";
+/// Mismatch records that never reached the file, by reason.
+pub const DIFF_SINK_DROPPED_TOTAL: &str = "limen_diff_sink_dropped_total";
 /// Circuit-breaker state by route/upstream (0 closed, 1 half-open, 2 open).
 pub const CIRCUIT_BREAKER_STATE: &str = "limen_circuit_breaker_state";
 /// Whether the flag provider is stale (1) or fresh (0).
@@ -136,21 +144,41 @@ pub fn record_upstream_timeout(route_id: &str, upstream: Upstream) {
     .increment(1);
 }
 
-/// A RAII guard that holds the in-flight request gauge up for its lifetime.
-pub struct InFlight;
+/// A RAII guard that holds a gauge up for its lifetime: incremented when the
+/// guard is taken, decremented on drop — including a panic unwind, so the gauge
+/// can never be left leaked high.
+///
+/// Constructed only through the named helpers below, so the set of gauges that
+/// can be held this way stays bounded and greppable.
+pub struct GaugeGuard(&'static str);
 
-impl InFlight {
-    /// Increment the in-flight gauge; the returned guard decrements on drop.
-    pub fn enter() -> Self {
-        gauge!(IN_FLIGHT).increment(1.0);
-        Self
+impl GaugeGuard {
+    fn enter(name: &'static str) -> Self {
+        gauge!(name).increment(1.0);
+        Self(name)
     }
 }
 
-impl Drop for InFlight {
+impl Drop for GaugeGuard {
     fn drop(&mut self) {
-        gauge!(IN_FLIGHT).decrement(1.0);
+        gauge!(self.0).decrement(1.0);
     }
+}
+
+/// Hold the in-flight *client request* gauge up until the guard is dropped.
+pub fn in_flight() -> GaugeGuard {
+    GaugeGuard::enter(IN_FLIGHT)
+}
+
+/// Hold the in-flight *shadow* gauge up until the guard is dropped.
+///
+/// Taken before the shadow task is spawned and moved into it, so the gauge
+/// covers the whole fire-and-forget lifetime and every exit path — completion,
+/// upstream failure, shadow timeout, or a panic unwinding the task — decrements
+/// it exactly once. A leaked increment would leave a campaign verdict waiting
+/// forever for a drain that already happened.
+pub fn shadow_in_flight() -> GaugeGuard {
+    GaugeGuard::enter(SHADOW_IN_FLIGHT)
 }
 
 /// A shadow request was dispatched to new.
@@ -187,6 +215,78 @@ pub fn diff_sampled(route_id: &str) {
     counter!(DIFF_SAMPLED_TOTAL, "route" => route_id.to_string()).increment(1);
 }
 
+/// Why a mismatch record never reached its daily sink file (a bounded, three-
+/// value metric label).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SinkDropReason {
+    /// The writer queue was full — the writer could not keep up and the shadow
+    /// task refused to block on it.
+    QueueFull,
+    /// The writer thread failed to open or write the daily file.
+    IoError,
+    /// The writer thread is gone (the channel is disconnected).
+    WriterGone,
+}
+
+impl SinkDropReason {
+    /// Every reason, so the label set can be registered up front
+    /// ([`register_verdict_series`]).
+    pub const ALL: [SinkDropReason; 3] = [
+        SinkDropReason::QueueFull,
+        SinkDropReason::IoError,
+        SinkDropReason::WriterGone,
+    ];
+
+    /// A stable, lowercase label.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SinkDropReason::QueueFull => "queue_full",
+            SinkDropReason::IoError => "io_error",
+            SinkDropReason::WriterGone => "writer_gone",
+        }
+    }
+}
+
+/// A mismatch record was *offered* to the diff sink's writer queue.
+///
+/// Counted at the offer, not at acceptance, so the drain equation
+/// `enqueued == written + dropped` stays balanced when the queue refuses a
+/// record: counting only accepted records would leave `enqueued` permanently
+/// short and make a finished pipeline look like one still draining.
+pub fn diff_sink_enqueued() {
+    counter!(DIFF_SINK_ENQUEUED_TOTAL).increment(1);
+}
+
+/// A mismatch record was appended to its daily sink file.
+pub fn diff_sink_written() {
+    counter!(DIFF_SINK_WRITTEN_TOTAL).increment(1);
+}
+
+/// A mismatch record was dropped rather than persisted.
+pub fn diff_sink_dropped(reason: SinkDropReason) {
+    counter!(DIFF_SINK_DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
+}
+
+/// Touch every series a campaign verdict reads, so all of them render from the
+/// very first scrape.
+///
+/// A verdict tool must be able to tell "nothing happened" from "this binary has
+/// no such instrumentation", and lazily-registered metrics render those two
+/// states identically: an absent series. Since verdict fails closed on a
+/// missing input, an un-touched series would turn every clean, quiet run into a
+/// tooling failure. Registering at zero makes the honest answer the one that
+/// renders.
+pub fn register_verdict_series() {
+    counter!(DIFF_SINK_ENQUEUED_TOTAL).increment(0);
+    counter!(DIFF_SINK_WRITTEN_TOTAL).increment(0);
+    for reason in SinkDropReason::ALL {
+        counter!(DIFF_SINK_DROPPED_TOTAL, "reason" => reason.as_str()).increment(0);
+    }
+    // An absolute set, not an increment: this runs once at startup, before any
+    // shadow can have taken the guard.
+    gauge!(SHADOW_IN_FLIGHT).set(0.0);
+}
+
 /// Set the circuit-breaker state gauge for a route's new upstream.
 pub fn set_breaker_state(route_id: &str, state: BreakerState) {
     let value = match state {
@@ -213,6 +313,41 @@ pub fn set_flag_health(stale: bool, staleness_seconds: Option<f64>, consecutive_
 #[cfg(test)]
 mod tests {
     use super::*;
+    use metrics_exporter_prometheus::PrometheusBuilder;
+
+    /// The verdict series must render *at zero* after registration — not merely
+    /// be spelled correctly somewhere. Asserted against a real rendered
+    /// exposition (a local recorder keeps this test off the global one), so
+    /// renderer drift breaks the test rather than the field.
+    #[test]
+    fn registration_renders_every_verdict_series_at_zero() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, register_verdict_series);
+        let rendered = handle.render();
+
+        for line in [
+            "limen_diff_sink_enqueued_total 0",
+            "limen_diff_sink_written_total 0",
+            r#"limen_diff_sink_dropped_total{reason="queue_full"} 0"#,
+            r#"limen_diff_sink_dropped_total{reason="io_error"} 0"#,
+            r#"limen_diff_sink_dropped_total{reason="writer_gone"} 0"#,
+            "limen_shadow_in_flight 0",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == line),
+                "expected `{line}` in the exposition:\n{rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn sink_drop_reasons_are_the_documented_vocabulary() {
+        assert_eq!(
+            SinkDropReason::ALL.map(SinkDropReason::as_str),
+            ["queue_full", "io_error", "writer_gone"]
+        );
+    }
 
     #[test]
     fn status_class_buckets() {

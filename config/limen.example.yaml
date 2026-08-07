@@ -34,6 +34,13 @@ flags:
 # diff_sink:
 #   dir: "./limen-diffs"
 
+# Debug-only affordances (spec territory: campaign falsification, never
+# production). WARNING: sink_canary exposes POST /debug/canary, which injects
+# a synthetic mismatch into the live sink on every call — never enable this in
+# production. `limen run` logs a loud warning at startup if it is on.
+# debug:
+#   sink_canary: true
+
 routes:
   # A read being observed in shadow mode: legacy serves the client, new is
   # shadowed, responses are compared using the referenced contract.
@@ -52,6 +59,9 @@ routes:
       enabled: true
       sample_rate: 0.1 # buffer + compare ~10% of eligible reads
       max_body_bytes: 262144
+      # min_comparisons: 1  # `limen verdict`'s per-route floor (default 1);
+      #   0 explicitly exempts this route from the floors check. Ignored by
+      #   the proxy itself.
       # shadow_methods: ["POST"]  # opt a write method into shadowing (spec
       #   §6.1); only valid on shadow_legacy_primary routes, and the method
       #   must also appear in match.methods

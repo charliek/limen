@@ -57,16 +57,44 @@ The metric set (spec §10.1):
 | `limen_upstream_errors_total` | counter | `route`, `upstream` |
 | `limen_upstream_timeouts_total` | counter | `route`, `upstream` |
 | `limen_in_flight_requests` | gauge | — |
+| `limen_shadow_in_flight` | gauge | — |
 | `limen_shadow_requests_total` | counter | `route` |
 | `limen_shadow_skipped_total` | counter | `route`, `reason` |
 | `limen_shadow_failed_total` | counter | `route`, `reason` |
 | `limen_comparisons_total` | counter | `route`, `result` |
 | `limen_comparison_skipped_total` | counter | `route`, `reason` |
 | `limen_diff_sampled_total` | counter | `route` |
+| `limen_diff_sink_enqueued_total` | counter | — |
+| `limen_diff_sink_written_total` | counter | — |
+| `limen_diff_sink_dropped_total` | counter | `reason` (`queue_full`\|`io_error`\|`writer_gone`) |
 | `limen_circuit_breaker_state` | gauge | `route`, `upstream` (0 closed, 1 half-open, 2 open) |
 | `limen_flag_provider_stale` | gauge | — |
 | `limen_flag_provider_staleness_seconds` | gauge | — |
 | `limen_flag_provider_consecutive_failures` | gauge | — |
+
+`limen_shadow_in_flight` counts shadow tasks in flight right now (dispatch
+through comparison) — distinct from `limen_in_flight_requests`, which only
+gauges client-facing requests. The three `limen_diff_sink_*` series track the
+diff sink's async pipeline: `enqueued_total` counts every mismatch record
+**offered** to the writer's bounded queue, incremented *before* the
+`try_send` call — not just the ones accepted — so the balance
+`enqueued == written + dropped` holds even when the queue refuses a record;
+counting only accepted records would leave `enqueued` permanently short and
+make a finished pipeline look like one still draining. `written_total`
+increments after a record is durably appended to its daily file;
+`dropped_total` increments per drop reason.
+
+!!! note "These four series are zero-registered at startup"
+    `limen run` touches `limen_shadow_in_flight` and the three
+    `limen_diff_sink_*` counters to zero immediately after installing the
+    Prometheus recorder — before any traffic has produced a sample. A
+    lazily-registered metric renders "nothing happened" and "this binary has
+    no such instrumentation" identically: an absent series. Zero-registering
+    them means their **absence from a scrape is itself meaningful** — it
+    signals missing instrumentation (an older binary, or a renderer
+    regression), not a quiet run. [`limen verdict`](../reference/cli.md#verdict)
+    relies on exactly this: it treats a required series that never appears in
+    the scrape as a typed input-unavailable failure (exit 50), never as zero.
 
 !!! warning "Bounded labels only"
     Every label is low-cardinality: a route id, an HTTP method, the upstream
@@ -153,6 +181,18 @@ up that channel instead of the proxy — once it's full, further mismatches are
 dropped and counted rather than queued unboundedly, and an IO failure logs one
 `limen.diff_sink_write_failed` warning (then counts, not re-logs, until a write
 succeeds again) rather than interfering with traffic.
+
+!!! note "Accepted edge case: a panicked writer thread"
+    The writer thread is written to never panic — IO failures are caught and
+    counted, not `unwrap`ed. If it somehow did panic anyway, its
+    already-dequeued records would never reach `written_total` or
+    `dropped_total`, so the drain equation (`enqueued == written + dropped`)
+    can never rebalance again for that run. `limen verdict` has no recovery
+    path for this and does not need one: the drain loop simply times out and
+    the verdict exits `40` (drain timeout) — fail-closed in the right
+    direction, since a stuck drain is a more honest signal than a verdict that
+    quietly under-counts. No special-casing was added for this because the
+    ordinary timeout path already produces the correct typed outcome.
 
 Read the files back with `limen report` — no config file needed, so it runs
 wherever the files ended up:

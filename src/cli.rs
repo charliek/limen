@@ -1,13 +1,17 @@
 //! Command-line interface: the `clap` subcommands and their dispatch.
 //!
-//! Five subcommands mirror the spec (Section 4.5, 10.4, 14):
+//! Six subcommands mirror the spec (Section 4.5, 10.4, 12.1, 14):
 //! - `run` — bind the data-plane and control-plane listeners and serve.
 //! - `validate-config` — semantically validate a configuration file.
 //! - `print-routes` — print the resolved routing table for a configuration.
 //! - `check-contract` — validate a behavioral contract and its JSONPath usage.
 //! - `report` — summarize the mismatches a `diff_sink` directory has collected.
+//! - `verdict` — render a typed campaign verdict from the config, the live
+//!   control plane, and the sink (drain, floors, integrity, canary).
 
 use std::path::PathBuf;
+use std::process::ExitCode;
+use std::time::Duration;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
@@ -16,6 +20,7 @@ use time::OffsetDateTime;
 use crate::config::{self, ConfigOverrides, LoadedConfig};
 use crate::contract::load as contract_load;
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
+use crate::verdict;
 
 /// Limen — a migration proxy that safely shifts HTTP traffic from a legacy
 /// service to a new implementation.
@@ -39,6 +44,10 @@ pub enum Command {
     CheckContract(CheckContractArgs),
     /// Summarize the mismatches recorded in a `diff_sink` directory.
     Report(ReportArgs),
+    /// Render a typed campaign verdict: drain the pipeline, assert per-route
+    /// comparison floors, reconcile the sink against the engine's counters,
+    /// and exit with a documented code (0/10/20/30/40/50).
+    Verdict(VerdictArgs),
 }
 
 /// Arguments shared by the config-oriented subcommands.
@@ -108,16 +117,57 @@ pub enum ReportFormat {
     Json,
 }
 
+/// Arguments for `verdict`. Unlike `report`, a config file is required: the
+/// verdict's floors and route matrix come from it, and the sink directory and
+/// control-plane address default from it so one flag set drives everything.
+#[derive(Debug, Args)]
+pub struct VerdictArgs {
+    #[command(flatten)]
+    pub config: ConfigArgs,
+    /// Sink directory override (default: the config's `diff_sink.dir`,
+    /// resolved exactly as `run` resolves it — against the process CWD).
+    #[arg(long)]
+    pub dir: Option<PathBuf>,
+    /// Control-plane base URL override (default: derived from the config's
+    /// `metrics.listen_addr`, with wildcard hosts mapped to `127.0.0.1`).
+    #[arg(long)]
+    pub control_url: Option<String>,
+    /// Trigger the debug sink canary and require it end-to-end (needs
+    /// `debug.sink_canary: true` in the running proxy's config).
+    #[arg(long, conflicts_with = "offline")]
+    pub canary: bool,
+    /// Degraded report-only mode: no drain, floors, integrity, or canary.
+    /// An offline exit 0 is weaker than an online one — prefer online.
+    #[arg(long)]
+    pub offline: bool,
+    /// Slack added to the longest route shadow timeout to form the drain
+    /// deadline (compare + sink flush headroom).
+    #[arg(long, default_value_t = 2000)]
+    pub drain_slack_ms: u64,
+    /// Advanced: replace the computed drain deadline entirely.
+    #[arg(long)]
+    pub drain_deadline_ms: Option<u64>,
+    /// Interval between drain scrapes.
+    #[arg(long, default_value_t = 250)]
+    pub poll_interval_ms: u64,
+    /// Output format.
+    #[arg(long, value_enum, default_value_t = ReportFormat::Human)]
+    pub format: ReportFormat,
+}
+
 impl Cli {
-    /// Dispatch the parsed command.
-    pub async fn run(self) -> anyhow::Result<()> {
+    /// Dispatch the parsed command. Only `verdict` uses exit codes beyond
+    /// success; every other command reports failure through `Err` (exit 1).
+    pub async fn run(self) -> anyhow::Result<ExitCode> {
         match self.command {
-            Command::Run(args) => cmd_run(args).await,
-            Command::ValidateConfig(args) => cmd_validate_config(args),
-            Command::PrintRoutes(args) => cmd_print_routes(args),
-            Command::CheckContract(args) => cmd_check_contract(args),
-            Command::Report(args) => cmd_report(args),
+            Command::Verdict(args) => return cmd_verdict(args).await,
+            Command::Run(args) => cmd_run(args).await?,
+            Command::ValidateConfig(args) => cmd_validate_config(args)?,
+            Command::PrintRoutes(args) => cmd_print_routes(args)?,
+            Command::CheckContract(args) => cmd_check_contract(args)?,
+            Command::Report(args) => cmd_report(args)?,
         }
+        Ok(ExitCode::SUCCESS)
     }
 }
 
@@ -295,6 +345,91 @@ fn cmd_report(args: ReportArgs) -> anyhow::Result<()> {
         ReportFormat::Human => print_report(&report),
     }
     Ok(())
+}
+
+async fn cmd_verdict(args: VerdictArgs) -> anyhow::Result<ExitCode> {
+    let loaded = load_and_validate(&args.config)?;
+    let config = &loaded.config;
+
+    // Every unavailable input is the typed exit 50, never an untyped error:
+    // wrappers branch on the code, and a fail-closed verdict must be
+    // distinguishable from a crashed tool.
+    let sink_dir = match args
+        .dir
+        .or_else(|| config.diff_sink.as_ref().map(|s| s.dir.clone()))
+    {
+        Some(dir) => dir,
+        None => {
+            return render_unavailable(
+                args.format,
+                "no sink directory: the config has no `diff_sink` block and no --dir was given",
+            );
+        }
+    };
+    let control_base = args
+        .control_url
+        .map(|u| u.trim_end_matches('/').to_string())
+        .unwrap_or_else(|| verdict::control_base_from_listen_addr(&config.metrics.listen_addr));
+    let metrics_path = if config.metrics.path.starts_with('/') {
+        config.metrics.path.clone()
+    } else {
+        format!("/{}", config.metrics.path)
+    };
+    let drain_deadline = args
+        .drain_deadline_ms
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| {
+            verdict::drain_deadline(config, Duration::from_millis(args.drain_slack_ms))
+        });
+
+    let opts = verdict::VerdictOptions {
+        sink_dir,
+        control_base,
+        metrics_path,
+        canary: args.canary,
+        offline: args.offline,
+        drain_deadline,
+        poll_interval: Duration::from_millis(args.poll_interval_ms),
+    };
+
+    match verdict::run_verdict(config, &opts).await {
+        Ok(report) => {
+            match args.format {
+                ReportFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
+                ReportFormat::Human => print!("{}", verdict::render_human(&report)),
+            }
+            Ok(ExitCode::from(report.exit_code))
+        }
+        Err(e) => render_unavailable(args.format, &e.0),
+    }
+}
+
+/// Report an input-unavailable verdict (exit 50) in the requested format.
+fn render_unavailable(format: ReportFormat, detail: &str) -> anyhow::Result<ExitCode> {
+    match format {
+        ReportFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "mode": "unavailable",
+                "verdict": "input-unavailable",
+                "exit_code": verdict::EXIT_INPUT_UNAVAILABLE,
+                "error": detail,
+            })
+        ),
+        ReportFormat::Human => {
+            println!("LIMEN VERDICT: INPUT UNAVAILABLE");
+            println!("  {detail}");
+            println!(
+                "  This is a tooling failure, not a clean run — it must never be read as \
+                 0 mismatches."
+            );
+            println!(
+                "  exit {} — input-unavailable",
+                verdict::EXIT_INPUT_UNAVAILABLE
+            );
+        }
+    }
+    Ok(ExitCode::from(verdict::EXIT_INPUT_UNAVAILABLE))
 }
 
 /// The column width that fits every value (in characters, not bytes).

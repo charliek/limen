@@ -19,6 +19,7 @@ use crate::config::model::{
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
+use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// Loads each distinct contract file at most once per `validate()` call. A
 /// contract typically holds many route entries, so without this the same file
@@ -234,6 +235,18 @@ fn validate_route<'a>(
 
     if route.id.trim().is_empty() {
         errs.push(format!("routes[{index}].id"), "must not be empty");
+    } else if route.id.starts_with(RESERVED_ROUTE_ID_PREFIX) {
+        // Reserved so limen's own records (today the debug sink canary, which
+        // writes under CANARY_ROUTE_ID) can never be confused with a real
+        // route's mismatches — `limen verdict` subtracts the namespace from
+        // its mismatch totals and floors.
+        errs.push(
+            format!("routes[{index}].id"),
+            format!(
+                "route ids starting with {RESERVED_ROUTE_ID_PREFIX:?} are reserved for \
+                 limen-internal records (e.g. {CANARY_ROUTE_ID:?}); rename the route"
+            ),
+        );
     } else if !seen_ids.insert(route.id.as_str()) {
         errs.push(
             format!("routes[{index}].id"),
@@ -469,6 +482,17 @@ fn validate_comparison_operational(
         route.comparison.sample_rate,
         errs,
     );
+    // An explicit positive floor on a comparison-disabled route could never
+    // be met, and `limen verdict` would silently exclude it from the floors
+    // check — the operator believes the route is verified, it never was.
+    // Like an inert `shadow_methods` listing, this refuses to start.
+    if !route.comparison.enabled && route.comparison.min_comparisons.is_some_and(|m| m > 0) {
+        errs.push(
+            loc("comparison.min_comparisons"),
+            "a positive verdict floor on a comparison-disabled route can never be met — \
+             enable comparison or set min_comparisons: 0",
+        );
+    }
     validate_shadow_methods(loc, route, errs);
 }
 
@@ -834,6 +858,67 @@ routes:
         assert!(errs
             .iter()
             .any(|e| e.message.contains("duplicate route id")));
+    }
+
+    #[test]
+    fn a_positive_floor_on_a_disabled_route_is_rejected() {
+        // Without this, the route silently vanishes from `limen verdict`'s
+        // floors check while looking floored in the config (fail-open).
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/a" }
+    legacy_upstream: "https://l"
+    mode: legacy_only
+    comparison: { enabled: false, min_comparisons: 500 }
+"#,
+        );
+        assert!(
+            errs.iter().any(|e| e.message.contains("never be met")),
+            "{errs:?}"
+        );
+        // The explicit opt-out and the plain default stay fully valid.
+        for comparison in [
+            "{ enabled: false, min_comparisons: 0 }",
+            "{ enabled: false }",
+        ] {
+            let config = parse(&format!(
+                r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET"], path_prefix: "/a" }}
+    legacy_upstream: "https://l"
+    mode: legacy_only
+    comparison: {comparison}
+"#
+            ));
+            assert!(
+                validate(&config, &base()).is_ok(),
+                "{comparison} should be valid"
+            );
+        }
+    }
+
+    #[test]
+    fn reserved_route_id_prefix_is_rejected() {
+        // The canary id itself and any other `__` id: limen owns the namespace,
+        // so a verdict's "these are not real mismatches" subtraction is exact.
+        for id in ["__limen_canary__", "__anything"] {
+            let errs = errors(&format!(
+                r#"
+routes:
+  - id: {id}
+    match: {{ methods: ["GET"], path_prefix: "/a" }}
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#
+            ));
+            assert!(
+                errs.iter().any(|e| e.message.contains("reserved")),
+                "{id}: {errs:?}"
+            );
+        }
     }
 
     #[test]

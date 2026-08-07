@@ -48,6 +48,7 @@ use crate::compare::result::{
     ComparisonResult, CookieMismatch, Difference, HeaderMismatch, LocationMismatch,
 };
 use crate::observability::metrics::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+use crate::observability::prometheus::{self, SinkDropReason};
 
 /// The file-name prefix of a daily sink file (`mismatches-2026-07-28.jsonl`).
 const FILE_PREFIX: &str = "mismatches-";
@@ -166,15 +167,25 @@ impl SinkObserver {
         }
     }
 
-    /// Record that a mismatch was dropped because the writer queue was full.
+    /// Record that a mismatch was dropped because the writer channel refused it.
     /// Warn once, then only count — a stalled sink must not drown the logs.
-    fn note_overflow(&self) {
+    ///
+    /// Both refusals share the `queue_overflows` stat and the warn latch: from
+    /// the shadow task's side a refused record is a refused record, and the
+    /// existing counter's meaning ("the producer could not hand this off") is
+    /// unchanged. The metric's `reason` label is what tells a full queue from a
+    /// dead writer. `event` comes from the call site so each refusal keeps its
+    /// own log event name without this function claiming to handle the IO
+    /// failures the writer thread reports itself (`record_failure`).
+    fn note_refused(&self, reason: SinkDropReason, event: &'static str) {
         self.stats.queue_overflows.fetch_add(1, Ordering::Relaxed);
+        prometheus::diff_sink_dropped(reason);
         if !self.overflow_warned.swap(true, Ordering::Relaxed) {
             warn!(
-                event = "limen.diff_sink_queue_full",
+                event,
+                reason = reason.as_str(),
                 dir = %self.dir.display(),
-                "mismatch record dropped; writer queue full, further drops are counted, not logged"
+                "mismatch record dropped; further drops are counted, not logged"
             );
         }
     }
@@ -231,20 +242,26 @@ fn write_record(dir: &Path, state: &mut WriterState, stats: &SinkStats, record: 
     // A single `write_all` of the newline-terminated record on an O_APPEND file
     // keeps other limen processes sharing the directory from interleaving partial
     // records. (Within one process only this thread writes.)
-    if let Err(e) = file.write_all(record.line.as_bytes()) {
+    match file.write_all(record.line.as_bytes()) {
+        Ok(()) => {
+            prometheus::diff_sink_written();
+            if state.failing {
+                warn!(
+                    suppressed_failures = state.suppressed,
+                    dir = %dir.display(),
+                    "limen.diff_sink_recovered"
+                );
+                state.failing = false;
+                state.suppressed = 0;
+            }
+        }
         // Drop the handle so the next record reopens rather than retrying a file
         // descriptor that may be gone (rotated away by an external log rotator,
         // unmounted volume, …).
-        state.open = None;
-        record_failure(dir, state, stats, date, &e);
-    } else if state.failing {
-        warn!(
-            suppressed_failures = state.suppressed,
-            dir = %dir.display(),
-            "limen.diff_sink_recovered"
-        );
-        state.failing = false;
-        state.suppressed = 0;
+        Err(e) => {
+            state.open = None;
+            record_failure(dir, state, stats, date, &e);
+        }
     }
 }
 
@@ -268,6 +285,7 @@ fn record_failure(
     error: &std::io::Error,
 ) {
     stats.io_failures.fetch_add(1, Ordering::Relaxed);
+    prometheus::diff_sink_dropped(SinkDropReason::IoError);
     if state.failing {
         state.suppressed = state.suppressed.saturating_add(1);
         return;
@@ -323,7 +341,10 @@ impl ShadowObserver for SinkObserver {
         };
         let mut line = match serde_json::to_string(&record) {
             Ok(line) => line,
-            // Unreachable: every field is a plain serializable type.
+            // Unreachable: every field is a plain serializable type. Note this
+            // returns *before* the record is offered to the queue, so it is
+            // neither enqueued nor dropped — the record never entered the
+            // pipeline the drain equation describes.
             Err(e) => {
                 warn!(
                     event = "limen.diff_sink_serialize_failed",
@@ -334,17 +355,27 @@ impl ShadowObserver for SinkObserver {
             }
         };
         line.push('\n');
+        // Counted at the offer, before `try_send` can refuse it, so every record
+        // that entered the pipeline is accounted for exactly once as written or
+        // dropped (`enqueued == written + dropped`).
+        prometheus::diff_sink_enqueued();
         // Hand the record to the writer thread without ever blocking the shadow
         // task: a full queue (a stalled volume the writer can't drain) drops-and-
         // counts, exactly like an IO failure. `Disconnected` means the writer
         // thread is gone (only possible if it panicked, which it is written not
-        // to) — count that dropped record too rather than resurrecting the thread.
+        // to) — count that dropped record too, under its own reason, rather than
+        // resurrecting the thread.
         match self.tx.try_send(WriterMsg::Record(QueuedRecord {
             date: now.date(),
             line,
         })) {
             Ok(()) => {}
-            Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => self.note_overflow(),
+            Err(TrySendError::Full(_)) => {
+                self.note_refused(SinkDropReason::QueueFull, "limen.diff_sink_queue_full")
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.note_refused(SinkDropReason::WriterGone, "limen.diff_sink_writer_gone")
+            }
         }
     }
 

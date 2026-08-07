@@ -17,6 +17,75 @@ pub fn config_from_yaml(yaml: &str) -> Config {
     serde_yaml::from_str(yaml).expect("valid test config")
 }
 
+/// Grab a currently-free localhost port by binding to `:0` and releasing it.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Spawn a real bound proxy (data plane + control plane) for `config`. The
+/// returned sender triggers graceful shutdown — as does dropping it — and the
+/// handle carries `serve_with_shutdown`'s result. For the tests that bind
+/// ports rather than driving the router directly via `oneshot`.
+pub fn spawn_proxy(
+    config: Config,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        limen::http::server::serve_with_shutdown(config, std::path::Path::new("."), async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    (tx, handle)
+}
+
+/// Poll until the proxy actually serves a request. A bare TCP connect only
+/// proves the kernel completed a handshake into the accept backlog, which can
+/// succeed before the server is accepting — only a successful response proves
+/// the data plane is live.
+/// One outer deadline rather than a bounded attempt count: each attempt can
+/// itself block for the client's request timeout, so "100 attempts" would be an
+/// unpredictable ceiling rather than a bound.
+pub async fn wait_serving(client: &reqwest::Client, url: &str) {
+    let probing = async {
+        loop {
+            if let Ok(resp) = client.get(url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), probing)
+        .await
+        .unwrap_or_else(|_| panic!("proxy did not start serving requests at {url}"));
+}
+
+/// A single `shadow_legacy_primary` route over the two upstreams, comparing
+/// every request — the shape every shadow-path test starts from.
+pub fn shadow_config(legacy: &str, new: &str, shadow_ms: u64) -> Config {
+    config_from_yaml(&format!(
+        r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET"], path_prefix: "/" }}
+    legacy_upstream: "{legacy}"
+    new_upstream: "{new}"
+    mode: shadow_legacy_primary
+    timeouts: {{ primary_ms: 2000, shadow_ms: {shadow_ms} }}
+    comparison: {{ enabled: true, sample_rate: 1.0, max_body_bytes: 262144 }}
+"#
+    ))
+}
+
 /// Build the data-plane router for a config (no contract refs in tests, so the
 /// base dir is irrelevant).
 pub fn router(config: &Config) -> Router {
@@ -40,6 +109,32 @@ pub fn router_with_observer(
 /// Send one request through the router (cloning so the router can be reused).
 pub async fn send(router: &Router, req: Request<Body>) -> Response<Body> {
     router.clone().oneshot(req).await.expect("router oneshot")
+}
+
+/// The value of one exposition line, keyed by everything left of the value
+/// (`limen_shadow_in_flight`, `limen_diff_sink_dropped_total{reason="io_error"}`).
+/// `None` means the series is absent — which a verdict must never conflate with
+/// zero, so tests assert on the distinction.
+pub fn metric_value(rendered: &str, series: &str) -> Option<f64> {
+    rendered.lines().find_map(|line| {
+        line.strip_prefix(series)?
+            .strip_prefix(' ')?
+            .trim()
+            .parse()
+            .ok()
+    })
+}
+
+/// Poll `cond` every 10ms for up to ~5s, so a fire-and-forget shadow task (or
+/// the sink's writer thread) can make progress. Panics with `what` on timeout.
+pub async fn wait_until(what: &str, cond: impl Fn() -> bool) {
+    for _ in 0..500 {
+        if cond() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("timed out waiting for {what}");
 }
 
 /// The status, headers, and body text of a response.

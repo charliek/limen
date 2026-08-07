@@ -40,6 +40,33 @@ pub struct Config {
     /// The routing table.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Debug-only switches. Absent (the normal case) = every debug affordance
+    /// is off; see [`DebugConfig`].
+    #[serde(default)]
+    pub debug: Option<DebugConfig>,
+}
+
+impl Config {
+    /// Whether the debug sink canary is enabled (absent block = off).
+    pub fn sink_canary_enabled(&self) -> bool {
+        self.debug.is_some_and(|d| d.sink_canary)
+    }
+}
+
+/// Debug-only switches, off unless the block is present and says otherwise.
+///
+/// These exist for proving the pipeline bites (`limen verdict --canary`), not
+/// for production operation — `limen run` logs a loud warning at startup when
+/// any of them is on. Deliberately config-gated rather than
+/// `cfg(debug_assertions)`- or feature-gated: campaign runners build limen
+/// `--release`, which is exactly where the proof has to work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugConfig {
+    /// Expose `POST /debug/canary` on the control plane, which injects one
+    /// synthetic mismatch through the real compare → observer → sink pipeline
+    /// under the reserved route id `__limen_canary__`.
+    pub sink_canary: bool,
 }
 
 /// The durable mismatch sink (spec §10.4).
@@ -405,6 +432,17 @@ pub struct ComparisonConfig {
     pub sample_rate: f64,
     /// Skip comparison above this body size.
     pub max_body_bytes: u64,
+    /// Floor asserted by `limen verdict`: the minimum number of comparisons
+    /// this route must have recorded for a campaign verdict to count it as
+    /// exercised (spec §12.1's operator-checked-gate territory). Unset means
+    /// a floor of 1 whenever comparison is enabled; `0` opts the route out
+    /// explicitly. An `Option` rather than a defaulted integer so validation
+    /// can tell an explicit floor from the default: a positive floor on a
+    /// comparison-disabled route could never be met and refuses to start
+    /// instead of silently vanishing from the verdict. Ignored by the proxy
+    /// itself — this is a verdict-time expectation, not a runtime knob.
+    #[serde(default)]
+    pub min_comparisons: Option<u64>,
     /// Write methods this route opts into shadowing (spec §6.1). Empty (the
     /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
     /// shadowed. Only `POST` may be listed today, and only on a
@@ -440,6 +478,7 @@ impl Default for ComparisonConfig {
             enabled: false,
             sample_rate: 0.0,
             max_body_bytes: 262_144,
+            min_comparisons: None,
             shadow_methods: Vec::new(),
             compare_status: None,
             compare_body: None,
@@ -452,6 +491,13 @@ impl Default for ComparisonConfig {
 }
 
 impl ComparisonConfig {
+    /// The floor `limen verdict` asserts for this route: the explicit value,
+    /// else 1. Meaningful only when comparison is enabled (validation rejects
+    /// a positive explicit floor on a disabled route).
+    pub fn effective_min_comparisons(&self) -> u64 {
+        self.min_comparisons.unwrap_or(1)
+    }
+
     /// Whether the route declares an inline behavioral block (which is mutually
     /// exclusive with a contract reference). A present-but-empty `json: {}`
     /// still counts: per spec §4.4 the conflict is about the *block* being
@@ -632,6 +678,26 @@ routes:
     #[test]
     fn unknown_top_level_key_rejected() {
         assert!(serde_yaml::from_str::<Config>("serer: {}").is_err());
+    }
+
+    #[test]
+    fn debug_block_is_absent_and_off_by_default() {
+        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.debug.is_none());
+        assert!(!cfg.sink_canary_enabled());
+        // An empty block is still off: only an explicit `true` enables it.
+        let cfg: Config = serde_yaml::from_str("debug: {}").unwrap();
+        assert_eq!(cfg.debug, Some(DebugConfig { sink_canary: false }));
+        assert!(!cfg.sink_canary_enabled());
+    }
+
+    #[test]
+    fn debug_sink_canary_parses_and_rejects_typos() {
+        let cfg: Config = serde_yaml::from_str("debug:\n  sink_canary: true\n").unwrap();
+        assert!(cfg.sink_canary_enabled());
+        // A misspelled debug switch must fail loudly rather than silently
+        // leaving the canary off — a runner would then "prove" nothing.
+        assert!(serde_yaml::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
     }
 
     #[test]
