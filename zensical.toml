@@ -32,6 +32,8 @@ nav = [
     { "Quickstart" = "getting-started/quickstart.md" },
   ] },
   { "Guides" = [
+    { "Classifying Routes" = "guides/classifying-routes.md" },
+    { "Observe Mode" = "guides/observe-mode.md" },
     { "Comparison & Contracts" = "guides/comparison-and-contracts.md" },
     { "Flags & Rollout" = "guides/flags-and-rollout.md" },
     { "Resilience & Failover" = "guides/resilience.md" },

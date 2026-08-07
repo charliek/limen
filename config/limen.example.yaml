@@ -41,6 +41,19 @@ flags:
 # debug:
 #   sink_canary: true
 
+# Observe mode (docs/guides/observe-mode.md): a strictly passive, bounded
+# per-route traffic profile — no shadow request, no body byte read — served
+# as JSON from GET /observe/profile and consumed by `limen suggest-routes` to
+# draft a route config. Uncomment to turn it on; `limen run` logs a loud
+# warning at startup, because the profile discloses route topology and
+# query-parameter names on the control plane — bind metrics.listen_addr to
+# loopback before enabling this anywhere but a laptop.
+# observe:
+#   sample_rate: 1.0      # 0-1; below 1.0, suggest-routes refuses to classify
+#   max_query_names: 32   # per-route cap on distinct query-parameter names
+#   max_path_shapes: 32   # per-route cap on distinct observed paths
+#   max_fingerprints: 32  # per-route cap on stability fingerprints
+
 routes:
   # A read being observed in shadow mode: legacy serves the client, new is
   # shadowed, responses are compared using the referenced contract.

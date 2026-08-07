@@ -25,6 +25,7 @@ flags: { … }           # feature-flag provider + fail-safe
 diff_sink: { … }       # optional: persist comparison mismatches to JSONL
 routes: [ … ]          # the routing table
 debug: { … }           # optional: debug-only affordances (never in production)
+observe: { … }         # optional: passive per-route traffic profiling
 ```
 
 ## `server`
@@ -284,6 +285,56 @@ Route IDs starting with `__` are reserved for limen-internal records (today:
 the sink canary's `__limen_canary__`); config validation rejects any user
 route declaring one, so a canary record can never be confused with a real
 mismatch.
+
+## `observe`
+
+Optional. Present = on; there is no separate `enabled` switch, following
+[`diff_sink`](#diff_sink) and [`debug`](#debug). Turns on a strictly passive,
+bounded per-route traffic profile — no shadow request, no second upstream
+contact, no body byte read — served as JSON from `GET /observe/profile` on the
+control plane and consumed by [`limen suggest-routes`](cli.md#suggest-routes).
+See the [observe mode guide](../guides/observe-mode.md) for the end-to-end
+workflow and [classifying routes](../guides/classifying-routes.md) for what
+the profile can and cannot tell you.
+
+```yaml
+observe:
+  sample_rate: 1.0      # 0-1, default 1.0
+  max_query_names: 32   # per-route cap on distinct query-parameter names
+  max_path_shapes: 32   # per-route cap on distinct observed paths
+  max_fingerprints: 32  # per-route cap on stability fingerprints
+```
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `sample_rate` | float | `1.0` | Fraction of relayed responses to observe (0–1). Below `1.0`, `limen suggest-routes` refuses to classify the resulting profile — sampling and classification are mutually exclusive, since the classifier's danger rules are existential and a dropped observation could have been the decisive one. |
+| `max_query_names` | int | `32` | Cap on the distinct query-parameter *names* recorded per route (values are never read). Must be `> 0` and at most `1024`. |
+| `max_path_shapes` | int | `32` | Cap on the set backing a route's distinct-read-path *count* (paths are counted, never recorded). Must be `> 0` and at most `1024`. |
+| `max_fingerprints` | int | `32` | Cap on the request fingerprints a route keeps for the response-stability signal. Must be `> 0` and at most `1024`. |
+
+**The floor and the ceiling are both enforced.** `0` is rejected rather than
+read as "unlimited" — a zero-capacity map records nothing, and an operator
+writing `0` means "narrower," not "empty." The ceiling (`1024`) matters just as
+much: each bound caps a map keyed by live traffic, and a value an operator can
+set arbitrarily high is not a bound at all. Past the ceiling there is nothing
+left to learn — a route with more than a thousand distinct query names or path
+shapes has already answered the question the field exists to answer, and an
+`overflow` flag in the profile carries the rest.
+
+**`metrics.path` may not be `/observe/profile` while this block is present.**
+The control plane registers the operator-supplied `metrics.path` and the fixed
+profile path on the same router, and axum panics at router *build* time on a
+duplicate route; validating the collision turns that abort into a
+refuse-to-start (invariant 7). The check is conditional on the block: an
+operator who never enables `observe:` is never told their `metrics.path` is
+wrong for a reason that does not apply to them, and the same path is fine with
+`observe:` absent.
+
+Like `debug`, an active `observe:` block makes `limen run` log a warning at
+startup — the profile discloses route topology and query-parameter names on
+the control plane, so an operator should know it is live and should bind
+[`metrics.listen_addr`](#metrics) to loopback (see the [observe mode
+guide](../guides/observe-mode.md#prerequisite-bind-the-control-plane-to-loopback)).
 
 ## Environment overrides
 

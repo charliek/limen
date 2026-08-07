@@ -120,6 +120,30 @@ sum(rate(limen_comparisons_total{result="mismatch"}[5m]))
   / sum(rate(limen_comparisons_total[5m]))
 ```
 
+## Observe mode
+
+[`observe:`](../reference/config-reference.md#observe) adds one more
+control-plane surface, present only while the block is configured:
+`GET /observe/profile` (registered only when `observe:` is present — with the
+block absent the path does not exist at all, the same way `/debug/canary`
+exists only under `debug.sink_canary`) serves the whole per-route traffic
+profile as one JSON document. It is a passive record of response metadata —
+status, a handful of headers, method, and query-parameter *names* — never a
+request or response body, and it obeys the same bounded-label doctrine as
+every metric above: no raw path, no header value, no query value, nothing a
+client controls the length of without a cap. See the [observe mode
+guide](observe-mode.md) for what it can and cannot tell you and how [`limen
+suggest-routes`](../reference/cli.md#suggest-routes) consumes it.
+
+The one new metric is `limen_observe_observations_total{route}`, a counter
+incremented once per recorded observation. It is **zero-registered per
+configured route** at startup — the same "these four series are
+zero-registered" reasoning noted above, applied to a per-route series this
+time — so a route reading absent from a scrape means observe mode is off (or
+the binary predates it), never that the route saw zero traffic. Consult
+[classifying routes](classifying-routes.md) for how the profile's fields
+become a suggested disposition.
+
 ## Structured logs & request correlation
 
 Logs go through `tracing`. The default formatter is human-readable; set
