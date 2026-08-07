@@ -1,6 +1,6 @@
 # CLI
 
-Limen exposes six subcommands. All output is structured and scriptable; the
+Limen exposes seven subcommands. All output is structured and scriptable; the
 proxy refuses to start (or validate) on invalid input.
 
 ```text
@@ -15,6 +15,7 @@ limen <COMMAND> [OPTIONS]
 | `check-contract` | Validate a behavioral contract and its JSONPath compliance. |
 | `report` | Summarize the mismatches collected in a `diff_sink` directory. |
 | `verdict` | Render a typed campaign verdict from the config, the live control plane, and the sink. |
+| `suggest-routes` | Classify an observe-mode profile into a draft route configuration. |
 
 ## `run`
 
@@ -218,6 +219,150 @@ completed one at a glance.
   whatever process is listening at `--control-url`. If that process's own
   config has `debug.sink_canary` off (or absent), the trigger is refused and
   verdict exits 50 — never silently skipped.
+
+## `suggest-routes`
+
+```bash
+limen suggest-routes -c limen.config.yaml --new-upstream https://new.internal
+limen suggest-routes -c limen.config.yaml --adopt-suggestions > draft.yaml
+limen suggest-routes -c limen.config.yaml --profile ./observe-profile.json --format json
+```
+
+`suggest-routes` turns an [observe-mode](../guides/observe-mode.md) profile
+into a draft route configuration: it classifies every configured route's
+traffic through the rules documented in [classifying
+routes](../guides/classifying-routes.md), then renders either a complete,
+loadable draft config or the machine-readable classification. The default
+draft **never enables comparison** — every route is emitted `comparison: {
+enabled: false }`, with the suggestion riding as a comment above it —
+because response metadata can prove a route unsafe to compare but never safe.
+`--adopt-suggestions` is the deliberate human act that promotes a suggestion
+into a shadowing config.
+
+Like `verdict`, a config file is required: it supplies the route table
+classified and the `observe.sample_rate` the profile is cross-checked
+against. The control-plane address is used only when polling a live proxy
+(`--control-url`, the default source); `--profile` reads a saved document
+instead and never contacts the control plane at all — see the two rows below.
+Unlike `verdict`, the third threshold (sample rate) is never taken from a CLI
+flag or config override — it is read off the profile document itself, since
+the proxy that recorded it is the only authority on whether it is complete.
+
+| Option | Default | Description |
+|---|---|---|
+| `-c, --config <PATH>` | `limen.config.yaml` (env `LIMEN_CONFIG`) | The config file `suggest-routes` classifies against — its route table, `match` conditions, and `observe` block. |
+| `--control-url <URL>` | derived from `metrics.listen_addr`, wildcard hosts mapped to `127.0.0.1` | Control-plane base URL to poll for the profile. Conflicts with `--profile`. |
+| `--profile <PATH>` | — | Classify a saved profile document instead of polling a running proxy — the same JSON `GET /observe/profile` serves. No quiescence poll: a file is already static. |
+| `--new-upstream <URL>` | — | Fallback `new_upstream` for routes that do not configure one. Without it, such a route is drafted `mode: legacy_only` — valid whether or not a `new` service exists yet. |
+| `--min-samples <N>` | `5` | Reads below this and a route is not classified (`insufficient-reads`). |
+| `--max-compare-paths <N>` | `8` | Distinct read paths above this and a route is treated as a wildcard proxy (`wildcard-granularity`). |
+| `--adopt-suggestions` | off | Emit the shadowing form (`comparison.enabled: true`, plus narrowing for `compare_narrowed` routes) for suggested routes. **Precondition**: you have confirmed against the service's source that each suggested route does not mutate — observation cannot establish that on its own. |
+| `--format <yaml\|json>` | `yaml` | `yaml` emits a complete, loadable draft configuration; `json` emits the machine surface (below). |
+| `--drain-deadline-ms <N>` | `2000` | How long to wait for the profile to stop changing (ignored with `--profile`). |
+| `--poll-interval-ms <N>` | `250` | Interval between quiescence polls (ignored with `--profile`). |
+
+### Preconditions
+
+- **The config must be the profiled proxy's config.** `suggest-routes` cannot
+  corroborate the route table, `match` conditions, or `observe.sample_rate` any
+  other way, so a config declaring no `observe:` block, or one whose
+  `sample_rate` disagrees with the profile document, is treated as "not this
+  proxy's config" — exit `50`, never an averaged or best-effort answer.
+- **Traffic has stopped, or the deadline is long enough to outlast it.**
+  Quiescence is observed (two consecutive byte-identical profile scrapes
+  **and** `limen_in_flight_requests == 0`), not slept — mirroring
+  [`verdict`](#verdict)'s drain contract for the same reason: two polls can be
+  identical while a slow request is still in flight and unrecorded.
+- **A sampled profile (`observe.sample_rate < 1.0`) cannot be classified.**
+  The classifier's danger rules are existential, so sampling and
+  classification are mutually exclusive — see [classifying
+  routes](../guides/classifying-routes.md#what-observation-can-and-cannot-tell-you).
+  Every route in such a profile lands on `relay_only` with reason
+  `partial-sample`, and the run exits `20`: a draft resting entirely on a
+  refusal to classify is not evidence, and automation must not read the exit
+  code alone as a successful classification.
+
+### Exit codes
+
+| Code | Meaning |
+|---|---|
+| `0` | Draft emitted. |
+| `20` | Nothing was profiled: no observations at all, or every route's reason is `no-observations`/`insufficient-reads`/`partial-sample`. A sampled profile counts here too — R0 already refused to classify every route, so a draft resting on it rests on no evidence. A draft nobody's traffic informed is not evidence. |
+| `40` | The profile never quiesced within `--drain-deadline-ms`. |
+| `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy. |
+| `1` | Unexpected tooling error (anyhow). |
+| `2` | CLI usage error (clap). |
+
+Unlike `verdict`'s `20`/`40`, these codes are **`suggest-routes`' own
+vocabulary** — there is no comparison pipeline here and no "highest code
+wins" accumulation to inherit; each run hits at most one of these paths.
+
+### JSON output
+
+`--format json` emits one object per configured route, in configuration
+order — the classification `suggest-routes` reached, independent of how (or
+whether) a draft would render it:
+
+```json
+[
+  {
+    "route_id": "get-device",
+    "disposition": "compare_candidate",
+    "reason": "stable-repeated-reads",
+    "evidence": {
+      "observations": 34,
+      "reads": 34,
+      "writes": 0,
+      "transport_errors": 0,
+      "distinct_read_paths": 1,
+      "distinct_read_paths_overflow": false,
+      "status_classes": { "2xx": 34 },
+      "content_types": ["application/json"],
+      "content_types_overflow": false,
+      "set_cookie_reads": 0,
+      "redirect_reads": 0,
+      "location_reads": 0,
+      "length_repeats": 12,
+      "length_varied": 0,
+      "length_missing": 0,
+      "fingerprint_overflow": false,
+      "one_time_token_names_observed": [],
+      "one_time_token_names_configured": [],
+      "query_names_unrecorded": false,
+      "path_uniqueness_ratio": 0.029411764705882353,
+      "narrowing_matches": []
+    }
+  }
+]
+```
+
+`disposition` and `reason` are both stable, published vocabularies — every
+value is documented in [classifying routes](../guides/classifying-routes.md).
+`narrowing_matches` lists **every** narrowing rule that matched, not just the
+one named by `reason`: first-match-wins picks the right disposition but hides
+the rest of the evidence, so a route demoted for `body-varies` that also
+serves three content types carries both facts here even though `reason` names
+only the first.
+
+### Notes
+
+- **The default draft shadows nothing, by construction.** Every route is
+  emitted `comparison: { enabled: false }` regardless of disposition; the
+  suggestion rides as a `SUGGESTED:` comment with its evidence. This is the
+  mechanical form of the classifier's epistemic limit — see [observe
+  mode](../guides/observe-mode.md#5-why-the-default-draft-shadows-nothing).
+- **A route already serving from `new` keeps its mode.** `new_only`,
+  `percentage_split`, and `failover_to_legacy` routes are never rewritten to
+  `shadow_legacy_primary` — doing so would move live client traffic back to
+  legacy, not just reformat a file. Only `legacy_only` and
+  `shadow_legacy_primary` routes with a `legacy_upstream` are re-moded.
+- **The `comparison` block is replaced wholesale, never edited in place**, and
+  `contract` is dropped whenever inline narrowing is emitted — both are what
+  keep the draft from carrying a shape (`shadow_methods` on a disabled route;
+  a contract alongside inline rules) that fails validation on load.
+- **The emitted YAML draft always validates.** `limen validate-config` against
+  a freshly emitted draft is cheap insurance worth running every time, not a
+  formality — see the [worked sequence](../guides/observe-mode.md#4-run-limen-suggest-routes).
 
 ## Configuration sources & precedence
 

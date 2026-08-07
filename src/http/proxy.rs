@@ -31,7 +31,7 @@ use crate::http::client::UpstreamClient;
 use crate::http::forwarded;
 use crate::http::shadow::{self, ShadowRequest};
 use crate::observability::request_id::{resolve as resolve_request_id, REQUEST_ID_HEADER};
-use crate::observability::{prometheus, SkipReason};
+use crate::observability::{prometheus, Observation, ResponseOrigin, SkipReason};
 use crate::resilience::BreakerReservation;
 use crate::routing::decision::PrimaryDecision;
 use crate::routing::{decision, CompiledRoute, Upstream};
@@ -74,13 +74,28 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     };
     let route_id = route.id.clone();
     let mode = route.mode;
+    // Observe mode's target, captured before `parts` is moved into `dispatch`.
+    // Owned copies because the seam is *after* dispatch — the price of profiling
+    // the response the client actually received rather than one of the several
+    // responses `dispatch` can return without ever reaching its primary arms.
+    // Only a profiled deployment pays for the two allocations.
+    let observed = state.observe_recorder().map(|_| {
+        (
+            parts.uri.path().to_string(),
+            parts.uri.query().map(str::to_string),
+        )
+    });
     let decision = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
 
     // Inner warnings inherit the request id + route via this span.
     let span = info_span!("request", %request_id, route = %route_id);
     // `dispatch` reports the upstream that actually *served* the client, which
     // differs from the chosen primary when a failover route replays to legacy.
-    let (response, served) = dispatch(&state, route, decision, parts, body, &route_id, &request_id)
+    let Dispatched {
+        response,
+        served,
+        origin,
+    } = dispatch(&state, route, decision, parts, body, &route_id, &request_id)
         .instrument(span)
         .await;
 
@@ -93,6 +108,25 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
         status.as_u16(),
         latency.as_secs_f64(),
     );
+    // Observe mode's seam: every response `dispatch` can produce arrives here,
+    // so no served response goes unprofiled and none is described by a status
+    // other than the one the client saw. Headers are read by reference and the
+    // body is never touched, so this cannot delay the client's first byte.
+    // `filter_headers` drops hop-by-hop headers only, so `Set-Cookie`,
+    // `Location` and `Content-Type` are still here to be counted.
+    if let Some((recorder, (path, query))) = state.observe_recorder().zip(observed.as_ref()) {
+        recorder.record(
+            &route_id,
+            Observation::new(
+                &method,
+                path,
+                query.as_deref(),
+                status,
+                response.headers(),
+                origin,
+            ),
+        );
+    }
     info!(
         %request_id,
         route = %route_id,
@@ -106,8 +140,51 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     finish_response(response, &request_id)
 }
 
+/// One dispatch's outcome: the client response, the upstream that actually
+/// served it, and where the response came from.
+///
+/// `origin` is carried rather than derived because it is the one thing the
+/// response cannot tell you — limen's synthesized 502 and an upstream's own 502
+/// are identical on the wire. [`handle`]'s observation seam needs the
+/// distinction and must not guess it.
+struct Dispatched {
+    response: Response,
+    served: Upstream,
+    origin: ResponseOrigin,
+}
+
+impl Dispatched {
+    /// An upstream answered and limen relayed it.
+    fn relayed(response: Response, served: Upstream) -> Self {
+        Self {
+            response,
+            served,
+            origin: ResponseOrigin::Upstream,
+        }
+    }
+
+    /// An upstream was contacted and never answered; the status is limen's own.
+    fn silent(response: Response, served: Upstream) -> Self {
+        Self {
+            response,
+            served,
+            origin: ResponseOrigin::UpstreamSilent,
+        }
+    }
+
+    /// limen refused before contacting any upstream.
+    fn refused(response: Response, served: Upstream) -> Self {
+        Self {
+            response,
+            served,
+            origin: ResponseOrigin::Refused,
+        }
+    }
+}
+
 /// Proxy a matched request to its chosen primary (and, where configured, shadow
-/// or fail over). Returns the client response; the caller records metrics/logs.
+/// or fail over). Returns the client response; the caller records
+/// metrics/logs/observations.
 async fn dispatch(
     state: &AppState,
     route: &CompiledRoute,
@@ -116,7 +193,7 @@ async fn dispatch(
     body: Body,
     route_id: &str,
     request_id: &str,
-) -> (Response, Upstream) {
+) -> Dispatched {
     let upstream = decision.upstream;
     // `Some` only when a breaker-guarded `new` trial was admitted: we then own
     // the obligation to settle that reserved slot exactly once — `record` on a
@@ -141,7 +218,7 @@ async fn dispatch(
             "limen: upstream not configured\n",
         )
             .into_response();
-        return (resp, upstream);
+        return Dispatched::refused(resp, upstream);
     };
 
     // Build the upstream URL, refusing to forward a path we cannot represent
@@ -158,7 +235,7 @@ async fn dispatch(
             "limen: request path cannot be forwarded unchanged\n",
         )
             .into_response();
-        return (resp, upstream);
+        return Dispatched::refused(resp, upstream);
     };
     let timeout = Duration::from_millis(route.timeouts.primary_ms);
     let mut request_headers = filter_headers(&parts.headers, Direction::Request);
@@ -221,7 +298,7 @@ async fn dispatch(
         prepare_request_body(state, body, &parts.headers, planned).await
     else {
         release_breaker(&breaker);
-        return (unreadable_body(), upstream);
+        return Dispatched::refused(unreadable_body(), upstream);
     };
 
     // The timeout bounds time-to-response (connect + send + first byte), not the
@@ -238,7 +315,15 @@ async fn dispatch(
     match tokio::time::timeout(timeout, send).await {
         Ok(Ok(resp)) => {
             record_breaker(&breaker, !resp.status().is_server_error());
-            (primary_succeeded(state, shadow, resp).await, upstream)
+            // `primary_succeeded` reports the origin itself: it can still turn a
+            // 2xx upstream response into a synthesized 502 when the buffered
+            // body errors mid-read, and that response is not the route's.
+            let (response, origin) = primary_succeeded(state, shadow, resp).await;
+            Dispatched {
+                response,
+                served: upstream,
+                origin,
+            }
         }
         Ok(Err(error)) => {
             // A non-failover-safe failover route returns the new-side failure to
@@ -247,7 +332,7 @@ async fn dispatch(
             record_breaker(&breaker, false);
             prometheus::record_upstream_error(route_id, upstream);
             warn!(upstream = upstream.as_str(), %error, "upstream request failed");
-            (bad_gateway(), upstream)
+            Dispatched::silent(bad_gateway(), upstream)
         }
         Err(_elapsed) => {
             record_breaker(&breaker, false);
@@ -257,7 +342,7 @@ async fn dispatch(
                 timeout_ms = timeout.as_millis(),
                 "upstream did not respond before the primary timeout",
             );
-            (gateway_timeout(), upstream)
+            Dispatched::silent(gateway_timeout(), upstream)
         }
     }
 }
@@ -391,7 +476,7 @@ async fn failover_dispatch(
     headers: HeaderMap,
     body: Body,
     timeout: Duration,
-) -> (Response, Upstream) {
+) -> Dispatched {
     // Buffer the request body so it can be replayed. failover_safe is opt-in, so
     // an over-limit body that can't be buffered is rejected rather than sent
     // un-replayable.
@@ -406,7 +491,7 @@ async fn failover_dispatch(
                 "limen: request body too large to buffer for failover replay\n",
             )
                 .into_response();
-            return (resp, Upstream::New);
+            return Dispatched::refused(resp, Upstream::New);
         }
     };
 
@@ -440,7 +525,7 @@ async fn failover_dispatch(
             match body::buffer_or_stream(resp, state.request_body_limit()).await {
                 Buffered::Full(buffered) => {
                     record_breaker(breaker, true);
-                    return (
+                    return Dispatched::relayed(
                         response_from_parts(status, resp_headers, Body::from(buffered)),
                         Upstream::New,
                     );
@@ -450,7 +535,7 @@ async fn failover_dispatch(
                     // committed stream can't be replayed; relay as-is (the
                     // failover guarantee is header-level for such responses).
                     record_breaker(breaker, true);
-                    return (
+                    return Dispatched::relayed(
                         response_from_parts(status, resp_headers, streamed),
                         Upstream::New,
                     );
@@ -467,7 +552,7 @@ async fn failover_dispatch(
     record_breaker(breaker, false);
     warn!("new upstream failed; failing over to legacy");
     match send_buffered(state.client(), method, legacy_url, headers, bytes, timeout).await {
-        Ok(resp) => (relay_response(resp), Upstream::Legacy),
+        Ok(resp) => Dispatched::relayed(relay_response(resp), Upstream::Legacy),
         Err(error) => {
             if error.is_timeout() {
                 prometheus::record_upstream_timeout(route_id, Upstream::Legacy);
@@ -475,7 +560,7 @@ async fn failover_dispatch(
                 prometheus::record_upstream_error(route_id, Upstream::Legacy);
             }
             warn!(%error, "legacy failover also failed");
-            (bad_gateway(), Upstream::Legacy)
+            Dispatched::silent(bad_gateway(), Upstream::Legacy)
         }
     }
 }
@@ -503,15 +588,20 @@ async fn send_buffered(
 /// Handle a successful primary response: stream it directly, or — when the
 /// request is shadow-planned — buffer it (bounded) to both serve the client and
 /// compare against a fire-and-forget shadow to the new upstream.
+///
+/// Returns the response's [`ResponseOrigin`] alongside it, because a primary
+/// that answered can still leave the client with a response the upstream never
+/// sent: buffering for comparison can fail mid-body, and limen then serves its
+/// own 502.
 async fn primary_succeeded(
     state: &AppState,
     shadow: Option<ShadowRequest>,
     resp: reqwest::Response,
-) -> Response {
+) -> (Response, ResponseOrigin) {
     // No shadow planned, or shutdown began while the primary was in flight:
     // stream the primary straight through, no buffering, no comparison.
     let Some(shadow_req) = shadow.filter(|_| !state.is_shutting_down()) else {
-        return relay_response(resp);
+        return (relay_response(resp), ResponseOrigin::Upstream);
     };
     // Buffering the primary here adds bounded latency on the *sampled* fraction
     // of requests (the documented buffer-for-compare overhead, spec §12) — the
@@ -528,7 +618,7 @@ async fn primary_succeeded(
         // request body (an opted-in write holds up to `max_body_bytes`) —
         // before the client response, rather than at end of scope.
         drop(shadow_req);
-        return relay_response(resp);
+        return (relay_response(resp), ResponseOrigin::Upstream);
     };
 
     let status = resp.status();
@@ -554,7 +644,10 @@ async fn primary_succeeded(
                 legacy,
                 permit,
             );
-            response_from_parts(status, client_headers, Body::from(bytes))
+            (
+                response_from_parts(status, client_headers, Body::from(bytes)),
+                ResponseOrigin::Upstream,
+            )
         }
         Buffered::TooLarge(streamed) => {
             // The primary body is too large to buffer for comparison; serve it
@@ -566,12 +659,18 @@ async fn primary_succeeded(
             // buffered request body) before handing the client its response.
             drop(shadow_req);
             drop(permit);
-            response_from_parts(status, client_headers, streamed)
+            (
+                response_from_parts(status, client_headers, streamed),
+                ResponseOrigin::Upstream,
+            )
         }
         Buffered::Error => {
             drop(shadow_req);
             drop(permit);
-            bad_gateway()
+            // The upstream's 2xx is already recorded on the breaker, but the
+            // client gets limen's 502 — so the origin is not `Upstream`, or the
+            // profile would record a status the client never saw.
+            (bad_gateway(), ResponseOrigin::UpstreamSilent)
         }
     }
 }

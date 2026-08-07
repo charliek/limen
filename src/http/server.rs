@@ -21,7 +21,9 @@ use crate::flags::FlagProvider;
 use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
 use crate::http::proxy;
-use crate::observability::{prometheus, Fanout, MetricsObserver, ShadowObserver, SinkObserver};
+use crate::observability::{
+    prometheus, Fanout, MetricsObserver, ObserveRecorder, ShadowObserver, SinkObserver,
+};
 use crate::resilience::ShadowLimiter;
 use crate::routing::RouteTable;
 
@@ -38,6 +40,10 @@ struct Inner {
     observer: Arc<dyn ShadowObserver>,
     flags: Arc<dyn FlagProvider>,
     request_body_limit: usize,
+    /// The observe-mode recorder, present **only** when the `observe:` block
+    /// is configured. `Some` is the whole enablement signal, as with the
+    /// control plane's canary observer.
+    observe: Option<Arc<ObserveRecorder>>,
     shutting_down: AtomicBool,
 }
 
@@ -52,6 +58,7 @@ impl AppState {
         observer: Arc<dyn ShadowObserver>,
         flags: Arc<dyn FlagProvider>,
         request_body_limit: usize,
+        observe: Option<Arc<ObserveRecorder>>,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -61,6 +68,7 @@ impl AppState {
                 observer,
                 flags,
                 request_body_limit,
+                observe,
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -99,6 +107,12 @@ impl AppState {
     /// The hard cap on buffered request bodies (e.g. for failover replay).
     pub fn request_body_limit(&self) -> usize {
         self.inner.request_body_limit
+    }
+
+    /// The observe-mode recorder, or `None` when the `observe:` block is
+    /// absent — which is what the proxy's observation seam checks.
+    pub fn observe_recorder(&self) -> Option<&Arc<ObserveRecorder>> {
+        self.inner.observe.as_ref()
     }
 
     /// Whether shutdown has begun (shadows are not started during shutdown).
@@ -145,6 +159,15 @@ pub fn build_state_with_observer(
     let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
     let flags = crate::flags::build(&config.flags)?;
     let request_body_limit = config.server.request_body_limit_bytes as usize;
+    // Built from the *compiled* route table, so the profile's key set is
+    // exactly the routes that can match traffic — "never observed" and "no such
+    // route" stay distinguishable, and traffic can never add a key.
+    let observe = config.observe.map(|observe| {
+        Arc::new(ObserveRecorder::new(
+            observe,
+            routes.iter().map(|route| route.id.as_str()),
+        ))
+    });
     Ok(AppState::new(
         routes,
         client,
@@ -152,6 +175,7 @@ pub fn build_state_with_observer(
         observer,
         flags,
         request_body_limit,
+        observe,
     ))
 }
 
@@ -235,6 +259,18 @@ pub async fn serve_with_shutdown(
         // The *same* observer the shadow path publishes to (metrics + sink
         // fanout), so the canary rides the real pipeline end to end.
         control_state = control_state.with_sink_canary(state.observer());
+    }
+    if let Some(recorder) = state.observe_recorder() {
+        // Loud on purpose: observation is passive, but the profile it builds
+        // is a disclosure — route topology and query-parameter names, served
+        // on a control plane whose default bind is 0.0.0.0.
+        warn!(
+            "observe mode enabled — traffic is being profiled and GET /observe/profile discloses \
+             route topology and query-parameter names; bind the control plane to loopback"
+        );
+        // The *same* recorder the data plane writes to; handing it over is also
+        // what registers the profile route at all.
+        control_state = control_state.with_observe(recorder.clone());
     }
     let data_app = data_plane_router(state.clone());
     let control_app = control_plane_router(control_state, &config.metrics.path);

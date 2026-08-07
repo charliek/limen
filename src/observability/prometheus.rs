@@ -51,6 +51,8 @@ pub const DIFF_SINK_ENQUEUED_TOTAL: &str = "limen_diff_sink_enqueued_total";
 pub const DIFF_SINK_WRITTEN_TOTAL: &str = "limen_diff_sink_written_total";
 /// Mismatch records that never reached the file, by reason.
 pub const DIFF_SINK_DROPPED_TOTAL: &str = "limen_diff_sink_dropped_total";
+/// Requests profiled by observe mode, by route.
+pub const OBSERVE_OBSERVATIONS_TOTAL: &str = "limen_observe_observations_total";
 /// Circuit-breaker state by route/upstream (0 closed, 1 half-open, 2 open).
 pub const CIRCUIT_BREAKER_STATE: &str = "limen_circuit_breaker_state";
 /// Whether the flag provider is stale (1) or fresh (0).
@@ -267,8 +269,9 @@ pub fn diff_sink_dropped(reason: SinkDropReason) {
     counter!(DIFF_SINK_DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
-/// Touch every series a campaign verdict reads, so all of them render from the
-/// very first scrape.
+/// Touch every series limen's own typed gate tools read — a campaign verdict's
+/// pipeline counters and the in-flight gauge `suggest-routes` quiesces against
+/// — so all of them render from the very first scrape.
 ///
 /// A verdict tool must be able to tell "nothing happened" from "this binary has
 /// no such instrumentation", and lazily-registered metrics render those two
@@ -285,6 +288,36 @@ pub fn register_verdict_series() {
     // An absolute set, not an increment: this runs once at startup, before any
     // shadow can have taken the guard.
     gauge!(SHADOW_IN_FLIGHT).set(0.0);
+    // The client-request gauge is registered here for the same reason, on
+    // behalf of a different tool: `limen suggest-routes` quiesces against
+    // `limen_in_flight_requests` and refuses to read an absent series as zero,
+    // so a proxy that has served no request yet must still render it. Same
+    // startup-ordering argument — nothing can hold the guard this early.
+    gauge!(IN_FLIGHT).set(0.0);
+}
+
+/// One request was observed by observe mode (after its sampling gate), so this
+/// counts the same events the profile's `observations` field does.
+///
+/// The route id is the only label — the cardinality doctrine at the top of this
+/// module applies unchanged, and observe mode's richer material (paths, query
+/// names, content types) stays in the profile document where it is bounded per
+/// route, never in a label.
+pub fn observe_observation(route_id: &str) {
+    counter!(OBSERVE_OBSERVATIONS_TOTAL, "route" => route_id.to_string()).increment(1);
+}
+
+/// Touch the observe counter for every configured route, so a profiled fleet
+/// renders zeros rather than nothing.
+///
+/// Same reasoning as [`register_verdict_series`], applied per route: a lazily
+/// registered counter makes "the observer saw nothing on this route" and "this
+/// binary has no observe instrumentation" render identically, and the first is
+/// a finding while the second is a broken deployment.
+pub fn register_observe_series<'a>(route_ids: impl IntoIterator<Item = &'a str>) {
+    for route_id in route_ids {
+        counter!(OBSERVE_OBSERVATIONS_TOTAL, "route" => route_id.to_string()).increment(0);
+    }
 }
 
 /// Set the circuit-breaker state gauge for a route's new upstream.
@@ -333,6 +366,29 @@ mod tests {
             r#"limen_diff_sink_dropped_total{reason="io_error"} 0"#,
             r#"limen_diff_sink_dropped_total{reason="writer_gone"} 0"#,
             "limen_shadow_in_flight 0",
+            "limen_in_flight_requests 0",
+        ] {
+            assert!(
+                rendered.lines().any(|l| l == line),
+                "expected `{line}` in the exposition:\n{rendered}"
+            );
+        }
+    }
+
+    /// The observe counter must render at zero for every configured route
+    /// before any traffic — absence≠zero applied to the per-route series.
+    #[test]
+    fn registration_renders_the_observe_series_at_zero_per_route() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            register_observe_series(["alpha", "beta"]);
+        });
+        let rendered = handle.render();
+
+        for line in [
+            r#"limen_observe_observations_total{route="alpha"} 0"#,
+            r#"limen_observe_observations_total{route="beta"} 0"#,
         ] {
             assert!(
                 rendered.lines().any(|l| l == line),
