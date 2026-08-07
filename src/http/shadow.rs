@@ -26,7 +26,7 @@ use crate::contract::model::ComparisonRules;
 use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
 use crate::http::forwarded::X_LIMEN_SHADOW;
-use crate::observability::{ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
+use crate::observability::{prometheus, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
 use crate::resilience::ShadowPermit;
 use crate::routing::CompiledRoute;
 
@@ -147,7 +147,8 @@ pub fn plan(
 }
 
 /// Spawn the shadow dispatch + comparison as a fire-and-forget task. Holds the
-/// concurrency `permit` for the shadow's lifetime. Never blocks the caller.
+/// concurrency `permit` and the in-flight gauge for the shadow's lifetime.
+/// Never blocks the caller.
 pub fn spawn(
     client: UpstreamClient,
     observer: Arc<dyn ShadowObserver>,
@@ -162,9 +163,15 @@ pub fn spawn(
     let request_id = shadow.request_id.clone();
     let route_id = shadow.route_id.clone();
     let span = info_span!("shadow", %request_id, route = %route_id);
+    // Taken here, *before* the spawn, and moved into the task: the gauge is up
+    // from the moment the shadow is committed to, and comes down on every exit
+    // path including a panic unwind (RAII). A drain check reading this gauge
+    // must never see a window where a shadow exists but is not counted.
+    let in_flight = prometheus::shadow_in_flight();
     tokio::spawn(
         async move {
             let _permit = permit; // released when the shadow completes
+            let _in_flight = in_flight;
             run(&client, observer.as_ref(), shadow, legacy).await;
         }
         .instrument(span),

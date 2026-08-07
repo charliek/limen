@@ -9,7 +9,9 @@ use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Method, Request};
-use common::{config_from_yaml, parts, router, router_with_observer, send};
+use common::{
+    config_from_yaml, parts, router, router_with_observer, send, shadow_config, wait_until,
+};
 use limen::compare::result::ComparisonResult;
 use limen::observability::{
     Fanout, ShadowFailure, ShadowMeta, ShadowObserver, SinkObserver, SkipReason,
@@ -78,32 +80,6 @@ impl Capture {
     }
 }
 
-/// Poll `cond` until true, up to ~2s, so a fire-and-forget shadow task can run.
-async fn wait_until(cond: impl Fn() -> bool) {
-    for _ in 0..200 {
-        if cond() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    panic!("condition not met within timeout");
-}
-
-fn shadow_config(legacy: &str, new: &str, shadow_ms: u64) -> limen::config::model::Config {
-    config_from_yaml(&format!(
-        r#"
-routes:
-  - id: r
-    match: {{ methods: ["GET"], path_prefix: "/" }}
-    legacy_upstream: "{legacy}"
-    new_upstream: "{new}"
-    mode: shadow_legacy_primary
-    timeouts: {{ primary_ms: 2000, shadow_ms: {shadow_ms} }}
-    comparison: {{ enabled: true, sample_rate: 1.0, max_body_bytes: 262144 }}
-"#
-    ))
-}
-
 #[tokio::test]
 async fn shadow_match_client_gets_legacy_both_hit_no_diff() {
     let legacy = MockServer::start().await;
@@ -136,7 +112,7 @@ async fn shadow_match_client_gets_legacy_both_hit_no_diff() {
     assert_eq!(status, 200);
     assert_eq!(body, r#"{"a":1,"b":2}"#, "client is served the legacy body");
 
-    wait_until(|| !capture.comparisons().is_empty()).await;
+    wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     let (meta, result) = capture.comparisons().pop().unwrap();
     assert!(
         result.is_match(),
@@ -184,7 +160,7 @@ async fn shadow_mismatch_records_diff_client_unaffected() {
     assert_eq!(status, 200);
     assert_eq!(body, r#"{"name":"A"}"#, "client always gets legacy");
 
-    wait_until(|| !capture.comparisons().is_empty()).await;
+    wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     let (_meta, result) = capture.comparisons().pop().unwrap();
     assert!(!result.is_match());
     assert!(
@@ -229,7 +205,7 @@ async fn shadow_meta_carries_request_id_route_method_and_path() {
     let (status, _, _) = parts(resp).await;
     assert_eq!(status, 200);
 
-    wait_until(|| !capture.comparisons().is_empty()).await;
+    wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     let (meta, _result) = capture.comparisons().pop().unwrap();
     assert_eq!(
         meta.request_id, "client-sent-id-789",
@@ -305,7 +281,7 @@ routes:
             .ok()
             .filter(|s| !s.is_empty())
     };
-    wait_until(|| read_sink().is_some()).await;
+    wait_until("the sink file", || read_sink().is_some()).await;
 
     let contents = read_sink().unwrap();
     assert_eq!(contents.lines().count(), 1);
@@ -368,7 +344,7 @@ async fn diff_sink_writes_nothing_when_the_responses_match() {
     .await;
     assert_eq!(resp.status(), 200);
 
-    wait_until(|| !capture.comparisons().is_empty()).await;
+    wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     assert!(capture.comparisons()[0].1.is_match());
     assert!(!sink_dir.exists(), "a match must not create the sink dir");
 }
@@ -414,7 +390,7 @@ async fn shadow_timeout_does_not_affect_client() {
         "client should not wait on the shadow ({elapsed:?})"
     );
 
-    wait_until(|| !capture.failures().is_empty()).await;
+    wait_until("the shadow failure", || !capture.failures().is_empty()).await;
     assert_eq!(capture.failures(), vec!["timeout"]);
 }
 
@@ -464,7 +440,7 @@ routes:
         "full body must be served despite the limit"
     );
     // ...and the comparison is skipped (so the new upstream is not shadowed).
-    wait_until(|| !capture.skips().is_empty()).await;
+    wait_until("the skip", || !capture.skips().is_empty()).await;
     assert_eq!(
         capture.skips(),
         vec!["comparison_skipped:response_too_large"]
@@ -527,7 +503,7 @@ routes:
     assert_eq!(status, 201);
     assert_eq!(client_body, r#"{"id":1}"#, "client is served legacy");
 
-    wait_until(|| !capture.comparisons().is_empty()).await;
+    wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     let (meta, result) = capture.comparisons().pop().unwrap();
     assert!(result.is_match(), "{result:?}");
     assert_eq!(meta.method, Method::POST);

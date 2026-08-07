@@ -56,7 +56,7 @@ const HOP_BY_HOP: &[&str] = &[
 /// metric — and delegates the actual proxying to [`dispatch`], so those are
 /// recorded once on every path rather than at each return site.
 pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
-    let _in_flight = prometheus::InFlight::enter();
+    let _in_flight = prometheus::in_flight();
     let started = Instant::now();
     let (parts, body) = req.into_parts();
     let method = parts.method.clone();

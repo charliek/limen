@@ -180,6 +180,9 @@ pub async fn serve_with_shutdown(
     shutdown: impl std::future::Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let metrics_handle = prometheus::install();
+    // Immediately after installing the recorder, so the verdict series render on
+    // the very first scrape rather than only once traffic has produced one.
+    prometheus::register_verdict_series();
     let state = build_state(&config, base_dir)?;
 
     let data_addr: SocketAddr = config.server.listen_addr.parse().map_err(|e| {
