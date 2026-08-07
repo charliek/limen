@@ -269,8 +269,9 @@ pub fn diff_sink_dropped(reason: SinkDropReason) {
     counter!(DIFF_SINK_DROPPED_TOTAL, "reason" => reason.as_str()).increment(1);
 }
 
-/// Touch every series a campaign verdict reads, so all of them render from the
-/// very first scrape.
+/// Touch every series limen's own typed gate tools read — a campaign verdict's
+/// pipeline counters and the in-flight gauge `suggest-routes` quiesces against
+/// — so all of them render from the very first scrape.
 ///
 /// A verdict tool must be able to tell "nothing happened" from "this binary has
 /// no such instrumentation", and lazily-registered metrics render those two
@@ -287,6 +288,12 @@ pub fn register_verdict_series() {
     // An absolute set, not an increment: this runs once at startup, before any
     // shadow can have taken the guard.
     gauge!(SHADOW_IN_FLIGHT).set(0.0);
+    // The client-request gauge is registered here for the same reason, on
+    // behalf of a different tool: `limen suggest-routes` quiesces against
+    // `limen_in_flight_requests` and refuses to read an absent series as zero,
+    // so a proxy that has served no request yet must still render it. Same
+    // startup-ordering argument — nothing can hold the guard this early.
+    gauge!(IN_FLIGHT).set(0.0);
 }
 
 /// One request was observed by observe mode (after its sampling gate), so this
@@ -359,6 +366,7 @@ mod tests {
             r#"limen_diff_sink_dropped_total{reason="io_error"} 0"#,
             r#"limen_diff_sink_dropped_total{reason="writer_gone"} 0"#,
             "limen_shadow_in_flight 0",
+            "limen_in_flight_requests 0",
         ] {
             assert!(
                 rendered.lines().any(|l| l == line),

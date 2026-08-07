@@ -150,10 +150,30 @@ pub enum ResponseOrigin {
     Refused,
 }
 
-/// The whole profile: every configured route, zero-filled until observed.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+/// The whole profile: every configured route, zero-filled until observed,
+/// carrying the sample rate the recorder actually applied.
+///
+/// **Nothing here defaults.** The document is machine-produced and
+/// machine-consumed, so a missing field is a corrupt or truncated profile, not
+/// a field worth guessing: `deny_unknown_fields` alone would accept a partial
+/// object and silently zero-fill every danger signal the classifier reads
+/// (`set_cookie_reads`, `redirect_reads`, the overflow flags), which is the one
+/// direction a safety input must never fail in. Deny-unknown does not
+/// deny-missing, so the container defaults are absent by design.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ObserveProfile {
+    /// The `observe.sample_rate` this profile was recorded under.
+    ///
+    /// **The proxy that did the sampling is the authoritative source**, so the
+    /// rate travels with the document rather than being read from whatever
+    /// config a later tool is handed. `limen suggest-routes` refuses to
+    /// classify a sampled profile (its rule R0), and a rate taken from a
+    /// config the operator supplies is a rate a mismatched or hand-edited
+    /// config can misstate — the profile cannot corroborate it, so the safety
+    /// rule would be bypassable. It carries no clock and does not advance with
+    /// traffic, so it costs the byte-identity quiescence contract nothing.
+    pub sample_rate: f64,
     /// Per-route aggregates, keyed by route id. `BTreeMap` for canonical
     /// ordering — see the module docs on quiescence.
     pub routes: BTreeMap<String, RouteProfile>,
@@ -164,8 +184,14 @@ pub struct ObserveProfile {
 /// Every "reads only" field below is restricted to `GET`/`HEAD` requests: the
 /// classifier's question is whether a route's *reads* are safe to shadow, and a
 /// write's response says nothing about that.
+///
+/// Every field is required on the wire — see [`ObserveProfile`] for why a
+/// partially-written profile must fail to parse rather than read as a pristine
+/// route. `Default` remains for *Rust-side* construction (the recorder's
+/// zero-filled state and tests), which is a different question from what a
+/// document is allowed to omit.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct RouteProfile {
     /// Responses served on this route (after sampling), successes and failures
     /// alike, so this reconciles against `limen_requests_total`.
@@ -361,6 +387,9 @@ impl ObserveRecorder {
     pub fn profile(&self) -> ObserveProfile {
         let routes = self.routes.lock().unwrap_or_else(PoisonError::into_inner);
         ObserveProfile {
+            // Reported from the recorder's own config, which *is* the rate that
+            // was applied — not from any config a downstream tool is handed.
+            sample_rate: self.config.sample_rate,
             routes: routes
                 .iter()
                 .map(|(id, state)| (id.clone(), state.profile.clone()))
@@ -1260,6 +1289,35 @@ mod tests {
             first, second,
             "an idle profile must not change as time passes"
         );
+    }
+
+    #[test]
+    fn the_profile_reports_the_rate_the_recorder_applied() {
+        // The rate travels with the document because the recorder is the only
+        // party that knows it: a downstream tool handed a mismatched or
+        // hand-edited config would otherwise classify a sampled profile as a
+        // complete one, which is exactly what the classifier's R0 exists to
+        // refuse.
+        let rec = recorder(ObserveConfig {
+            sample_rate: 0.25,
+            ..ObserveConfig::default()
+        });
+        assert_eq!(rec.profile().sample_rate, 0.25);
+        assert_eq!(
+            recorder(ObserveConfig::default()).profile().sample_rate,
+            1.0
+        );
+    }
+
+    #[test]
+    fn a_partial_route_object_does_not_deserialize() {
+        // `deny_unknown_fields` does not deny *missing* fields, and a profile
+        // missing its danger signals would zero-fill into a pristine-looking
+        // route. Machine-produced input is read strictly.
+        let partial = r#"{"sample_rate":1.0,"routes":{"r":{"observations":3,"reads":3}}}"#;
+        assert!(serde_json::from_str::<ObserveProfile>(partial).is_err());
+        let no_rate = r#"{"routes":{}}"#;
+        assert!(serde_json::from_str::<ObserveProfile>(no_rate).is_err());
     }
 
     #[test]

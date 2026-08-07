@@ -8,6 +8,7 @@
 //! - `report` — summarize the mismatches a `diff_sink` directory has collected.
 //! - `verdict` — render a typed campaign verdict from the config, the live
 //!   control plane, and the sink (drain, floors, integrity, canary).
+//! - `suggest-routes` — classify an observe-mode profile into a draft config.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -19,7 +20,9 @@ use time::OffsetDateTime;
 
 use crate::config::{self, ConfigOverrides, LoadedConfig};
 use crate::contract::load as contract_load;
+use crate::draft::{self, DraftOptions, ProfileSource, SuggestOptions};
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
+use crate::suggest::{DEFAULT_MAX_COMPARE_PATHS, DEFAULT_MIN_SAMPLES};
 use crate::verdict;
 
 /// Limen — a migration proxy that safely shifts HTTP traffic from a legacy
@@ -48,6 +51,9 @@ pub enum Command {
     /// comparison floors, reconcile the sink against the engine's counters,
     /// and exit with a documented code (0/10/20/30/40/50).
     Verdict(VerdictArgs),
+    /// Classify an observe-mode profile into a draft configuration: what each
+    /// route's traffic suggests about comparing it, with the evidence.
+    SuggestRoutes(SuggestRoutesArgs),
 }
 
 /// Arguments shared by the config-oriented subcommands.
@@ -155,12 +161,72 @@ pub struct VerdictArgs {
     pub format: ReportFormat,
 }
 
+/// Arguments for `suggest-routes`. Like `verdict`, a config file is required:
+/// the route table it classifies and the control-plane address both come from
+/// it. The sample rate does **not** — that is read off the profile the proxy
+/// wrote, and the config's copy is only cross-checked against it.
+#[derive(Debug, Args)]
+pub struct SuggestRoutesArgs {
+    #[command(flatten)]
+    pub config: ConfigArgs,
+    /// Control-plane base URL override (default: derived from the config's
+    /// `metrics.listen_addr`, with wildcard hosts mapped to `127.0.0.1`).
+    #[arg(long, conflicts_with = "profile")]
+    pub control_url: Option<String>,
+    /// Classify a saved profile document instead of polling a running proxy —
+    /// the same JSON `GET /observe/profile` serves. No quiescence poll: a file
+    /// is already static.
+    #[arg(long)]
+    pub profile: Option<PathBuf>,
+    /// New upstream for routes that do not configure one. Without it such a
+    /// route is drafted `mode: legacy_only`, so the draft is valid whether or
+    /// not a `new` service exists yet.
+    #[arg(long)]
+    pub new_upstream: Option<String>,
+    /// Reads below which a route is not classified at all.
+    #[arg(long, default_value_t = DEFAULT_MIN_SAMPLES)]
+    pub min_samples: u64,
+    /// Distinct read paths above which a route is treated as a wildcard proxy.
+    #[arg(long, default_value_t = DEFAULT_MAX_COMPARE_PATHS)]
+    pub max_compare_paths: u64,
+    /// Emit the shadowing form (`comparison.enabled: true`) for suggested
+    /// routes.
+    ///
+    /// PRECONDITION: you have confirmed against the service's source that each
+    /// suggested route does not mutate. Observation cannot establish that — it
+    /// can prove a route unsafe to compare, never safe — so promotion is a
+    /// deliberate human act and this flag is where you take it.
+    #[arg(long)]
+    pub adopt_suggestions: bool,
+    /// Output format: the draft configuration, or the machine surface.
+    #[arg(long, value_enum, default_value_t = DraftFormat::Yaml)]
+    pub format: DraftFormat,
+    /// How long to wait for the profile to stop changing (ignored with
+    /// `--profile`).
+    #[arg(long, default_value_t = draft::DEFAULT_DRAIN_DEADLINE_MS)]
+    pub drain_deadline_ms: u64,
+    /// Interval between quiescence polls (ignored with `--profile`).
+    #[arg(long, default_value_t = draft::DEFAULT_POLL_INTERVAL_MS)]
+    pub poll_interval_ms: u64,
+}
+
+/// How `suggest-routes` renders its output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum DraftFormat {
+    /// A complete, loadable draft configuration document.
+    Yaml,
+    /// One `{route_id, disposition, reason, evidence}` object per route.
+    Json,
+}
+
 impl Cli {
-    /// Dispatch the parsed command. Only `verdict` uses exit codes beyond
-    /// success; every other command reports failure through `Err` (exit 1).
+    /// Dispatch the parsed command. Only `verdict` and `suggest-routes` use
+    /// exit codes beyond success; every other command reports failure through
+    /// `Err` (exit 1).
     pub async fn run(self) -> anyhow::Result<ExitCode> {
         match self.command {
             Command::Verdict(args) => return cmd_verdict(args).await,
+            Command::SuggestRoutes(args) => return cmd_suggest_routes(args).await,
             Command::Run(args) => cmd_run(args).await?,
             Command::ValidateConfig(args) => cmd_validate_config(args)?,
             Command::PrintRoutes(args) => cmd_print_routes(args)?,
@@ -432,6 +498,98 @@ fn render_unavailable(format: ReportFormat, detail: &str) -> anyhow::Result<Exit
     Ok(ExitCode::from(verdict::EXIT_INPUT_UNAVAILABLE))
 }
 
+async fn cmd_suggest_routes(args: SuggestRoutesArgs) -> anyhow::Result<ExitCode> {
+    let loaded = load_and_validate(&args.config)?;
+    let config = &loaded.config;
+
+    let source = match args.profile {
+        Some(path) => ProfileSource::File(path),
+        None => {
+            let base = args
+                .control_url
+                .map(|u| u.trim_end_matches('/').to_string())
+                .unwrap_or_else(|| {
+                    verdict::control_base_from_listen_addr(&config.metrics.listen_addr)
+                });
+            let metrics_path = if config.metrics.path.starts_with('/') {
+                config.metrics.path.clone()
+            } else {
+                format!("/{}", config.metrics.path)
+            };
+            ProfileSource::ControlPlane { base, metrics_path }
+        }
+    };
+
+    let opts = SuggestOptions {
+        source,
+        min_samples: args.min_samples,
+        max_compare_paths: args.max_compare_paths,
+        // The third threshold, the sample rate, is not passed here: it is read
+        // off the profile document the proxy wrote, and the config's copy is
+        // only cross-checked against it.
+        drain_deadline: Duration::from_millis(args.drain_deadline_ms),
+        poll_interval: Duration::from_millis(args.poll_interval_ms),
+    };
+    let draft_opts = DraftOptions {
+        new_upstream: args.new_upstream,
+        adopt: args.adopt_suggestions,
+        base_dir: loaded.base_dir.clone(),
+    };
+
+    let outcome = match draft::run_suggest_routes(config, &opts).await {
+        Ok(outcome) => outcome,
+        Err(e) => return suggest_failed(args.format, &e),
+    };
+
+    // The document goes to stdout so it can be redirected into a file;
+    // everything advisory goes to stderr so that redirection stays clean.
+    match args.format {
+        DraftFormat::Json => println!("{}", draft::render_json(&outcome.suggestions)?),
+        DraftFormat::Yaml => print!(
+            "{}",
+            draft::render_yaml(config, &outcome.suggestions, &draft_opts)?
+        ),
+    }
+    for warning in &outcome.warnings {
+        eprintln!("warning: {warning}");
+    }
+    // Only when a draft was actually emitted: `--adopt-suggestions` changes
+    // nothing about the JSON surface, and a note claiming comparison was
+    // enabled would be describing a document that does not exist.
+    if draft_opts.adopt && args.format == DraftFormat::Yaml {
+        eprintln!(
+            "note: --adopt-suggestions emitted comparison.enabled: true — every enabled route \
+             dispatches a shadow request. Confirm each against the service's source before \
+             running this draft."
+        );
+    }
+    Ok(ExitCode::from(outcome.exit_code))
+}
+
+/// Report a `suggest-routes` failure in the requested format, exiting with its
+/// typed code. Never a bare error: wrappers branch on 40 vs 50, and a draft
+/// that was never produced must not be mistaken for one that suggested nothing.
+fn suggest_failed(format: DraftFormat, error: &draft::SuggestError) -> anyhow::Result<ExitCode> {
+    let code = error.exit_code();
+    match format {
+        DraftFormat::Json => println!(
+            "{}",
+            serde_json::json!({
+                "outcome": error.name(),
+                "exit_code": code,
+                "error": error.to_string(),
+            })
+        ),
+        DraftFormat::Yaml => {
+            eprintln!("LIMEN SUGGEST-ROUTES FAILED: {}", error.name());
+            eprintln!("  {error}");
+            eprintln!("  No draft was emitted — this is a tooling failure, not a suggestion.");
+            eprintln!("  exit {code} — {}", error.name());
+        }
+    }
+    Ok(ExitCode::from(code))
+}
+
 /// The column width that fits every value (in characters, not bytes).
 fn width<'a>(values: impl Iterator<Item = &'a str>) -> usize {
     values.map(|v| v.chars().count()).max().unwrap_or(0)
@@ -597,6 +755,58 @@ mod tests {
         assert!(
             err.to_string().contains("definitely-not-a-sink-dir"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn suggest_routes_defaults_match_the_documented_vocabulary() {
+        match Cli::parse_from(["limen", "suggest-routes", "-c", "x.yaml"]).command {
+            Command::SuggestRoutes(args) => {
+                assert_eq!(args.format, DraftFormat::Yaml);
+                assert_eq!(args.min_samples, DEFAULT_MIN_SAMPLES);
+                assert_eq!(args.max_compare_paths, DEFAULT_MAX_COMPARE_PATHS);
+                assert_eq!(args.drain_deadline_ms, 2000);
+                assert_eq!(args.poll_interval_ms, 250);
+                // The default must be the non-shadowing draft: a flag that
+                // defaulted on would make promotion an accident.
+                assert!(!args.adopt_suggestions);
+                assert!(args.profile.is_none() && args.control_url.is_none());
+            }
+            _ => panic!("expected suggest-routes"),
+        }
+    }
+
+    #[test]
+    fn suggest_routes_refuses_both_profile_sources_at_once() {
+        // A saved file and a live proxy are different claims about what is
+        // being classified; silently preferring one would hide the other.
+        let err = Cli::try_parse_from([
+            "limen",
+            "suggest-routes",
+            "--profile",
+            "p.json",
+            "--control-url",
+            "http://127.0.0.1:9090",
+        ])
+        .unwrap_err();
+        assert_eq!(err.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn the_adopt_flag_states_its_precondition() {
+        let mut command = Cli::command();
+        let help = command.render_long_help().to_string();
+        let suggest = Cli::command()
+            .get_subcommands()
+            .find(|c| c.get_name() == "suggest-routes")
+            .expect("subcommand")
+            .clone()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("suggest-routes"));
+        assert!(
+            suggest.contains("PRECONDITION") && suggest.contains("does not mutate"),
+            "{suggest}"
         );
     }
 

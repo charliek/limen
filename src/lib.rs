@@ -24,11 +24,17 @@
 //! | [`observability`] | Metrics, structured logging, request-id propagation.     |
 //! | [`health`]      | `/health/live` and `/health/ready` endpoints + readiness.  |
 //! | [`error`]       | Top-level error types crossing module boundaries.          |
+//!
+//! Two modules sit outside that map because they implement operator commands
+//! rather than a data-plane concern: [`verdict`] (`limen verdict`) and the
+//! [`suggest`]/[`draft`] pair (`limen suggest-routes`), which classify an
+//! observe-mode profile and render a draft configuration from it.
 
 pub mod cli;
 pub mod compare;
 pub mod config;
 pub mod contract;
+pub mod draft;
 pub mod error;
 pub mod flags;
 pub mod health;

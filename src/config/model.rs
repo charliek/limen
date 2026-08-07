@@ -8,6 +8,15 @@
 //!
 //! Every field has a built-in default (spec §5.1), so a minimal config file
 //! parses and the missing fields fall back to safe values.
+//!
+//! These types are `Serialize` as well as `Deserialize` because
+//! [`crate::draft`] writes a configuration back out (`limen suggest-routes`).
+//! Optional fields and list fields therefore carry `skip_serializing_if`: an
+//! emitted document is meant to be read and edited by an operator, and a wall
+//! of `null`s and `[]`s is a document nobody reads. Serialization is *not* the
+//! loader's inverse in one respect — a `None` and an absent key both render as
+//! absent, which is exactly the round trip the loader's `#[serde(default)]`
+//! defines.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -35,19 +44,19 @@ pub struct Config {
     pub flags: FlagsConfig,
     /// Optional durable sink for comparison mismatches (spec §10.4). Absent =
     /// mismatches are counted and logged only.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diff_sink: Option<DiffSinkConfig>,
     /// The routing table.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
     /// Debug-only switches. Absent (the normal case) = every debug affordance
     /// is off; see [`DebugConfig`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub debug: Option<DebugConfig>,
     /// Passive traffic profiling. Absent (the normal case) = nothing is
     /// observed; declaring the block turns observation on, see
     /// [`ObserveConfig`].
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub observe: Option<ObserveConfig>,
 }
 
@@ -193,7 +202,7 @@ pub struct UpstreamTlsConfig {
     /// Verify upstream certificates (on by default).
     pub verify_certificates: bool,
     /// Optional custom CA bundle for internal PKI.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca_bundle_path: Option<PathBuf>,
 }
 
@@ -358,15 +367,15 @@ pub struct RouteConfig {
     /// What requests this route matches.
     pub r#match: RouteMatch,
     /// Legacy upstream base URL (required unless mode is `new_only`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_upstream: Option<String>,
     /// New upstream base URL (required unless mode is `legacy_only`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub new_upstream: Option<String>,
     /// The route mode.
     pub mode: RouteMode,
     /// Optional `path#routeId` contract reference for behavioral rules.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub contract: Option<String>,
     /// May this route auto-fail-over a failed in-flight request to legacy?
     /// Required to be `true` for `failover_to_legacy` with non-idempotent
@@ -374,7 +383,7 @@ pub struct RouteConfig {
     #[serde(default)]
     pub failover_safe: bool,
     /// Rollout settings (required for `percentage_split`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rollout: Option<RolloutConfig>,
     /// Per-route timeouts.
     #[serde(default)]
@@ -386,7 +395,7 @@ pub struct RouteConfig {
     #[serde(default)]
     pub circuit_breaker: CircuitBreakerConfig,
     /// Forward-looking rollout budget (documented, not enforced in MVP §12.1).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<BudgetConfig>,
 }
 
@@ -404,12 +413,12 @@ pub struct RouteMatch {
     /// unconditioned. Exists so a path whose hops are not equally safe to
     /// shadow can be split into a conditioned route that only relays and an
     /// unconditioned one that stays compared (spec §5.2).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub query_present: Vec<String>,
     /// Query parameter names of which **none** may be present for this route to
     /// match. Empty (the default) = unconditioned. A name may not appear in both
     /// `query_present` and `query_absent` (see [`super::validate`]).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub query_absent: Vec<String>,
 }
 
@@ -441,7 +450,7 @@ pub struct RolloutConfig {
 #[serde(deny_unknown_fields)]
 pub struct AssignmentKey {
     /// Header whose value is the assignment key.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub header: Option<String>,
     /// Fallback when the header is absent.
     pub fallback: AssignmentFallback,
@@ -494,7 +503,7 @@ pub struct ComparisonConfig {
     /// comparison-disabled route could never be met and refuses to start
     /// instead of silently vanishing from the verdict. Ignored by the proxy
     /// itself — this is a verdict-time expectation, not a runtime knob.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min_comparisons: Option<u64>,
     /// Write methods this route opts into shadowing (spec §6.1). Empty (the
     /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
@@ -503,25 +512,25 @@ pub struct ComparisonConfig {
     /// [`super::validate`]); an opted-in request's body is buffered once,
     /// bounded by `max_body_bytes`, and replayed byte-identically to both
     /// upstreams.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub shadow_methods: Vec<String>,
     /// Inline: compare HTTP status (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare_status: Option<bool>,
     /// Inline: compare normalized body (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare_body: Option<bool>,
     /// Inline: header names to compare (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compare_headers: Option<Vec<String>>,
     /// Inline: JSON normalization rules (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub json: Option<JsonRules>,
     /// Inline: `Set-Cookie` comparison (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub set_cookie: Option<SetCookieRules>,
     /// Inline: `Location` comparison (behavioral; conflicts with `contract`).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub location: Option<LocationRules>,
 }
 
