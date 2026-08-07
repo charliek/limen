@@ -20,6 +20,7 @@ use crate::config::model::{
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
+use crate::health::endpoints::CONTROL_PLANE_RESERVED_PATHS;
 use crate::observability::observe::OBSERVE_PROFILE_PATH;
 use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
@@ -118,6 +119,7 @@ pub fn validate(config: &Config, base_dir: &Path) -> Result<(), Vec<ValidationEr
     validate_tls(&config.upstream_tls, &mut errs);
     validate_flags(&config.flags, &mut errs);
     validate_diff_sink(config.diff_sink.as_ref(), &mut errs);
+    validate_metrics_path(&config.metrics, &mut errs);
     validate_observe(config.observe.as_ref(), &config.metrics, &mut errs);
 
     let mut seen_ids: HashSet<&str> = HashSet::new();
@@ -197,6 +199,28 @@ fn validate_diff_sink(sink: Option<&DiffSinkConfig>, errs: &mut Errors) {
     }
 }
 
+/// Reject an operator-supplied `metrics.path` that collides with any control-
+/// plane path the router registers unconditionally (`/health/live`,
+/// `/health/ready`, `/debug/canary`). axum panics at router *build* time on a
+/// duplicate route, so this is what turns that abort into a refuse-to-start
+/// (invariant 7). `/observe/profile` is *not* checked here — it is only
+/// registered when the observe block is present, so that collision is
+/// validated separately in [`validate_observe`], conditional on the same
+/// scoping the router uses.
+fn validate_metrics_path(metrics: &MetricsConfig, errs: &mut Errors) {
+    for reserved in CONTROL_PLANE_RESERVED_PATHS {
+        if metrics.path == *reserved {
+            errs.push(
+                "metrics.path",
+                format!(
+                    "{reserved:?} is a fixed control-plane path and cannot also serve metrics \
+                     — choose a different metrics.path"
+                ),
+            );
+        }
+    }
+}
+
 /// Validate the optional observe block. Absent = observation is off and there
 /// is nothing to check, including the path collision below — an operator who
 /// never asked to observe must not be told their metrics path is wrong.
@@ -218,10 +242,9 @@ fn validate_observe(observe: Option<&ObserveConfig>, metrics: &MetricsConfig, er
         }
     }
 
-    // The control plane registers the operator-supplied metrics path on the
-    // same router as the fixed profile path, and axum panics at router *build*
-    // time on a duplicate route. Rejecting the collision here is what turns
-    // that abort into a refuse-to-start (invariant 7).
+    // Same failure mode as `validate_metrics_path` (a router-build-time axum
+    // panic on a duplicate route), but this route only exists when observe
+    // does, so the check has to live here rather than in the unconditional set.
     if metrics.path == OBSERVE_PROFILE_PATH {
         errs.push(
             "metrics.path",
@@ -1617,5 +1640,27 @@ observe:
         // The same metrics path is fine with observation off — nothing else
         // claims the route.
         assert!(validate(&parse("metrics:\n  path: \"/observe/profile\"\n"), &base()).is_ok());
+    }
+
+    #[test]
+    fn metrics_path_cannot_collide_with_a_fixed_control_plane_route() {
+        // Unconditional, unlike the observe/profile check above: these three
+        // routes are always registered, so the collision must be caught with
+        // no observe block in play. Iterating the shared constant (rather than
+        // hardcoding the three literals) is what proves validation actually
+        // tracks the router instead of just agreeing with it today.
+        for path in CONTROL_PLANE_RESERVED_PATHS {
+            let errs = errors(&format!("metrics:\n  path: {path:?}\n"));
+            assert!(
+                errs.iter()
+                    .any(|e| e.location == "metrics.path" && e.message.contains(path)),
+                "{path}: {errs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ordinary_metrics_path_validates_clean() {
+        assert!(validate(&parse("metrics:\n  path: \"/metrics\"\n"), &base()).is_ok());
     }
 }

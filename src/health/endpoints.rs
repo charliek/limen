@@ -24,6 +24,30 @@ use crate::observability::{prometheus, ShadowMeta, ShadowObserver};
 use crate::routing::RouteTable;
 use crate::verdict::CANARY_ROUTE_ID;
 
+/// `/health/live` — see [`live`].
+pub const HEALTH_LIVE_PATH: &str = "/health/live";
+/// `/health/ready` — see [`ready`].
+pub const HEALTH_READY_PATH: &str = "/health/ready";
+/// `POST /debug/canary` — see [`debug_canary`].
+pub const DEBUG_CANARY_PATH: &str = "/debug/canary";
+
+/// Every path [`router`] always registers, regardless of config — i.e.
+/// everything but the operator-supplied `metrics_path`. Lives here (rather
+/// than in `config::validate`, the only other module that cares) because
+/// `router` is the thing making the promise; validation just needs to read
+/// it. [`router`] builds its fixed routes from these constants, and
+/// `config::validate` checks `metrics.path` against them, so the two cannot
+/// drift into the panic this was written to prevent — axum panics at router
+/// *build* time on a duplicate route, so a collision must be caught at
+/// config-validation time instead (invariant 7).
+///
+/// `/observe/profile` is deliberately not here: it is only registered when
+/// the observe block is present, so it stays a conditional check in
+/// `config::validate::validate_observe` against
+/// [`crate::observability::observe::OBSERVE_PROFILE_PATH`] directly.
+pub const CONTROL_PLANE_RESERVED_PATHS: &[&str] =
+    &[HEALTH_LIVE_PATH, HEALTH_READY_PATH, DEBUG_CANARY_PATH];
+
 /// Shared, cheaply-cloneable state for the control plane.
 #[derive(Clone)]
 pub struct ControlState {
@@ -176,10 +200,10 @@ async fn debug_canary(State(control): State<ControlState>, headers: HeaderMap) -
 /// `metrics_path`, and the debug canary (which 404s unless enabled).
 pub fn router(control: ControlState, metrics_path: &str) -> Router {
     Router::new()
-        .route("/health/live", get(live))
-        .route("/health/ready", get(ready))
+        .route(HEALTH_LIVE_PATH, get(live))
+        .route(HEALTH_READY_PATH, get(ready))
         .route(metrics_path, get(metrics))
-        .route("/debug/canary", post(debug_canary))
+        .route(DEBUG_CANARY_PATH, post(debug_canary))
         .with_state(control)
 }
 
