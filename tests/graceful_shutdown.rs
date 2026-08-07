@@ -2,45 +2,14 @@
 //! shutdown the proxy stops accepting new connections but lets an in-flight
 //! request finish within the drain window, then exits cleanly.
 
-use std::net::TcpListener as StdListener;
-use std::path::Path;
 use std::time::Duration;
 
 use limen::config::model::Config;
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-/// Grab a currently-free localhost port by binding to `:0` and releasing it.
-fn free_port() -> u16 {
-    StdListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
-/// Poll until the proxy actually serves a request. A bare TCP connect only
-/// proves the kernel completed a handshake into the accept backlog, which can
-/// succeed before the server is accepting — only a successful response proves
-/// the data plane is live.
-/// One outer deadline rather than a bounded attempt count: each attempt can
-/// itself block for the client's request timeout, so "100 attempts" would be an
-/// unpredictable ceiling rather than a bound.
-async fn wait_serving(client: &reqwest::Client, url: &str) {
-    let probing = async {
-        loop {
-            if let Ok(resp) = client.get(url).send().await {
-                if resp.status().is_success() {
-                    return;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(10), probing)
-        .await
-        .unwrap_or_else(|_| panic!("proxy did not start serving requests at {url}"));
-}
+mod common;
+use common::{free_port, spawn_proxy, wait_serving};
 
 #[tokio::test]
 async fn drains_in_flight_then_stops_accepting() {
@@ -92,13 +61,7 @@ routes:
     let inflight_client = reqwest::Client::new();
 
     // Drive shutdown from a oneshot rather than an OS signal.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    let server = tokio::spawn(async move {
-        limen::http::server::serve_with_shutdown(cfg, Path::new("."), async move {
-            let _ = rx.await;
-        })
-        .await
-    });
+    let (tx, server) = spawn_proxy(cfg);
 
     let url = format!("http://127.0.0.1:{data_port}/devices");
     wait_serving(&probe, &format!("http://127.0.0.1:{data_port}/__ready")).await;

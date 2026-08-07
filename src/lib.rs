@@ -36,5 +36,6 @@ pub mod http;
 pub mod observability;
 pub mod resilience;
 pub mod routing;
+pub mod verdict;
 
 pub use error::{Error, Result};

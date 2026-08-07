@@ -405,6 +405,13 @@ pub struct ComparisonConfig {
     pub sample_rate: f64,
     /// Skip comparison above this body size.
     pub max_body_bytes: u64,
+    /// Floor asserted by `limen verdict`: the minimum number of comparisons
+    /// this route must have recorded for a campaign verdict to count it as
+    /// exercised (spec §12.1's operator-checked-gate territory). `0` opts the
+    /// route out of the floor explicitly. Ignored by the proxy itself — this
+    /// is a verdict-time expectation, not a runtime behavior knob.
+    #[serde(default = "default_min_comparisons")]
+    pub min_comparisons: u64,
     /// Write methods this route opts into shadowing (spec §6.1). Empty (the
     /// default) keeps safety invariant 3 intact: only `GET`/`HEAD` reads are
     /// shadowed. Only `POST` may be listed today, and only on a
@@ -434,12 +441,17 @@ pub struct ComparisonConfig {
     pub location: Option<LocationRules>,
 }
 
+fn default_min_comparisons() -> u64 {
+    1
+}
+
 impl Default for ComparisonConfig {
     fn default() -> Self {
         Self {
             enabled: false,
             sample_rate: 0.0,
             max_body_bytes: 262_144,
+            min_comparisons: default_min_comparisons(),
             shadow_methods: Vec::new(),
             compare_status: None,
             compare_body: None,

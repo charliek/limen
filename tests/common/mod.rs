@@ -17,6 +17,58 @@ pub fn config_from_yaml(yaml: &str) -> Config {
     serde_yaml::from_str(yaml).expect("valid test config")
 }
 
+/// Grab a currently-free localhost port by binding to `:0` and releasing it.
+pub fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// Spawn a real bound proxy (data plane + control plane) for `config`. The
+/// returned sender triggers graceful shutdown — as does dropping it — and the
+/// handle carries `serve_with_shutdown`'s result. For the tests that bind
+/// ports rather than driving the router directly via `oneshot`.
+pub fn spawn_proxy(
+    config: Config,
+) -> (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::task::JoinHandle<anyhow::Result<()>>,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+    let handle = tokio::spawn(async move {
+        limen::http::server::serve_with_shutdown(config, std::path::Path::new("."), async move {
+            let _ = rx.await;
+        })
+        .await
+    });
+    (tx, handle)
+}
+
+/// Poll until the proxy actually serves a request. A bare TCP connect only
+/// proves the kernel completed a handshake into the accept backlog, which can
+/// succeed before the server is accepting — only a successful response proves
+/// the data plane is live.
+/// One outer deadline rather than a bounded attempt count: each attempt can
+/// itself block for the client's request timeout, so "100 attempts" would be an
+/// unpredictable ceiling rather than a bound.
+pub async fn wait_serving(client: &reqwest::Client, url: &str) {
+    let probing = async {
+        loop {
+            if let Ok(resp) = client.get(url).send().await {
+                if resp.status().is_success() {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(10), probing)
+        .await
+        .unwrap_or_else(|_| panic!("proxy did not start serving requests at {url}"));
+}
+
 /// A single `shadow_legacy_primary` route over the two upstreams, comparing
 /// every request — the shape every shadow-path test starts from.
 pub fn shadow_config(legacy: &str, new: &str, shadow_ms: u64) -> Config {
