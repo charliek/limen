@@ -62,6 +62,17 @@ pub const CANARY_ROUTE_ID: &str = "__limen_canary__";
 /// records (today: the sink canary).
 pub const RESERVED_ROUTE_ID_PREFIX: &str = "__";
 
+/// The series whose values this verdict's math rests on: watched for
+/// stability by the drain loop and validated as exact integers before any
+/// comparison trusts them.
+const WATCHED_SERIES: [&str; 5] = [
+    SHADOW_IN_FLIGHT,
+    DIFF_SINK_ENQUEUED_TOTAL,
+    DIFF_SINK_WRITTEN_TOTAL,
+    DIFF_SINK_DROPPED_TOTAL,
+    COMPARISONS_TOTAL,
+];
+
 // ---------------------------------------------------------------------------
 // Outcomes and errors
 // ---------------------------------------------------------------------------
@@ -217,16 +228,9 @@ impl Scrape {
     /// (latency histograms, client gauges) must not keep a quiescent pipeline
     /// reading "unstable" forever.
     fn stable_view(&self) -> BTreeMap<(String, String), f64> {
-        const WATCHED: [&str; 5] = [
-            SHADOW_IN_FLIGHT,
-            DIFF_SINK_ENQUEUED_TOTAL,
-            DIFF_SINK_WRITTEN_TOTAL,
-            DIFF_SINK_DROPPED_TOTAL,
-            COMPARISONS_TOTAL,
-        ];
         self.samples
             .iter()
-            .filter(|s| WATCHED.contains(&s.name.as_str()))
+            .filter(|s| WATCHED_SERIES.contains(&s.name.as_str()))
             .map(|s| {
                 let labels = s
                     .labels
@@ -765,6 +769,23 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
             resp.status()
         )));
     }
+    // Require the endpoint's own acknowledgment, not just a 2xx: a mis-aimed
+    // URL happily returning 200 for any POST must not count as an injection
+    // (adversarial review) — only limen's canary answers `"injected": true`.
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| InputUnavailable(format!("cannot read canary response from {url}: {e}")))?;
+    let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        InputUnavailable(format!(
+            "canary trigger at {url} returned a non-JSON body: {e}"
+        ))
+    })?;
+    if body.get("injected") != Some(&serde_json::Value::Bool(true)) {
+        return Err(InputUnavailable(format!(
+            "canary trigger at {url} did not acknowledge the injection (body: {body})"
+        )));
+    }
     Ok(())
 }
 
@@ -785,6 +806,22 @@ async fn drain(
                     "required series {series} absent from the scrape — the proxy is not \
                      exporting the verdict instrumentation (older binary?)"
                 )));
+            }
+        }
+        // Every count this verdict compares must be an exact integer: past
+        // 2^53 an f64 `==` can equate values that differ by one, which is
+        // precisely the discrepancy the integrity checks exist to catch
+        // (adversarial review). Validated once here so every downstream
+        // comparison and cast works on exact values.
+        for name in WATCHED_SERIES {
+            for sample in scrape.family(name) {
+                let v = sample.value;
+                if v.fract() != 0.0 || !(0.0..9_007_199_254_740_992.0).contains(&v) {
+                    return Err(InputUnavailable(format!(
+                        "series {name} carries a non-exact count ({v}) — refusing \
+                         float-imprecise integrity math"
+                    )));
+                }
             }
         }
         // Absence handled above, so these sums are all present.

@@ -19,6 +19,7 @@ use crate::config::model::{
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
+use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// Loads each distinct contract file at most once per `validate()` call. A
 /// contract typically holds many route entries, so without this the same file
@@ -234,6 +235,18 @@ fn validate_route<'a>(
 
     if route.id.trim().is_empty() {
         errs.push(format!("routes[{index}].id"), "must not be empty");
+    } else if route.id.starts_with(RESERVED_ROUTE_ID_PREFIX) {
+        // Reserved so limen's own records (today the debug sink canary, which
+        // writes under CANARY_ROUTE_ID) can never be confused with a real
+        // route's mismatches — `limen verdict` subtracts the namespace from
+        // its mismatch totals and floors.
+        errs.push(
+            format!("routes[{index}].id"),
+            format!(
+                "route ids starting with {RESERVED_ROUTE_ID_PREFIX:?} are reserved for \
+                 limen-internal records (e.g. {CANARY_ROUTE_ID:?}); rename the route"
+            ),
+        );
     } else if !seen_ids.insert(route.id.as_str()) {
         errs.push(
             format!("routes[{index}].id"),
@@ -834,6 +847,27 @@ routes:
         assert!(errs
             .iter()
             .any(|e| e.message.contains("duplicate route id")));
+    }
+
+    #[test]
+    fn reserved_route_id_prefix_is_rejected() {
+        // The canary id itself and any other `__` id: limen owns the namespace,
+        // so a verdict's "these are not real mismatches" subtraction is exact.
+        for id in ["__limen_canary__", "__anything"] {
+            let errs = errors(&format!(
+                r#"
+routes:
+  - id: {id}
+    match: {{ methods: ["GET"], path_prefix: "/a" }}
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#
+            ));
+            assert!(
+                errs.iter().any(|e| e.message.contains("reserved")),
+                "{id}: {errs:?}"
+            );
+        }
     }
 
     #[test]

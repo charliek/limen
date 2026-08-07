@@ -40,6 +40,33 @@ pub struct Config {
     /// The routing table.
     #[serde(default)]
     pub routes: Vec<RouteConfig>,
+    /// Debug-only switches. Absent (the normal case) = every debug affordance
+    /// is off; see [`DebugConfig`].
+    #[serde(default)]
+    pub debug: Option<DebugConfig>,
+}
+
+impl Config {
+    /// Whether the debug sink canary is enabled (absent block = off).
+    pub fn sink_canary_enabled(&self) -> bool {
+        self.debug.is_some_and(|d| d.sink_canary)
+    }
+}
+
+/// Debug-only switches, off unless the block is present and says otherwise.
+///
+/// These exist for proving the pipeline bites (`limen verdict --canary`), not
+/// for production operation — `limen run` logs a loud warning at startup when
+/// any of them is on. Deliberately config-gated rather than
+/// `cfg(debug_assertions)`- or feature-gated: campaign runners build limen
+/// `--release`, which is exactly where the proof has to work.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DebugConfig {
+    /// Expose `POST /debug/canary` on the control plane, which injects one
+    /// synthetic mismatch through the real compare → observer → sink pipeline
+    /// under the reserved route id `__limen_canary__`.
+    pub sink_canary: bool,
 }
 
 /// The durable mismatch sink (spec §10.4).
@@ -644,6 +671,26 @@ routes:
     #[test]
     fn unknown_top_level_key_rejected() {
         assert!(serde_yaml::from_str::<Config>("serer: {}").is_err());
+    }
+
+    #[test]
+    fn debug_block_is_absent_and_off_by_default() {
+        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.debug.is_none());
+        assert!(!cfg.sink_canary_enabled());
+        // An empty block is still off: only an explicit `true` enables it.
+        let cfg: Config = serde_yaml::from_str("debug: {}").unwrap();
+        assert_eq!(cfg.debug, Some(DebugConfig { sink_canary: false }));
+        assert!(!cfg.sink_canary_enabled());
+    }
+
+    #[test]
+    fn debug_sink_canary_parses_and_rejects_typos() {
+        let cfg: Config = serde_yaml::from_str("debug:\n  sink_canary: true\n").unwrap();
+        assert!(cfg.sink_canary_enabled());
+        // A misspelled debug switch must fail loudly rather than silently
+        // leaving the canary off — a runner would then "prove" nothing.
+        assert!(serde_yaml::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
     }
 
     #[test]
