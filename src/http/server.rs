@@ -236,6 +236,15 @@ pub async fn serve_with_shutdown(
         // fanout), so the canary rides the real pipeline end to end.
         control_state = control_state.with_sink_canary(state.observer());
     }
+    if config.observe_enabled() {
+        // Loud on purpose: observation is passive, but the profile it builds
+        // is a disclosure — route topology and query-parameter names, served
+        // on a control plane whose default bind is 0.0.0.0.
+        warn!(
+            "observe mode enabled — traffic is being profiled and GET /observe/profile discloses \
+             route topology and query-parameter names; bind the control plane to loopback"
+        );
+    }
     let data_app = data_plane_router(state.clone());
     let control_app = control_plane_router(control_state, &config.metrics.path);
 

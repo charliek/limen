@@ -15,10 +15,12 @@ use std::path::{Path, PathBuf};
 use crate::compare::jsonpath;
 use crate::config::model::{
     BudgetConfig, CircuitBreakerConfig, Config, DiffSinkConfig, FlagProviderKind, FlagsConfig,
-    RolloutConfig, RouteConfig, RouteMatch, RouteMode, TimeoutsConfig, UpstreamTlsConfig,
+    MetricsConfig, ObserveConfig, RolloutConfig, RouteConfig, RouteMatch, RouteMode,
+    TimeoutsConfig, UpstreamTlsConfig,
 };
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
+use crate::observability::observe::OBSERVE_PROFILE_PATH;
 use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// Loads each distinct contract file at most once per `validate()` call. A
@@ -116,6 +118,7 @@ pub fn validate(config: &Config, base_dir: &Path) -> Result<(), Vec<ValidationEr
     validate_tls(&config.upstream_tls, &mut errs);
     validate_flags(&config.flags, &mut errs);
     validate_diff_sink(config.diff_sink.as_ref(), &mut errs);
+    validate_observe(config.observe.as_ref(), &config.metrics, &mut errs);
 
     let mut seen_ids: HashSet<&str> = HashSet::new();
     let mut contracts = ContractCache::default();
@@ -191,6 +194,42 @@ fn validate_diff_sink(sink: Option<&DiffSinkConfig>, errs: &mut Errors) {
     let Some(sink) = sink else { return };
     if sink.dir.as_os_str().is_empty() {
         errs.push("diff_sink.dir", "must not be empty");
+    }
+}
+
+/// Validate the optional observe block. Absent = observation is off and there
+/// is nothing to check, including the path collision below — an operator who
+/// never asked to observe must not be told their metrics path is wrong.
+fn validate_observe(observe: Option<&ObserveConfig>, metrics: &MetricsConfig, errs: &mut Errors) {
+    let Some(observe) = observe else { return };
+
+    validate_fraction("observe.sample_rate".to_string(), observe.sample_rate, errs);
+
+    // Each bound caps a map keyed by live traffic, so `0` records nothing at
+    // all rather than meaning "no limit". An operator writing it expects a
+    // narrower profile, not an empty one.
+    for (field, value) in [
+        ("max_query_names", observe.max_query_names),
+        ("max_path_shapes", observe.max_path_shapes),
+        ("max_fingerprints", observe.max_fingerprints),
+    ] {
+        if value == 0 {
+            errs.push(format!("observe.{field}"), "must be greater than 0");
+        }
+    }
+
+    // The control plane registers the operator-supplied metrics path on the
+    // same router as the fixed profile path, and axum panics at router *build*
+    // time on a duplicate route. Rejecting the collision here is what turns
+    // that abort into a refuse-to-start (invariant 7).
+    if metrics.path == OBSERVE_PROFILE_PATH {
+        errs.push(
+            "metrics.path",
+            format!(
+                "{OBSERVE_PROFILE_PATH:?} is the observe profile endpoint and cannot also serve \
+                 metrics — move metrics.path or remove the observe block"
+            ),
+        );
     }
 }
 
@@ -1528,5 +1567,55 @@ routes:
         let bad = good.replace("#get", "#missing");
         let errs = validate(&parse(&bad), dir.path()).unwrap_err();
         assert!(errs.iter().any(|e| e.message.contains("no route")));
+    }
+
+    #[test]
+    fn valid_observe_block_passes() {
+        assert!(validate(&parse("observe: {}"), &base()).is_ok());
+        assert!(validate(
+            &parse("observe:\n  sample_rate: 0.5\n  max_query_names: 8\n"),
+            &base()
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn observe_sample_rate_out_of_range_is_caught() {
+        for rate in ["-0.1", "1.5"] {
+            let errs = errors(&format!("observe:\n  sample_rate: {rate}\n"));
+            assert!(locations(&errs).contains(&"observe.sample_rate"));
+        }
+    }
+
+    #[test]
+    fn observe_zero_bounds_are_caught() {
+        // All three accumulate: a config with three mistakes reports three.
+        let errs = errors(
+            r#"
+observe:
+  max_query_names: 0
+  max_path_shapes: 0
+  max_fingerprints: 0
+"#,
+        );
+        for field in [
+            "observe.max_query_names",
+            "observe.max_path_shapes",
+            "observe.max_fingerprints",
+        ] {
+            assert!(locations(&errs).contains(&field), "{field}");
+        }
+    }
+
+    #[test]
+    fn observe_profile_path_cannot_also_serve_metrics() {
+        // Without this the duplicate route panics inside axum's router build.
+        let errs = errors("observe: {}\nmetrics:\n  path: \"/observe/profile\"\n");
+        assert!(errs
+            .iter()
+            .any(|e| e.location == "metrics.path" && e.message.contains("/observe/profile")));
+        // The same metrics path is fine with observation off — nothing else
+        // claims the route.
+        assert!(validate(&parse("metrics:\n  path: \"/observe/profile\"\n"), &base()).is_ok());
     }
 }

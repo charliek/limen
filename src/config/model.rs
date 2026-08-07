@@ -44,12 +44,23 @@ pub struct Config {
     /// is off; see [`DebugConfig`].
     #[serde(default)]
     pub debug: Option<DebugConfig>,
+    /// Passive traffic profiling. Absent (the normal case) = nothing is
+    /// observed; declaring the block turns observation on, see
+    /// [`ObserveConfig`].
+    #[serde(default)]
+    pub observe: Option<ObserveConfig>,
 }
 
 impl Config {
     /// Whether the debug sink canary is enabled (absent block = off).
     pub fn sink_canary_enabled(&self) -> bool {
         self.debug.is_some_and(|d| d.sink_canary)
+    }
+
+    /// Whether observe mode is on. Presence of the block is the whole switch —
+    /// there is no `enabled` field to disagree with it.
+    pub fn observe_enabled(&self) -> bool {
+        self.observe.is_some()
     }
 }
 
@@ -67,6 +78,48 @@ pub struct DebugConfig {
     /// synthetic mismatch through the real compare → observer → sink pipeline
     /// under the reserved route id `__limen_canary__`.
     pub sink_canary: bool,
+}
+
+/// Observe mode: a bounded, strictly passive profile of the traffic Limen
+/// already relays.
+///
+/// Declaring the block turns observation on; there is nothing to enable
+/// separately, and — like [`DebugConfig`] — `limen run` logs a warning at
+/// startup while it is on, because the profile discloses route topology and
+/// query-parameter names on the control plane. Observation is orthogonal to
+/// routing: it reads the primary response's metadata (never a body byte,
+/// never a second upstream contact), so it is legal under every route mode
+/// and needs no `new` upstream to exist.
+///
+/// The three caps are per configured route, and each bounds a map whose keys
+/// come from live traffic — unbounded, any of them would be a memory
+/// amplifier a client could drive.
+#[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ObserveConfig {
+    /// Fraction of relayed responses to observe (0–1).
+    pub sample_rate: f64,
+    /// Cap on the distinct query-parameter *names* recorded per route. Names
+    /// only — a value is never read, so nothing redaction covers can reach the
+    /// profile.
+    pub max_query_names: usize,
+    /// Cap on the set backing a route's distinct-read-path *count*. Paths are
+    /// counted, never emitted.
+    pub max_path_shapes: usize,
+    /// Cap on the request fingerprints a route keeps for the response
+    /// -stability signal.
+    pub max_fingerprints: usize,
+}
+
+impl Default for ObserveConfig {
+    fn default() -> Self {
+        Self {
+            sample_rate: 1.0,
+            max_query_names: 32,
+            max_path_shapes: 32,
+            max_fingerprints: 32,
+        }
+    }
 }
 
 /// The durable mismatch sink (spec §10.4).
@@ -698,6 +751,36 @@ routes:
         // A misspelled debug switch must fail loudly rather than silently
         // leaving the canary off — a runner would then "prove" nothing.
         assert!(serde_yaml::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
+    }
+
+    #[test]
+    fn observe_block_is_absent_by_default() {
+        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        assert!(cfg.observe.is_none());
+        assert!(!cfg.observe_enabled());
+        // An empty block is still on: presence is the switch, so the bare
+        // `observe: {}` an operator is most likely to write must observe with
+        // the built-in bounds rather than do nothing.
+        let cfg: Config = serde_yaml::from_str("observe: {}").unwrap();
+        assert_eq!(cfg.observe, Some(ObserveConfig::default()));
+        assert!(cfg.observe_enabled());
+    }
+
+    #[test]
+    fn observe_partial_block_fills_remaining_defaults() {
+        let cfg: Config = serde_yaml::from_str("observe:\n  sample_rate: 0.25\n").unwrap();
+        let observe = cfg.observe.unwrap();
+        assert_eq!(observe.sample_rate, 0.25);
+        assert_eq!(observe.max_query_names, 32);
+        assert_eq!(observe.max_path_shapes, 32);
+        assert_eq!(observe.max_fingerprints, 32);
+    }
+
+    #[test]
+    fn observe_block_rejects_typos() {
+        // A misspelled bound must fail loudly: silently defaulting it back to
+        // 32 would leave an operator believing they had raised a cap.
+        assert!(serde_yaml::from_str::<Config>("observe:\n  max_query_name: 64\n").is_err());
     }
 
     #[test]
