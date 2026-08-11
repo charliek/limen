@@ -89,11 +89,20 @@ returning a stable `200` looks exactly like `GET /orders/42` from outside and is
 is blind to sub-path aliasing too (a prefix route folds every path beneath it into one profile), so never
 widen a `path_prefix` to make more traffic land in one class.
 
+**No source to read** (closed binary, vendor service)? Then that precondition cannot be met:
+leave the route at the draft's disposition or demote it further, and let a Pharos scenario
+against a non-production environment establish what reading the handler would have — absence of
+source is ambiguity, and ambiguity fails toward relay-only.
+
 → [classifying routes](https://charliek.github.io/limen/guides/classifying-routes/) · [the class taxonomy](https://charliek.github.io/limen/guides/classifying-routes/#the-class-taxonomy) · [what observation can and cannot tell you](https://charliek.github.io/limen/guides/classifying-routes/#what-observation-can-and-cannot-tell-you) · [why the default draft shadows nothing](https://charliek.github.io/limen/guides/observe-mode/#5-why-the-default-draft-shadows-nothing)
 
 ## 4. Shadow-compare — only on the routes that earned it
 
 Legacy still serves every client; the shadow leg is fire-and-forget off the client path.
+To rehearse the mechanics before a real `new` exists, point `new_upstream` at the *legacy*
+host: every comparison should match, and the sink canary still proves the recording pipeline.
+The `observe:` block can stay on during shadowing (it is passive either way); remove it when
+you no longer want profiling.
 
 ```yaml
 routes:
