@@ -35,6 +35,14 @@ user-facing behavior. It can:
 - **Fail safe** to legacy whenever anything is uncertain — new upstream
   unhealthy, circuit open, flags stale, config ambiguous.
 
+Nothing about this is tied to a language or a framework: the migration target
+fleet is **language-agnostic HTTP**, and the first wave is Kotlin/Java services
+on Ratpack moving to Rust or to Kotlin Spring Boot. Either side of the crossing
+can be written in anything that speaks plain HTTP request/response over
+HTTP/1.1 or HTTP/2 — Limen neither knows nor cares which. (Upgrade-based
+protocols are the boundary: a WebSocket handshake is not proxied — see
+[deployment](docs/guides/deployment.md).)
+
 It is the runtime half of a two-tool migration approach; the
 [Pharos](docs/pharos_spec.md) functional test suite is the deterministic,
 pre-production half. The two share a [behavioral contract](docs/limen_spec.md)
@@ -112,14 +120,20 @@ limen run --config limen.config.yaml         # serve (data + control planes)
 limen validate-config -c limen.config.yaml   # semantic validation
 limen print-routes -c limen.config.yaml      # resolved routing table
 limen check-contract path/to.contract.yaml   # validate a behavioral contract
+limen suggest-routes -c limen.config.yaml    # classify an observe profile into a draft config
 limen report --dir ./limen-diffs             # summarize a diff_sink directory
+limen report --dir ./limen-diffs --format html --out status.html
+                                             # one self-contained status page over a campaign
+limen verdict -c limen.config.yaml           # typed campaign verdict (exit 0/10/20/30/40/50)
 ```
 
 Configuration is layered (defaults < file < environment < CLI). See the
 [configuration reference](docs/reference/config-reference.md) and the example
-config under `config/`. `report` needs no config file — it reads the
-[`diff_sink`](docs/reference/config-reference.md#diff_sink) directory directly;
-see the [CLI reference](docs/reference/cli.md#report).
+config under `config/`. The text forms of `report` need no config file — they
+read the [`diff_sink`](docs/reference/config-reference.md#diff_sink) directory
+directly; `--format html` optionally joins the config and a captured verdict,
+profile, and metrics scrape into one page. See the [CLI
+reference](docs/reference/cli.md#report).
 
 ## Performance
 
@@ -149,8 +163,12 @@ The full site lives under `docs/` and builds with [Zensical](https://zensical.or
 (`mise exec -- make docs-serve` → http://127.0.0.1:7071):
 
 - **Getting started** — installation, quickstart
-- **Guides** — comparison & contracts, flags & rollout, resilience & failover,
-  observability & operations, deployment
+- **Guides** — [classifying routes](docs/guides/classifying-routes.md) (which
+  routes may be compared at all), [observe mode](docs/guides/observe-mode.md)
+  (profile traffic, then draft a config from it), comparison & contracts,
+  flags & rollout, resilience & failover, observability & operations, [prove
+  your lens bites](docs/guides/prove-your-lens-bites.md) (turning a clean
+  verdict into evidence), deployment
 - **Reference** — architecture, CLI, config, contract
 - **Specifications** — the full Limen spec, the migration runbook, and the
   PR/FAQ that motivate the design

@@ -222,6 +222,13 @@ async fn run(
         Buffered::TooLarge(_) => {
             return observer.comparison_skipped(&meta, SkipReason::ResponseTooLarge);
         }
+        // Unreachable today: the shadow leg passes no buffering deadline
+        // because the total request timeout above already bounds it. Labeled
+        // for what it is rather than folded into the over-limit skip, so it
+        // stays honest if this leg ever does take one.
+        Buffered::TimedOut(_) => {
+            return observer.comparison_skipped(&meta, SkipReason::ResponseBufferTimeout);
+        }
         // Includes the total timeout firing mid-body: the stream errors and the
         // permit is released here.
         Buffered::Error => return observer.shadow_failed(&meta, ShadowFailure::Error),

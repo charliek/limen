@@ -19,6 +19,9 @@ __pycache__/
 # Local runtime state
 /flags.local.yaml
 
+# Local secrets / env overrides
+.env*
+
 # Editor / OS
 .DS_Store
 .idea/
@@ -26,5 +29,8 @@ __pycache__/
 *.swp
 *~
 
-# Claude Code local state
-.claude/
+# Claude Code local state -- everything except the checked-in skills. git never
+# descends into an excluded directory, so `.claude/` itself must stay
+# un-excluded and the exclusion applied to its contents instead.
+/.claude/*
+!/.claude/skills/

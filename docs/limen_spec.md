@@ -39,7 +39,7 @@ The two share a **behavioral contract** (Section 4) but are independently deploy
 - Protocols beyond HTTP/1.1 and HTTP/2 over TCP. No gRPC, no WebSockets, no GraphQL-specific handling in MVP.
 - Dual-writing or reconciling production *data*. Limen shadows reads (and, only where a route explicitly opts a method in, replays a write to the new upstream for comparison); it never reconciles data between the two implementations.
 - Hot-reloading of behavioral comparison rules mid-run (flag *values* hot-reload; comparison *semantics* are fixed for the duration of a run — see Section 4.4).
-- A web UI.
+- A web UI. `limen report --format html` is not one: it renders a single self-contained static page from artifacts that already exist on disk — no server, no JavaScript, no external references, nothing live — so it is a report artifact in a second format, not a dashboard and not a UI.
 
 ### 1.3 Assumed migration pattern
 
@@ -110,7 +110,7 @@ This is a central design decision. Limen has **two deliberately separate code pa
 
 1. **Streaming path (default).** Used when a route has comparison disabled, or when a request is not selected for comparison sampling. Request and response bodies are **streamed** between client and upstream without full buffering. Limen observes only status, headers, and latency. Lowest overhead; unbounded body size is fine. This is the path most production traffic should take.
 
-2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client. The *request* body is buffered under the same bound only for a write the route opted into shadowing (Section 6.1), so the shadow can replay identical bytes; over that limit → shadowing is skipped with reason `request_too_large` and the request body streams to the primary unchanged.
+2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client. It is bounded in **time** by the same `primary_ms` budget as the send that preceded it — one absolute per-request deadline covering send-to-headers *and* this buffering — so on expiry the response demotes to streaming with comparison skipped (`response_buffer_timeout`) rather than holding the client's first byte for a body that trickles. A `text/event-stream` response skips comparison eagerly (`event_stream`) before a byte is buffered, since an event stream never completes and buffering one could only ever end at that deadline. The *request* body is buffered under the same bound only for a write the route opted into shadowing (Section 6.1), so the shadow can replay identical bytes; over that limit → shadowing is skipped with reason `request_too_large` and the request body streams to the primary unchanged.
 
 The sampling decision is made **per request**, before buffering, so that on a route with `sample_rate: 0.1` you pay buffering cost on ~10% of traffic and stream the other ~90%.
 
@@ -145,8 +145,13 @@ limen/
       example-service.contract.yaml
   src/
     main.rs                 # bootstrap, signal handling, listener wiring
-    cli.rs                  # clap subcommands: run, validate-config, print-routes, check-contract, report
+    cli.rs                  # clap subcommands: run, validate-config, print-routes,
+                            #   check-contract, report, verdict, suggest-routes
     error.rs                # top-level error types
+    verdict.rs              # `limen verdict`: drain, floors, sink integrity, canary (§12.1)
+    suggest.rs              # observe-profile → per-route classification
+    draft.rs                # `limen suggest-routes`: draft config emission
+    report_html.rs          # `limen report --format html`: fail-closed status page (§10.4)
     config/
       mod.rs
       model.rs              # serde structs for limen.config.yaml
@@ -188,9 +193,11 @@ limen/
       headers.rs            # set_cookie/location comparison dimensions (§4.2)
     observability/
       mod.rs
-      metrics.rs            # metric definitions + registration
+      metrics.rs            # observer traits + metric event vocabulary
+      prometheus.rs         # metric definitions, labels, exposition rendering
       logging.rs            # tracing setup, structured fields
       request_id.rs         # request/trace id extraction + propagation
+      observe.rs            # observe mode: passive per-route traffic profiling
       sink.rs               # durable mismatch diff sink + `limen report` (§10.4)
     resilience/
       mod.rs
@@ -824,7 +831,7 @@ A global and/or per-route limit on concurrent in-flight shadow requests. When ex
 
 ### 9.4 Bounded buffers
 
-All buffering (request bodies, comparison buffering) is bounded by configured limits. The proxy must never buffer unbounded data; over-limit bodies fall back to streaming with comparison skipped.
+All buffering (request bodies, comparison buffering) is bounded by configured limits. The proxy must never buffer unbounded data; over-limit bodies fall back to streaming with comparison skipped. Comparison buffering of the primary response is additionally bounded in **time**: it draws down the same absolute `primary_ms` budget as the send that preceded it (Section 3.3), and an expiry demotes to the same streaming fallback with reason `response_buffer_timeout` — a bound on size alone would still let a trickling body hold the client's first byte indefinitely.
 
 ---
 
@@ -843,7 +850,7 @@ Required metrics (avoid high-cardinality labels — **no** user IDs, tenant IDs,
 - Comparison attempted count.
 - Comparison match count.
 - Comparison mismatch count.
-- Comparison skipped count by reason (`response_too_large`, `not_sampled`, `non_json`, …).
+- Comparison skipped count by reason (`response_too_large`, `event_stream`, `response_buffer_timeout`) — a shadow that was planned but whose comparison could not complete. A request the sampler never selected makes no shadow plan at all and is therefore counted in neither this series nor the shadow-skip one; comparison coverage follows from `sample_rate` and eligible request volume, not from a skip count.
 - Diff sampled count.
 - Circuit-breaker state by route and upstream.
 - Feature-flag provider health.
@@ -901,10 +908,29 @@ Behavior:
 `limen report` aggregates a sink directory without needing the proxy's configuration:
 
 ```bash
-limen report --dir ./limen-diffs [--route <id>] [--since <RFC3339>] [--format human|json]
+limen report --dir ./limen-diffs [--route <id>] [--since <RFC3339>] [--format human|json] [--out <path>]
 ```
 
-It reads every `mismatches-*.jsonl` file in the directory, applies the filters, and prints per-route mismatch counts (total and by `mismatch_kinds`) plus the most recent examples per route. Unparseable lines are **counted and reported**, never fatal — a record torn by a killed process must not cost you the rest of the report. Unknown fields are ignored, so a directory written by a newer Limen still reports against an older binary.
+It reads every `mismatches-*.jsonl` file in the directory, applies the filters, and prints per-route mismatch counts (total and by `mismatch_kinds`) plus the most recent examples per route. Unparseable lines are **counted and reported**, never fatal — a record torn by a killed process must not cost you the rest of the report. Unknown fields are ignored, so a directory written by a newer Limen still reports against an older binary. Output goes to stdout unless `--out` names a file.
+
+#### `--format html`: the campaign status page
+
+The third format renders a self-contained HTML page over a whole campaign's artifacts rather than the sink alone:
+
+```bash
+limen report --dir ./limen-diffs --format html \
+  [--config limen.config.yaml] [--verdict verdict.json] \
+  [--profile profile.json] [--metrics metrics.txt] [--out report.html]
+```
+
+Each optional input is a file that already exists — the config the campaign ran under, a document captured from `limen verdict --format json`, a saved `GET /observe/profile` body, a saved `/metrics` scrape. The page runs nothing and contacts nothing; `--dir` alone still works, and everything not given is rendered as "not provided".
+
+Its defining property is negative: **it must be unable to render a failure or a missing input as success.** The banner has three states — CLEAN, INCOMPLETE, FAILURE — and reaching CLEAN requires the sink directory, `--config` and `--verdict` all present and parsed, every *provided* optional input parsed, a self-consistent verdict that exited 0 online, and no disagreement between artifacts. Sink counts are reconciled against the verdict's per-route map, canary records against its `canary_records`, and verdict floors against the config's `effective_min_comparisons()`; any disagreement is a named finding and a FAILURE. Where the page reads an input `limen verdict` also reads, it takes the same position on it — including which metric families may legitimately be absent (§12.1's required series are required here too; the lazily-registered ones are not).
+
+Two rules follow from that property:
+
+- **`--route` and `--since` are refused with `--format html`** (exit 1). Both filter records *before* aggregation, so a filtered page could reconcile a dirty sink to zero and render green.
+- **Producing the page is exit 0 even when every section of it is a failure.** A CI artifact that vanishes on a bad run is one nobody looks at. Only a page that could not be produced — an unwritable `--out`, an incoherent flag combination — is exit 1; an unreadable *input* is a section of the page, not a process failure.
 
 ---
 

@@ -13,7 +13,7 @@ limen <COMMAND> [OPTIONS]
 | `validate-config` | Semantically validate a configuration file. |
 | `print-routes` | Print the resolved routing table for a configuration. |
 | `check-contract` | Validate a behavioral contract and its JSONPath compliance. |
-| `report` | Summarize the mismatches collected in a `diff_sink` directory. |
+| `report` | Summarize the mismatches collected in a `diff_sink` directory, as text or as one self-contained HTML status page. |
 | `verdict` | Render a typed campaign verdict from the config, the live control plane, and the sink. |
 | `suggest-routes` | Classify an observe-mode profile into a draft route configuration. |
 
@@ -73,19 +73,27 @@ before wiring it into a route. It produces the **same** verdict Pharos's
 limen report --dir ./limen-diffs
 limen report --dir ./limen-diffs --route get-device --since 2026-07-28T00:00:00Z
 limen report --dir ./limen-diffs --format json | jq '.routes[] | {route_id, count}'
+limen report --dir ./campaign-diffs --format html --out status.html \
+  --verdict verdict.json --config campaign.config.yaml \
+  --profile profile.json --metrics metrics.txt
 ```
 
 | Option | Default | Description |
 |---|---|---|
 | `--dir <PATH>` | — | **Required.** The [`diff_sink.dir`](config-reference.md#diff_sink) directory to read. |
-| `--route <ID>` | all routes | Only report this route id. |
-| `--since <RFC3339>` | all time | Only mismatches at or after this instant (offsets honored, e.g. `2026-07-28T12:00:05+02:00`). |
-| `--format <human\|json>` | `human` | `human` prints an aligned summary; `json` prints one document. |
+| `--route <ID>` | all routes | Only report this route id. Refused with `--format html`. |
+| `--since <RFC3339>` | all time | Only mismatches at or after this instant (offsets honored, e.g. `2026-07-28T12:00:05+02:00`). Refused with `--format html`. |
+| `--config <PATH>` | — | **`html` only.** The limen configuration the campaign ran under — the route table and effective floors the other artifacts are cross-checked against. |
+| `--verdict <PATH>` | — | **`html` only.** A file captured from [`limen verdict --format json`](#verdict). |
+| `--profile <PATH>` | — | **`html` only.** A saved `GET /observe/profile` body (see [observe mode](../guides/observe-mode.md)). |
+| `--metrics <PATH>` | — | **`html` only.** A saved `metrics.path` text scrape. |
+| `--out <PATH>` | stdout | Write the rendered output to this file instead of stdout (all three formats). |
+| `--format <human\|json\|html>` | `human` | `human` prints an aligned summary; `json` prints one document; `html` renders the status page below. |
 
-Reads every `mismatches-*.jsonl` file in the directory and prints per-route
-mismatch counts (total and by mismatch kind) plus the most recent examples per
-route. **No config file is involved** — the sink directory is self-describing, so
-a report runs anywhere the files are.
+The text formats read every `mismatches-*.jsonl` file in the directory and print
+per-route mismatch counts (total and by mismatch kind) plus the most recent
+examples per route. They involve **no config file** — the sink directory is
+self-describing, so a text report runs anywhere the files are.
 
 Unparseable lines are counted and reported (`malformed_lines`), never fatal: a
 record torn by a killed process must not cost you the rest of the report.
@@ -101,6 +109,43 @@ get-device — 2 most recent:
   2026-07-28T10:00:05Z  GET  /devices/42  0f2c…  body,set_cookie.value
   2026-07-28T10:00:00Z  GET  /devices/7   9ab1…  body
 ```
+
+### The HTML status page
+
+`--format html` renders one self-contained status page over a whole campaign's
+artifacts — no JavaScript, no external references of any kind, readable from
+`file://` and postable as a CI artifact. `--dir` is still the only required
+input; the four artifact flags are optional, and anything not given is rendered
+as **not provided** rather than silently treated as empty. The page runs
+nothing and reaches nothing: it only reads files that already exist.
+
+It cannot render a failure or a missing input as a success. An absent artifact
+downgrades the banner to INCOMPLETE; an artifact that was provided but could not
+be read or parsed is a FAILURE; and the artifacts are cross-checked against each
+other — sink counts against the verdict's per-route map, verdict floors against
+the config's effective floors, every route id against the config's route table —
+so a disagreement between two of them is a named drift finding and a FAILURE.
+Every state carries a text label beside its color, and routes render as the
+union across all inputs so no source can drop another's failure.
+
+**Refusals.** Each of these is refused rather than quietly honored, because each
+would otherwise hand back a report answering a narrower question than the one
+that was asked:
+
+| Combination | Result |
+|---|---|
+| `--route` or `--since` with `--format html` | Refused. The filters apply *before* aggregation, so a filtered page could reconcile to zero and render a dirty sink as a clean one. |
+| `--config`, `--verdict`, `--profile`, or `--metrics` with `--format human` or `json` | Refused, naming the flags. An operator who believes a verdict was taken into account must not be handed a report that never read it. |
+| `--format html` on `verdict` | Not a valid value. `verdict`'s format enum is separate from `report`'s: a verdict is a typed exit code plus the evidence for it, and a page has no exit code. The page is downstream of a verdict (`report --format html --verdict …`), never a way to take one. |
+
+**Exit codes.** The page is **not a gate**; [`limen verdict`](#verdict)'s exit
+code is the gate.
+
+| Code | Meaning |
+|---|---|
+| `0` | The page was emitted — including a page that renders nothing but failures. A CI artifact that vanishes on a bad run is one nobody looks at. |
+| `1` | The page could **not** be produced — an incoherent invocation (a refusal above) or an unwritable `--out`. These are the cases where no page exists at all; an input that could not be *read* still produces a page, and says so on it. |
+| `2` | CLI usage error: a missing `--dir`, an unknown flag, an invalid `--format` value. Clap rejects these while parsing, before any subcommand runs, so this code is not `report`-specific. |
 
 ## `verdict`
 
@@ -131,7 +176,7 @@ unavailable is never read as "0 mismatches."
 | `--drain-slack-ms <N>` | `2000` | Slack added to the longest route `timeouts.shadow_ms` to form the drain deadline. |
 | `--drain-deadline-ms <N>` | (computed from `--drain-slack-ms`) | Advanced: replace the computed drain deadline entirely. |
 | `--poll-interval-ms <N>` | `250` | Interval between `/metrics` polls while draining. |
-| `--format <human\|json>` | `human` | `human` prints an aligned verdict block; `json` prints one document. |
+| `--format <human\|json>` | `human` | `human` prints an aligned verdict block; `json` prints one document. `html` is deliberately **not** a value here — the page is downstream of a verdict, never a way to take one (see [the HTML status page](#the-html-status-page)). |
 
 ### Preconditions
 
@@ -162,7 +207,7 @@ unavailable is never read as "0 mismatches."
 | `0` | Clean — drained, floors met, sink integral, zero non-canary mismatches. |
 | `10` | Mismatches found (non-canary). |
 | `20` | Floors unmet, including a config that floors nothing at all. |
-| `30` | Sink-integrity failure: drops, per-route disagreement, malformed lines, or a missing/duplicate canary. |
+| `30` | Sink-integrity failure: dropped sink records, unparseable sink lines, counter routes absent from the config, per-route disagreement between sink and engine, or — with `--canary` — a canary that never landed or on which sink and engine disagree. |
 | `40` | Drain timeout — the pipeline never quiesced within the deadline. |
 | `50` | A required input was unavailable: control plane unreachable, sink dir unreadable, a required metric series absent, or a refused canary trigger. |
 | `1` | Unexpected tooling error (anyhow). |
@@ -336,8 +381,10 @@ whether) a draft would render it:
 ]
 ```
 
-`disposition` and `reason` are both stable, published vocabularies — every
-value is documented in [classifying routes](../guides/classifying-routes.md).
+`disposition` and `reason` are both stable, published vocabularies; the three
+dispositions are tabulated in [observe mode](../guides/observe-mode.md#reading-a-suggestion),
+and the traffic shapes the reasons name are catalogued in [classifying
+routes](../guides/classifying-routes.md).
 `narrowing_matches` lists **every** narrowing rule that matched, not just the
 one named by `reason`: first-match-wins picks the right disposition but hides
 the rest of the evidence, so a route demoted for `body-varies` that also

@@ -32,7 +32,7 @@ use crate::http::forwarded;
 use crate::http::shadow::{self, ShadowRequest};
 use crate::observability::request_id::{resolve as resolve_request_id, REQUEST_ID_HEADER};
 use crate::observability::{prometheus, Observation, ResponseOrigin, SkipReason};
-use crate::resilience::BreakerReservation;
+use crate::resilience::{BreakerReservation, ShadowPermit};
 use crate::routing::decision::PrimaryDecision;
 use crate::routing::{decision, CompiledRoute, Upstream};
 
@@ -312,13 +312,19 @@ async fn dispatch(
         .body(upstream_body)
         .send();
 
-    match tokio::time::timeout(timeout, send).await {
+    // One absolute deadline for the whole primary leg, taken immediately before
+    // the send. The send below and — on a sampled request — the response
+    // buffering that follows it draw down the *same* `primary_ms` budget, so a
+    // sampled route's worst-case time to first byte stays ≈ `primary_ms` instead
+    // of becoming `primary_ms` plus however long a trickling body cares to take.
+    let deadline = tokio::time::Instant::now() + timeout;
+    match tokio::time::timeout_at(deadline, send).await {
         Ok(Ok(resp)) => {
             record_breaker(&breaker, !resp.status().is_server_error());
             // `primary_succeeded` reports the origin itself: it can still turn a
             // 2xx upstream response into a synthesized 502 when the buffered
             // body errors mid-read, and that response is not the route's.
-            let (response, origin) = primary_succeeded(state, shadow, resp).await;
+            let (response, origin) = primary_succeeded(state, shadow, resp, deadline).await;
             Dispatched {
                 response,
                 served: upstream,
@@ -402,7 +408,12 @@ async fn prepare_request_body(
             shadow.body = Some(bytes.clone());
             Some((reqwest::Body::from(bytes), Some(shadow)))
         }
-        Buffered::TooLarge(rest) => {
+        // `TimedOut` cannot arise on the request leg: no deadline is passed
+        // here, deliberately — this buffering is bounded by the client's own
+        // upload, and cutting it short would mean sending the primary a body we
+        // had already begun to read. Grouped with the over-limit arm because it
+        // would mean the same thing: no replayable body, so no shadow.
+        Buffered::TooLarge(rest) | Buffered::TimedOut(rest) => {
             // The new upstream is never called (the body could not be buffered
             // for replay), so no comparison is ever attempted — this is a shadow
             // skip, consistent with the concurrency-limit gate above.
@@ -530,7 +541,11 @@ async fn failover_dispatch(
                         Upstream::New,
                     );
                 }
-                Buffered::TooLarge(streamed) => {
+                // `TimedOut` cannot arise here — this leg passes no deadline
+                // (`send_buffered` already bounds the whole exchange) — but it
+                // means the same thing the over-limit arm does: a body that
+                // could not be buffered, so relay it rather than fail over.
+                Buffered::TooLarge(streamed) | Buffered::TimedOut(streamed) => {
                     // Past the buffer bound the body can't be verified, and a
                     // committed stream can't be replayed; relay as-is (the
                     // failover guarantee is header-level for such responses).
@@ -586,8 +601,14 @@ async fn send_buffered(
 }
 
 /// Handle a successful primary response: stream it directly, or — when the
-/// request is shadow-planned — buffer it (bounded) to both serve the client and
-/// compare against a fire-and-forget shadow to the new upstream.
+/// request is shadow-planned — buffer it (bounded in both size and time) to
+/// both serve the client and compare against a fire-and-forget shadow to the
+/// new upstream.
+///
+/// `deadline` is the tail of the route's `primary_ms` budget left over from the
+/// send: buffering is the only shadow-related work on the client's response
+/// path, so it is the only place a slow body can hold the client, and it must
+/// not outlive the budget the route already declared (invariant 2).
 ///
 /// Returns the response's [`ResponseOrigin`] alongside it, because a primary
 /// that answered can still leave the client with a response the upstream never
@@ -597,6 +618,7 @@ async fn primary_succeeded(
     state: &AppState,
     shadow: Option<ShadowRequest>,
     resp: reqwest::Response,
+    deadline: tokio::time::Instant,
 ) -> (Response, ResponseOrigin) {
     // No shadow planned, or shutdown began while the primary was in flight:
     // stream the primary straight through, no buffering, no comparison.
@@ -627,7 +649,34 @@ async fn primary_succeeded(
     let upstream_headers = resp.headers().clone();
     let client_headers = filter_headers(&upstream_headers, Direction::Response);
 
-    match body::buffer_or_stream(resp, shadow_req.max_body_bytes).await {
+    // Two responses are known to be unbufferable before a byte is read.
+    let eager_skip = if is_event_stream(&upstream_headers) {
+        // An event stream never completes by design, so buffering one can only
+        // ever end at the deadline: the client pays a stalled first byte *and*
+        // the comparison is skipped anyway. Skipping now costs no coverage — no
+        // response that would have completed is lost — and keeps it zero-copy.
+        Some(SkipReason::EventStream)
+    } else if tokio::time::Instant::now() >= deadline {
+        // The send may already have spent the whole budget (headers that
+        // arrived on the last millisecond of `primary_ms`). Nothing left means
+        // nothing to buffer with: demote rather than read a byte past it.
+        Some(SkipReason::ResponseBufferTimeout)
+    } else {
+        None
+    };
+    if let Some(reason) = eager_skip {
+        return demote(
+            state,
+            shadow_req,
+            permit,
+            reason,
+            status,
+            client_headers,
+            Body::from_stream(resp.bytes_stream()),
+        );
+    }
+
+    match body::buffer_or_stream_within(resp, shadow_req.max_body_bytes, deadline).await {
         Buffered::Full(bytes) => {
             let legacy = Captured {
                 status: status.as_u16(),
@@ -649,21 +698,27 @@ async fn primary_succeeded(
                 ResponseOrigin::Upstream,
             )
         }
-        Buffered::TooLarge(streamed) => {
-            // The primary body is too large to buffer for comparison; serve it
-            // (prefix + remaining stream) and skip the comparison.
-            state
-                .observer()
-                .comparison_skipped(&shadow_req.meta(), SkipReason::ResponseTooLarge);
-            // Same as above: the shadow will not run, so drop its plan (and any
-            // buffered request body) before handing the client its response.
-            drop(shadow_req);
-            drop(permit);
-            (
-                response_from_parts(status, client_headers, streamed),
-                ResponseOrigin::Upstream,
-            )
-        }
+        // Too large to buffer, or too slow to buffer within what was left of
+        // `primary_ms`: either way the client is served the complete body
+        // (prefix + remaining stream) and the comparison is skipped.
+        Buffered::TooLarge(streamed) => demote(
+            state,
+            shadow_req,
+            permit,
+            SkipReason::ResponseTooLarge,
+            status,
+            client_headers,
+            streamed,
+        ),
+        Buffered::TimedOut(streamed) => demote(
+            state,
+            shadow_req,
+            permit,
+            SkipReason::ResponseBufferTimeout,
+            status,
+            client_headers,
+            streamed,
+        ),
         Buffered::Error => {
             drop(shadow_req);
             drop(permit);
@@ -673,6 +728,45 @@ async fn primary_succeeded(
             (bad_gateway(), ResponseOrigin::UpstreamSilent)
         }
     }
+}
+
+/// Abandon the comparison for a sampled response and serve `body` as it is —
+/// the one demotion shape behind every reason a sampled response cannot be
+/// buffered (too large, out of budget, or an event stream that never ends).
+///
+/// The shadow plan — and with it any buffered request body an opted-in write is
+/// holding — and the concurrency permit are dropped *before* the response is
+/// returned rather than at end of scope, so the next request's shadow can have
+/// the slot immediately.
+fn demote(
+    state: &AppState,
+    shadow_req: ShadowRequest,
+    permit: ShadowPermit,
+    reason: SkipReason,
+    status: StatusCode,
+    client_headers: HeaderMap,
+    body: Body,
+) -> (Response, ResponseOrigin) {
+    state
+        .observer()
+        .comparison_skipped(&shadow_req.meta(), reason);
+    drop(shadow_req);
+    drop(permit);
+    (
+        response_from_parts(status, client_headers, body),
+        ResponseOrigin::Upstream,
+    )
+}
+
+/// Whether a response is a server-sent-events stream, by the *essence* of its
+/// `Content-Type` — parameters (`; charset=utf-8`) and case are not part of the
+/// media type's identity and must not decide this.
+fn is_event_stream(headers: &HeaderMap) -> bool {
+    headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
 /// Build the upstream URL from the upstream origin + the request's path/query.

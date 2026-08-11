@@ -31,6 +31,8 @@ Where a migration does **not** share a datastore (separate stores that must be k
 
 ```
   1. DISCOVER     → inventory routes, classify read/write, risk-tag
+  1b. OBSERVE     → relay real traffic through Limen; suggest-routes proposes a
+                    per-route disposition from the profile
   2. DRAFT        → AI proposes a behavioral contract from code + OpenAPI + samples
   3. GENERATE     → AI writes Pharos scenarios (success / error / edge) per route
   4. REVIEW (gate)→ human validates contract + scenarios before they are trusted
@@ -66,7 +68,61 @@ Each stage below states its **inputs**, **actions**, and **outputs**, with decis
 - A **route inventory table**: `id`, `method`, `path_template`, read/write, idempotent?, risk, side-effects, sample payloads.
 - A migration **ordering**: low-risk reads first, then idempotent writes, then high-risk writes last.
 
+The inventory is a set of *claims* about routes, and the most dangerous of them — "this `GET` has no side effect" — is the one code reading is most likely to get wrong on a large surface. Stage 1b checks those claims against the service's real traffic before any of them is trusted.
+
 **For the agent:** when reading OpenAPI, treat `paths.*.responses.*.content.application/json.schema` as the authority on response shape, and `examples`/`example` as the authority on concrete values. When reading legacy code, find the router/controller layer to enumerate routes and the serialization layer to find dynamic fields (timestamps, generated IDs, request IDs).
+
+---
+
+## 1b. Stage 1b — Observe (let real traffic name the risky routes)
+
+**Goal:** replace the riskiest guesses in the Stage 1 inventory with evidence from the service's own traffic, and reach a *disposition* per route — may this route be compared at all, and if so, comparing what — before a single shadow request is ever dispatched.
+
+Run this stage whenever a legacy service is reachable and can be driven with representative traffic. It is cheap (Limen relays, it does not shadow) and safe (nothing is sent to `new`; a `new` upstream need not exist yet), and it catches the mis-tagged routes that *announce* themselves — a read that redirects, mints a cookie, or carries a one-time token in its query.
+
+Be precise about what it does not catch. A mutating read with innocuous metadata is invisible to it: `GET /orders/42/mark-read` answering a stable `200` JSON looks exactly like `GET /orders/42` from the outside, and the classifier suggests it as a `compare_candidate` — the tool's own test suite asserts that limitation rather than hiding it. Reading the handler's source is what catches that one, which is why step 6 below is not optional.
+
+**Inputs:**
+- Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough.
+- Representative traffic (a driving harness, replayed production shapes, or real traffic if Limen is already on the path).
+- The two doctrine pages this stage orchestrates: [observe mode](guides/observe-mode.md) for the mechanism, [classifying routes](guides/classifying-routes.md) for the judgment.
+
+**Actions:**
+
+1. **Bind the control plane to loopback, then turn the `observe:` block on.** The profile discloses route topology and query-parameter *names*, so `metrics.listen_addr` must not be `0.0.0.0` anywhere but a laptop. Presence of the block is the whole switch — `observe: {}` is a complete, valid block, and `limen run` logs a loud warning whenever it is present. Field-by-field: [observe mode → turn the block on](guides/observe-mode.md#1-turn-the-block-on).
+2. **Drive traffic at `sample_rate: 1.0`.** Coverage, not volume, is what this stage buys: the classifier's dangerous rules are *existential*, so a corpus that never exercises a route's redirect or flow-hop paths says nothing about them however many times it hits the happy path. Sampling below `1.0` and classification are mutually exclusive — a sampled profile is refused classification outright, not classified with lower confidence.
+3. **Read the profile.**
+   ```bash
+   curl -s http://127.0.0.1:9090/observe/profile | jq .
+   ```
+   Every *configured* route appears from the first request onward, zero-filled until observed — a route with `"observations": 0` is telling you your corpus never touched it, which is itself a Stage 1b finding.
+4. **Draft, and validate the draft.**
+   ```bash
+   limen suggest-routes -c limen.config.yaml --new-upstream https://new.internal \
+     > draft.limen.config.yaml
+   limen validate-config -c draft.limen.config.yaml
+   ```
+   `suggest-routes` polls until the profile stops changing **and** `limen_in_flight_requests` reads zero — never a blind sleep — then classifies every configured route and emits a complete, loadable config. `--format json` gives the same classification as a machine surface. Options and exit codes: [CLI → `suggest-routes`](reference/cli.md#suggest-routes).
+5. **Disposition each route against the class taxonomy.** The tool's three dispositions are evidence, not answers; map each one onto the taxonomy in [classifying routes](guides/classifying-routes.md#the-class-taxonomy) and record the class in the inventory:
+
+   | Disposition | What it means | Where it lands in the taxonomy |
+   |---|---|---|
+   | `relay_only` | A danger signal fired (a redirecting read, a cookie-minting read, a one-time-token query name, a catch-all or wildcard-granularity route), or too little was observed to say anything at all. | Classes **C**, **D**, **F** — never compared, by policy — or "not yet known", which is not the same thing and must not be recorded as if it were. |
+   | `compare_narrowed` | Nothing dangerous fired, but the body cannot be trusted for equality (varying length, more than one content type, incomplete stability evidence). | Class **B** — compare with narrowed equality; the narrowing becomes contract work in Stage 2. |
+   | `compare_candidate` | A request fingerprint repeated with a stable length and no danger signal fired. | Class **A** *if* the source agrees — a hypothesis carrying evidence, never a safety claim. |
+
+6. **Confirm candidates against the source, then adopt deliberately.** The default draft emits `comparison: { enabled: false }` for *every* route, suggestion riding as a comment. That is not a hedge: response metadata can prove a route unsafe to compare and can never prove one safe, so no traffic shape may cause the tool to emit a shadowing config. `--adopt-suggestions` is the human act that promotes suggestions into the shadowing form — pass it only after reading each candidate route's handler.
+
+**Outputs:**
+- A per-route **disposition + evidence** merged into the Stage 1 inventory, with a class assigned to every route.
+- A validated `draft.limen.config.yaml` — the starting point for the Stage 6 config.
+- Two explicit lists that shape everything downstream: the routes that will need narrowing (feeding contract drafting in Stage 2), and the routes that will **never** be compared (which need no scenarios beyond `new_only_assert`, per Section 6).
+
+**Gate:** `suggest-routes` exits `0` when a draft was emitted on real classifications; `20` when nothing was usefully profiled (no observations, every route below the read floor, or a sampled profile); `40` when the profile never quiesced; `50` when a required input was unavailable. **Exit `20` still writes a draft** — the document goes to stdout either way — so the presence of a file proves nothing. What `20` says is that the draft rests on refusals to classify rather than on evidence, which makes it unadoptable, not absent. Automation must branch on the exit code, never on whether the redirect produced output.
+
+**What this stage cannot do.** Observation is per *route*; mutation is per *path*. A route matching a prefix folds every path underneath it into one profile, and the recorder deliberately stores path *hashes*, so no rule can see the fold happening — [sub-path aliasing](guides/classifying-routes.md#what-observation-can-and-cannot-tell-you) is unfixable from traffic and is the strongest argument for keeping route granularity a human decision. Stage 1b narrows where a human has to look. It does not replace the looking.
+
+**For the agent:** treat `compare_candidate` as a hypothesis to check against the handler's source, never as a result. Never pass `--adopt-suggestions` on the strength of a profile alone, and never widen a route's `path_prefix` to make more traffic land in one classification — that is the wildcard-granularity sharp edge, manufactured on purpose.
 
 ---
 
@@ -272,22 +328,26 @@ If legacy and new do **not** share a store, none of the above holds cheaply: wri
 
 ## 8. Stages 6–7 — Shadow, then Roll Out (with Budgets)
 
-This is where validation moves from deterministic testing to live traffic, and where the **latency + error-rate budget** becomes the go/no-go gate.
+This is where validation moves from deterministic testing to live traffic, and where two things together become the go/no-go gate: **`limen verdict`'s typed exit code** for parity and pipeline integrity, and the **latency + error-rate budget** for everything the proxy cannot judge on your behalf.
 
 ### 8.1 The budget (define before shadowing)
 
-For each route, define a **budget** the route must satisfy to advance. Treat these as conventions the engineer maintains and checks against Limen's exposed metrics (a forward note: this budget could become a per-route field in Limen config later; today it is a documented gate, not a tool feature).
+For each route, define a **budget** the route must satisfy to advance. The latency and error-rate rows are conventions the engineer maintains against Limen's exposed metrics and the service's own — nothing in Limen judges whether the new service is fast enough.
+
+The parity row is different in kind, and the difference matters: [`limen verdict`](reference/cli.md#verdict) is **zero-tolerance**. It does not compare a mismatch *rate* against a threshold; any remaining non-canary mismatch is exit `10`. So read the parity row below as a **triage** target — how much unexplained divergence you tolerate while working a route toward the gate — and never as the gate itself, which is 8.3.
 
 Default budget (tune per route/service):
 
 | Dimension | Default gate to advance |
 |---|---|
-| **Response parity (shadow)** | Mismatch rate **< 0.1%** of compared requests over the observation window, with **zero** unexplained mismatches in high-risk fields. Every recurring mismatch is either fixed or explicitly accepted as `intentional-change`. |
+| **Response parity (shadow)** — *triage target, not the gate* | While working the route: unexplained mismatch rate **< 0.1%** of compared requests over the window, and **zero** unexplained mismatches in high-risk fields — the point at which reading every remaining diff individually is tractable. To *pass*, each remaining mismatch must be **resolved**: fixed in `new`, normalized by a narrow contract rule, or accepted as `intentional-change`. Any that survives all three is exit `10`. |
 | **New-service error rate** | New 5xx rate **≤ legacy 5xx rate** for the same route over the window (new must not be worse). |
 | **New-service latency** | New **p95 ≤ legacy p95** (or within a **documented exception**, e.g. "+15% p95 allowed because Z") for the route over the window. p99 not pathologically worse. |
 | **Proxy overhead** | Limen's own added latency within its SLO (streaming p50 < 1 ms, p99 < 5 ms; buffer-for-compare p50 < 3 ms) — i.e. confirm the *proxy* is healthy, separately from the service. |
 
-A **migration exception** is a deliberate, documented allowance for a route to regress within a bound (e.g. a route that does more work in the new implementation by design). Record it next to the route; it changes the gate for that route only.
+`comparison.min_comparisons` is **not** a budget row and does not belong in this table: it is an *exercise floor* — did this route get compared at all — read by `limen verdict` (and cross-checked against the verdict's floors by `limen report --format html`), and set from the traffic you expect rather than from a tolerance you accept.
+
+A **migration exception** is a deliberate, documented allowance for a route to regress within a bound (e.g. a route that does more work in the new implementation by design). Record it next to the route; it changes the gate for that route only. There is no such thing as a parity exception expressed as a rate — an accepted difference is accepted *in the contract*, where it is reviewable, or it is a mismatch.
 
 ### 8.2 Stage 6 — Shadow
 
@@ -301,18 +361,96 @@ routes:
     new_upstream: "https://new.internal"
     mode: "shadow_legacy_primary"
     contract: "./contracts/user-service.contract.yaml#get-user"
-    comparison: { enabled: true, sample_rate: 0.1, max_body_bytes: 262144 }
+    comparison:
+      enabled: true
+      sample_rate: 0.1
+      max_body_bytes: 262144
+      min_comparisons: 20        # the floor `limen verdict` holds this route to
+
+diff_sink: { dir: "./campaign-diffs" }   # the durable mismatch trail
+debug: { sink_canary: true }             # exposes POST /debug/canary
 ```
 
-**Watch (on Limen's metrics/logs):**
-- `comparison_match` vs. `comparison_mismatch` → the parity rate.
-- Sampled mismatch diffs → *what* differs; feed recurring ones back as new Pharos scenarios (closing the loop) or accept as intentional.
-- New-upstream latency and error metrics vs. legacy → the latency/error budget.
-- Shadow-skip reasons → confirm you're actually comparing enough traffic.
+Three fields there are not about routing at all — they exist so the gate in 8.3 can be taken mechanically. Omit the last two and the gate cannot run at all; ignore the first and it runs against the default floor of `1`, which almost any traffic clears:
 
-**Gate to proceed:** the budget (8.1) is green over a meaningful observation window, and every recurring mismatch is resolved or explained. Clients have been served **only** legacy this entire time — shadow mode carries no user-facing risk.
+- **`comparison.min_comparisons`** (default `1`) — the floor this route must clear for a verdict to pass. Set it to a number the campaign's traffic should comfortably exceed; set it to `0`, deliberately and visibly, for a route this campaign's topology genuinely cannot exercise.
+- **`diff_sink.dir`** (top level) — the durable JSONL trail. Reset it whenever the proxy under test starts; a sink carried across restarts makes the verdict's reconciliation fail, correctly.
+- **`debug.sink_canary: true`** (top level) — exposes `POST /debug/canary`, without which `limen verdict --canary` is refused rather than silently skipped.
 
-### 8.3 Stage 7 — Percentage rollout
+**Watch, on the dimensions the gate does not cover:** new-upstream latency and error metrics against legacy (the 8.1 budget rows the proxy cannot judge for you), and the two *separate* skip families —
+
+- `limen_comparison_skipped_total{reason}`: a shadow was planned but the comparison did not happen. `response_too_large` (body over `max_body_bytes`), `event_stream` (the response declared `text/event-stream`, skipped by content type before a byte was buffered), `response_buffer_timeout` (buffering outlived what was left of the request's `primary_ms` — a trickling or stalled body, of declared length or not).
+- `limen_shadow_skipped_total{reason}`: no shadow was dispatched at all. `concurrency_limit` (the shadow-concurrency cap was saturated) and `request_too_large` (a write-shadowing route's request body could not be buffered for replay).
+
+A request the sampler never selected appears in **neither**: no shadow is planned, so there is nothing to record a skip against. Coverage is therefore arithmetic you do yourself — `sample_rate` against eligible request volume — not a metric to read off. A route whose comparisons are mostly skipped has a parity result resting on very little traffic. Read recurring mismatch diffs for *what* differs and feed them back as new Pharos scenarios (closing the loop), or accept them as `intentional-change`.
+
+Clients have been served **only** legacy this entire time, and the shadow leg is fire-and-forget off the client path, so it carries no user-facing risk. The **sampled comparison** is not quite free, and it is worth being honest about the two costs it does put on the client path: buffering the primary response to compare it delays the client's first byte (bounded by `primary_ms`, then demoted to streaming — see [resilience & failover](guides/resilience.md#timeouts)), and a primary body that errors *while* it is being buffered is returned as Limen's own `502` rather than as a truncated stream. Both fall only on the sampled fraction, and bounding them is exactly what `sample_rate` and that deadline are for. What shadow mode never risks is sending a client to `new`.
+
+The remaining risk in this stage is proving nothing at all, which is what 8.3 exists to rule out.
+
+### 8.3 The shadow gate — `limen verdict`, not a reading of the counters
+
+"Zero mismatches" is not a gate. It is satisfied equally well by *compared everything, found nothing*, by *compared nothing*, and by *compared plenty while the recording pipeline silently dropped every record*. The gate to leave Stage 6 is therefore a command with a typed exit code, not an operator's reading of a metrics page:
+
+```bash
+limen verdict -c campaign.config.yaml --canary --format json > verdict.json
+```
+
+In one invocation `verdict` waits for the shadow/comparison/sink pipeline to quiesce (observed, never slept), asserts every floored route compared at least its configured minimum, reconciles the sink's per-route counts against the engine's own counters, drives the canary through the real compare → observer → sink → flush path, and counts non-canary mismatches. Every check fails closed: an input it could not read is never scored as "0 mismatches."
+
+| Exit | Meaning | The gate's response |
+|---|---|---|
+| `0` | Drained, floors met, sink integral, zero non-canary mismatches. | Advance — subject to the latency/error rows of 8.1, which `verdict` does not judge. |
+| `10` | Mismatches found. | Triage each one: real divergence → fix `new`; incidental → a narrow contract rule; intended → `intentional-change`. |
+| `20` | Floors unmet — including a config that floors nothing at all. | **Not** a parity result. Extend the traffic corpus (or fix the config); the run proved nothing about the unfloored routes. |
+| `30` | Sink integrity: dropped sink records, unparseable sink lines, counter routes this config does not know, per-route disagreement between sink and engine — or, with `--canary`, a canary that never landed or one on which sink and engine disagree. | Stop. Trust none of the numbers in this run until the sink is understood. |
+| `40` | Drain timeout — the pipeline never quiesced. | Re-run with traffic actually stopped; the mismatch and floor numbers from a run that never drained are unreliable, which is why `40` outranks `10` and `20`. |
+| `50` | A required input was unavailable (control plane unreachable, sink unreadable, a required metric series absent, a refused canary trigger). | A refused verdict, not a failed one. Fix the invocation. |
+
+The disciplines behind those codes are set out in full in [prove your lens bites](guides/prove-your-lens-bites.md) — read it once before the first campaign rather than deriving them from the exit table. Two of them decide whether a clean exit means anything:
+
+- **Floors prove something was compared.** A floor counts comparisons, not coverage; `min_comparisons: 20` is met by 20 comparisons out of 20 eligible requests exactly as much as by 20 out of 20,000. Coverage is a `sample_rate` and traffic-volume decision made *before* the campaign runs.
+- **The canary proves the recording pipeline is live.** A campaign with real mismatches would eventually notice a broken sink; a campaign with zero real mismatches never would, because an empty sink and a correctly empty sink render identically. Run `--canary` in *every* campaign wrapper — a standing check that only runs when someone remembers is not a standing check. Note what it does not prove: it goes through no route's comparison rules and says nothing about whether any real shadow request was dispatched. Floors plus real traffic cover that half; the two are complementary, not redundant.
+
+Periodically — when the contract vocabulary changes materially, not every run — falsify the gate: mutate the config or the sink in a way with one predicted effect on the exit code, confirm the prediction, and revert. A gate nobody has ever seen fail is a gate nobody has tested.
+
+**The campaign bundle.** Take the verdict *first*, then render the human-facing page from the artifacts it left behind, so the page can never disagree with the gate:
+
+```bash
+limen verdict -c campaign.config.yaml --canary --format json > verdict.json \
+  && verdict_exit=0 || verdict_exit=$?
+
+# Both captures are OPTIONAL inputs, and each flag is passed only if its capture
+# actually produced content. An empty or truncated file is "provided but
+# unparseable" — a FAILURE on the page — which is strictly worse than not
+# passing the flag at all. (`/observe/profile` 404s unless the campaign config
+# carries an `observe:` block, so `curl -f` is doing real work here.)
+# 127.0.0.1:9090 below is this runbook's example `metrics.listen_addr`; substitute
+# your campaign config's control-plane address and metrics path throughout.
+page_flags=()
+if curl -sf http://127.0.0.1:9090/observe/profile > profile.json && [ -s profile.json ]; then
+  page_flags+=(--profile profile.json)
+fi
+if curl -sf http://127.0.0.1:9090/metrics > metrics.txt && [ -s metrics.txt ]; then
+  page_flags+=(--metrics metrics.txt)
+fi
+
+limen report --dir ./campaign-diffs \
+  --verdict verdict.json \
+  --config  campaign.config.yaml \
+  "${page_flags[@]}" \
+  --format html --out status.html
+
+exit "$verdict_exit"
+```
+
+`status.html` is one self-contained page — no JavaScript, no external fetches, readable from `file://` and postable as a CI artifact — answering "what is covered, and what is switched over" from those artifacts alone. It cross-checks them rather than trusting them: sink counts against the verdict's per-route map, verdict floors against the config's effective floors, every route id against the config's route table. A missing input renders as *not provided* and downgrades the banner to INCOMPLETE; an input that was provided but could not be read or parsed is a FAILURE — which is why the snippet passes `--profile`/`--metrics` only when the capture succeeded, since an empty file is provided-but-unparseable, not absent; a disagreement between two artifacts is a named drift finding and a FAILURE. The banner is CLEAN only when the sink, the verdict, and the config are all present and parsed, the verdict is online and exit-`0`, every input that *was* provided parsed, and no cross-check drifted — and an empty sink directory is INCOMPLETE, never clean, since sink files are created on the first mismatch and their absence is indistinguishable from a pipeline that never ran.
+
+**The page is not the gate.** `limen report --format html` exits `0` whenever the page was produced — including a page that is nothing but failures, because a CI artifact that vanishes on a bad run is one nobody looks at. `limen verdict`'s exit code is the gate; the page is how a human reads the campaign afterward.
+
+**Gate to proceed:** `limen verdict --canary` exits `0` **and** the latency/error rows of the budget (8.1) are green over a meaningful observation window, with every recurring mismatch resolved or explained.
+
+### 8.4 Stage 7 — Percentage rollout
 
 **Action:** move the route to `percentage_split` and raise the rollout flag in steps, **pausing at each step** to recheck the budget against *real* traffic now hitting the new service:
 
@@ -334,9 +472,9 @@ routes:
 Raise the flag at runtime (no redeploy) via the flag provider. After each increase:
 - Recheck the budget (8.1) on the now-live new traffic.
 - For write routes, run the read-back drift check (7.3).
-- Only advance when green; otherwise **hold or roll back** (8.4).
+- Only advance when green; otherwise **hold or roll back** (8.5).
 
-### 8.4 Rollback / abort criteria (named, automatic where possible)
+### 8.5 Rollback / abort criteria (named, automatic where possible)
 
 Roll back **immediately** if any of the following, during shadow or rollout:
 
@@ -386,7 +524,7 @@ Distinct from validating the service: you must also confirm **Limen** is behavin
 **Confirm the proxy is healthy (separately from the service):**
 - **Proxy overhead within SLO.** Limen's added latency on the streaming path (p50 < 1 ms, p99 < 5 ms) and buffer-for-compare path (p50 < 3 ms) — from Limen's own latency metrics, isolating proxy time from upstream time. If proxy overhead is out of band, a latency reading attributed to the new service may actually be the proxy.
 - **Shadow truly off the client path.** Client-visible latency must be unchanged whether shadowing is on or off (Limen guarantees this architecturally; verify it in staging by toggling shadow and watching client latency).
-- **Comparison coverage.** Watch `comparison_skipped` reasons — if most traffic is skipped (`response_too_large`, `not_sampled`, `concurrency_limit`), your parity rate is based on too little data; adjust `sample_rate`/`max_body_bytes` or accept the sampling and widen the window.
+- **Comparison coverage.** Watch `limen_comparison_skipped_total` by reason — `response_too_large`, `event_stream` (the response declared `text/event-stream`, so it is skipped by content type before any buffering), `response_buffer_timeout` (buffering outlived what was left of the request's `primary_ms`; a slow body hits this whether or not it declared a `Content-Length`) — and, separately, `limen_shadow_skipped_total`'s `concurrency_limit` / `request_too_large`, where no shadow was dispatched at all. If most eligible traffic lands in these, your parity result rests on too little data: raise `max_body_bytes` for the first reason, but note the other two are deadline- and content-type-driven and will not move. Remember that an unsampled request is recorded in neither family — coverage is `sample_rate` against eligible volume, computed by you, not a metric to read.
 - **Flag health.** Provider health and staleness metrics green — a stale flag provider means rollout decisions may be running on the fail-safe (legacy), which is safe but means your "rollout" isn't actually happening.
 - **Circuit-breaker state.** Know whether a breaker is open; an open breaker silently routing to legacy can masquerade as "new service has no traffic / no errors."
 
@@ -417,12 +555,15 @@ Both must be true to call a route green. Conflating them is a common mistake: a 
 
 ```
 [ ] DISCOVER: route classified (read/write, idempotent?, risk, side-effects), samples captured
+[ ] OBSERVE: profiled unsampled; suggest-routes disposition recorded; candidates confirmed against source
 [ ] DRAFT: contract rules derived narrowly from observable signals; check-contract passes
 [ ] GENERATE: success + error + edge scenarios; correctly tagged; pharos validate passes
 [ ] REVIEW (human gate): contract justified & narrow; scenarios = intended behavior; signed off
 [ ] REFINE: suite green; failures diagnosed correctly; no unjustified ignore rules; contract validated
 [ ] BUDGET: latency + error-rate + parity budget defined (with any documented exceptions)
-[ ] SHADOW (reads): Limen shadow_legacy_primary; parity & budgets green over the window
+[ ] SHADOW (reads): Limen shadow_legacy_primary; min_comparisons floor set; diff_sink reset at start
+[ ] GATE: limen verdict --canary exits 0; latency/error budget green over the window;
+    report --format html captured as the campaign artifact
 [ ] WRITES: validated via new_only_assert (+ read-back); no shadow; no auto-failover on POST
 [ ] ROLL OUT: 0→1→5→25→50→100, rechecking budget at each step; drift checks for writes
 [ ] PROXY HEALTH: overhead within SLO; shadow off client path; coverage adequate; flags/breaker healthy
@@ -438,10 +579,11 @@ Both must be true to call a route green. Conflating them is a common mistake: a 
 This runbook is structured so a skill can be derived from it. The skill's job, given a service's code + OpenAPI + samples, is to **produce the artifacts** the runbook's early stages call for and to guide the later stages. Maintain these mappings when authoring the skill:
 
 - **Discover → a route-inventory generator.** Input: OpenAPI + router code. Output: the classified inventory table (Section 1).
+- **Observe → an evidence gatherer, not a decider.** Input: a profiled proxy (or a saved profile document). Output: `limen suggest-routes`' per-route disposition and evidence merged into the inventory (Section 1b), with every `compare_candidate` still flagged for a human to confirm against the handler's source. The skill must never emit `--adopt-suggestions`, and must read exit `20` as "this draft rests on no evidence" — the document is still written, so its existence is not the signal.
 - **Draft → a contract generator.** Input: inventory + samples + serialization code. Output: a `*.contract.yaml` using the catalog (Section 9) to choose rules. Bias: narrowest rules; everything else is a real assertion.
 - **Generate → a scenario generator.** Input: inventory + contract + OpenAPI responses. Output: the standard scenario family per route (Section 3), small and focused, success + error + edge.
 - **Review → a checklist surfacer.** The skill **presents** the Stage 4 checklist for a human; it does not self-approve.
 - **Refine → a failure classifier.** Given a Pharos diff, classify it (real gap / legitimate-dynamic / over-broad-rule / intended-change) and recommend the corresponding action (Section 5), defaulting to "fix the new service," never to "widen the ignore path."
-- **Shadow/Roll out → a gate evaluator.** Given Limen metrics, evaluate the budget (Section 8.1) and recommend advance / hold / roll back per Section 8.4.
+- **Shadow/Roll out → a gate evaluator.** Run `limen verdict --canary --format json` and branch on its typed exit code (Section 8.3) rather than parsing prose or scraping counters; add the latency/error rows of the budget (Section 8.1), which the verdict does not judge; recommend advance / hold / roll back per Section 8.5. Render `limen report --format html` as the artifact a human reads afterward — never as the gate.
 
 The invariant the skill must preserve end to end: **the tools generate and recommend; a human validates intent and correctness.** Every normalization rule and every trusted scenario passes through human judgment before it gates anything or reaches production traffic.

@@ -243,6 +243,25 @@ constant. That signal is honest about its own limits:
   per-user response can look "varied" and get demoted — a **false demotion**.
   This is the safe direction: it costs evidence, not safety.
 
+**A response with no `Content-Length` at all is the third case, and it is
+counted rather than guessed at.** An SSE stream (`text/event-stream`), a chunked
+response, and any other reply that simply never declares a length all collapse
+into one bucket — `length_missing` in the profile — because the signal has
+nothing to compare against a previous sighting. Observe mode narrows a route on
+**any** such read, not only when every read lacked a length: one length-less
+read means that route's stability evidence is incomplete, and incomplete
+evidence about body trustworthiness is a reason to compare status instead of
+body, never a reason to assume the body is fine. That is the same safe direction
+as the false demotion above — it costs evidence, not safety.
+
+Do not over-read it as a runtime prediction, though. Of these shapes only a
+`text/event-stream` response is declined outright at comparison time, because it
+can never complete. A chunked response, or one that simply omits the header, is
+buffered and compared exactly like any other as long as it finishes inside the
+route's size and time bounds. A missing `Content-Length` is a hole in the
+*profile's* evidence, not an exclusion from comparison (see [observe
+mode](observe-mode.md#length-less-responses-collapse-to-one-bucket)).
+
 **Classification requires a full, unsampled traffic set — sampling and
 classification are mutually exclusive.** The dangerous rules (a redirecting
 read, a cookie-minting read, a one-time-token query name) are *existential*:

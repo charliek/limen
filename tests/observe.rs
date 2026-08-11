@@ -18,13 +18,12 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::http::Request;
 use axum::Router;
-use common::{config_from_yaml, metric_value, parts, send};
+use common::{config_from_yaml, metric_value, parts, raw_upstream, send, write, Gate};
 use futures::StreamExt;
 use limen::config::model::Config;
 use limen::health::endpoints::ControlState;
 use limen::http::server::{build_state, control_plane_router, data_plane_router};
 use serde_json::Value;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -163,45 +162,30 @@ async fn legacy_only_route_populates_its_profile() {
     assert_eq!(route["query_names"][0], "page");
 }
 
-/// A raw-TCP upstream that answers exactly one request with a 20-byte
-/// `Content-Length` body, writes the first ten bytes, and then **blocks** until
-/// the returned sender fires before writing the last ten.
-///
-/// Raw TCP rather than `wiremock`: proving the proxy streams requires an
-/// upstream that can hold a response body half-written, and no mock-server
-/// template can do that.
-async fn half_written_upstream() -> (String, tokio::sync::oneshot::Sender<()>) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    let (release, released) = tokio::sync::oneshot::channel::<()>();
-    tokio::spawn(async move {
-        let (mut sock, _) = listener.accept().await.unwrap();
-        // The request has no body, so the head is the whole of it.
-        let mut head = Vec::new();
-        let mut buf = [0u8; 1024];
-        while !head.windows(4).any(|w| w == b"\r\n\r\n") {
-            let n = sock.read(&mut buf).await.unwrap();
-            if n == 0 {
-                return;
-            }
-            head.extend_from_slice(&buf[..n]);
+/// A raw-TCP upstream that answers with a 20-byte `Content-Length` body,
+/// writing the first ten bytes and then **blocking** on `gate` before the last
+/// ten — a response body held half-written, which no `wiremock` template can
+/// do and which proving the proxy streams requires.
+async fn half_written_upstream(gate: Gate) -> String {
+    raw_upstream(move |mut sock, _head| {
+        let gate = gate.clone();
+        async move {
+            write(
+                &mut sock,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nAAAAAAAAAA",
+            )
+            .await;
+            gate.wait().await;
+            write(&mut sock, "BBBBBBBBBB").await;
         }
-        sock.write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 20\r\n\r\nAAAAAAAAAA",
-        )
-        .await
-        .unwrap();
-        sock.flush().await.unwrap();
-        let _ = released.await;
-        sock.write_all(b"BBBBBBBBBB").await.unwrap();
-        sock.flush().await.unwrap();
-    });
-    (format!("http://{addr}"), release)
+    })
+    .await
 }
 
 #[tokio::test]
 async fn the_client_gets_the_first_chunk_before_the_upstream_sends_the_last() {
-    let (upstream, release) = half_written_upstream().await;
+    let gate = Gate::new();
+    let upstream = half_written_upstream(gate.clone()).await;
     let cfg = config("streaming", &upstream, "{}");
     let (data, control) = planes(&cfg);
 
@@ -224,8 +208,8 @@ async fn the_client_gets_the_first_chunk_before_the_upstream_sends_the_last() {
 
     // The load-bearing assertion, and the one a "the body arrived intact" test
     // could not make: the first chunk reaches the client while the upstream
-    // still owes the last one. A buffering proxy would park here until
-    // `release` fires — which happens only *after* this await returns.
+    // still owes the last one. A buffering proxy would park here until the gate
+    // opens — which happens only *after* this await returns.
     let mut chunks = resp.into_body().into_data_stream();
     let first = tokio::time::timeout(Duration::from_secs(5), chunks.next())
         .await
@@ -241,7 +225,7 @@ async fn the_client_gets_the_first_chunk_before_the_upstream_sends_the_last() {
     assert_eq!(route["content_types"][0], "text/plain");
     assert_eq!(route["query_names"][0], "page");
 
-    release.send(()).unwrap();
+    gate.open();
     let mut rest = Vec::new();
     while let Some(chunk) = chunks.next().await {
         rest.extend_from_slice(&chunk.unwrap());

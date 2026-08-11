@@ -1,0 +1,61 @@
+# cargo-deny configuration (plan Section 3.6: license + dependency audit).
+#
+# Run via `mise exec -- make audit` (see Makefile). Not wired into CI yet --
+# this is a local/manual gate until that's decided.
+#
+# Docs: https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only check the crate's own dependency graph (no other targets/features to
+# consider here -- limen is a single binary + lib, one platform).
+all-features = false
+
+[advisories]
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
+ignore = []
+# Note on "unmaintained" severity: in this cargo-deny version the
+# `unmaintained` key here only controls *scope* (all/workspace/transitive/
+# none), not warn-vs-deny -- every advisory (vulnerability, unmaintained,
+# unsound, notice) is otherwise hard-denied by default. Demoting unmaintained
+# findings to warnings is done via the `-W unmaintained` flag on the
+# `cargo deny check` invocation in the Makefile's `audit` target instead.
+# That's for `rustls-pemfile` (RUSTSEC-2025-0134, pulled in via redis), which
+# is what actually tripped this at the time this file was written.
+# serde_yaml 0.9 (a direct dependency, also deprecated upstream) isn't
+# currently flagged by RustSec, but would fall under the same `-W
+# unmaintained` treatment if/when it is -- the swap away from serde_yaml is
+# tracked separately and deliberately deferred.
+
+[licenses]
+# Licenses allowed for any crate in the dependency graph. Kept to the
+# permissive set actually exercised by limen's dependency tree -- see the
+# audit report in the L5 commit for how this list was derived from a real
+# `cargo deny check licenses` run.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    # Not in the original common-license starting set -- added because
+    # `webpki-roots` (pulled in transitively by both reqwest and redis for
+    # TLS root certs) ships under it. It's a data license (covers the
+    # Mozilla root CA bundle, not code) and is permissive in substance, just
+    # not one of the usual OSI code licenses.
+    "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.8
+
+[bans]
+# Multiple versions of the same crate in the graph are common and expected
+# in a normal Cargo dependency tree; don't fail the audit on that alone.
+multiple-versions = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
