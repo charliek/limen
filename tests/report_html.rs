@@ -18,6 +18,7 @@ use limen::report_html::{
     analyze, render, BannerState, FloorClass, Inputs, PageModel, Section, SinkState,
     VerdictArtifact,
 };
+use limen::verdict::CANARY_ROUTE_ID;
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -54,14 +55,32 @@ routes:
     mode: legacy_only
 "#;
 
-/// A scrape carrying every family the runtime-counters section requires.
-const METRICS: &str = "\
-limen_comparisons_total{route=\"a\",result=\"match\"} 3
-limen_comparison_skipped_total{route=\"a\",reason=\"event_stream\"} 2
-limen_comparison_skipped_total{route=\"a\",reason=\"response_buffer_timeout\"} 1
-limen_shadow_requests_total{route=\"a\"} 3
-limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0
+/// The series `prometheus::register_verdict_series` pre-touches at startup —
+/// what any live limen renders from its very first scrape, and exactly the set
+/// `verdict::REQUIRED_SERIES` refuses to read as absent. Transcribed from that
+/// function rather than invented, so a change to either side shows up here.
+const REGISTERED: &str = "\
+limen_shadow_in_flight 0
+limen_diff_sink_enqueued_total 0
+limen_diff_sink_written_total 0
+limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
+limen_diff_sink_dropped_total{reason=\"io_error\"} 0
+limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
 ";
+
+/// A busy proxy's scrape: the registered series, plus the lazily-registered
+/// families a run that compared, skipped and shadowed would have touched.
+fn metrics() -> String {
+    format!(
+        "{REGISTERED}\
+limen_comparisons_total{{route=\"a\",result=\"match\"}} 3
+limen_comparison_skipped_total{{route=\"a\",reason=\"event_stream\"}} 2
+limen_comparison_skipped_total{{route=\"a\",reason=\"response_buffer_timeout\"}} 1
+limen_shadow_requests_total{{route=\"a\"}} 3
+limen_shadow_failed_total{{route=\"a\",reason=\"timeout\"}} 0
+"
+    )
+}
 
 /// A coherent, clean, online verdict over [`CONFIG`].
 fn clean_verdict() -> serde_json::Value {
@@ -216,7 +235,7 @@ fn canonical() -> Workspace {
         .with_config(CONFIG)
         .with_verdict(&clean_verdict())
         .with_profile(&profile().to_string())
-        .with_metrics(METRICS)
+        .with_metrics(&metrics())
 }
 
 /// The failure reasons, joined, for a readable assertion message.
@@ -308,7 +327,9 @@ fn the_page_is_self_contained() {
 
 #[test]
 fn a_missing_verdict_is_incomplete() {
-    let ws = Workspace::new().with_config(CONFIG).with_metrics(METRICS);
+    let ws = Workspace::new()
+        .with_config(CONFIG)
+        .with_metrics(&metrics());
     let model = ws.model();
     assert_eq!(
         model.banner.state,
@@ -438,22 +459,67 @@ fn a_comment_only_metrics_file_is_unavailable() {
     assert_eq!(model.banner.state, BannerState::Failure, "{}", why(&model));
 }
 
+/// A series limen registers at startup, absent: the scrape did not come from a
+/// limen control plane, and `limen verdict` would exit 50 on it.
 #[test]
 fn a_metrics_file_missing_a_required_family_is_unavailable() {
-    let ws = canonical().with_metrics(
-        "limen_comparisons_total{route=\"a\",result=\"match\"} 3\n\
-         limen_shadow_requests_total{route=\"a\"} 3\n\
-         limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0\n",
-    );
+    let without_in_flight: String = REGISTERED
+        .lines()
+        .filter(|l| !l.starts_with("limen_shadow_in_flight"))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    let ws = canonical().with_metrics(&format!(
+        "{without_in_flight}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
+    ));
     let model = ws.model();
     match &model.evidence.metrics {
         Section::Unavailable(why) => {
-            assert!(why.contains("limen_comparison_skipped_total"), "{why}");
-            assert!(why.contains("not a zero"), "{why}");
+            assert!(why.contains("limen_shadow_in_flight"), "{why}");
+            assert!(why.contains("never a zero count"), "{why}");
         }
         other => panic!("expected unavailable, got {other:?}"),
     }
     assert_eq!(model.banner.state, BannerState::Failure, "{}", why(&model));
+}
+
+/// The bug a real end-to-end run found. A service that never skipped a
+/// comparison and never failed a shadow exports neither
+/// `limen_comparison_skipped_total` nor `limen_shadow_failed_total` — those
+/// counters register on their first event. The live verdict against that same
+/// process exits 0, so a page that called it FAILURE was stricter than the gate
+/// it claims to report on.
+#[test]
+fn a_scrape_from_a_service_that_never_skipped_is_accepted() {
+    let ws = canonical().with_metrics(&format!(
+        "{REGISTERED}\
+limen_comparisons_total{{route=\"a\",result=\"match\"}} 3
+limen_shadow_requests_total{{route=\"a\"}} 3
+"
+    ));
+    let model = ws.model();
+    assert!(
+        !model.evidence.metrics.is_unavailable(),
+        "a quiet service was called a broken one: {:?}",
+        model.evidence.metrics
+    );
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+
+    // The absent families are named on the page, not passed over in silence.
+    let html = ws.page();
+    assert!(html.contains("limen_comparison_skipped_total"));
+    assert!(html.contains("ABSENT"));
+    assert!(html.contains("first event of its kind"));
+}
+
+/// Even a proxy that has served nothing at all renders: only the four series
+/// it registers at startup are required, and `limen verdict` reads an absent
+/// `limen_comparisons_total` as zero rather than as a broken scrape.
+#[test]
+fn a_scrape_from_a_proxy_that_served_nothing_still_renders() {
+    let ws = canonical().with_metrics(REGISTERED);
+    let model = ws.model();
+    assert!(!model.evidence.metrics.is_unavailable());
+    assert!(ws.page().contains("reads this as zero"));
 }
 
 #[test]
@@ -909,6 +975,166 @@ fn mismatch_records_on_disk_fail_the_page() {
     let html = ws.page();
     assert!(html.contains("req-1"), "the example is shown");
     assert!(html.contains("MISMATCHES RECORDED"));
+}
+
+// ---------------------------------------------------------------------------
+// The canary: limen's own record
+// ---------------------------------------------------------------------------
+
+/// The verdict as `--canary` renders it: the canary check passed, and the one
+/// record it wrote is reported as `canary_records`, outside `mismatches_total`.
+fn canary_backed_verdict() -> serde_json::Value {
+    let mut v = clean_verdict();
+    v["canary_records"] = serde_json::json!(1);
+    v["checks"]["canary"] = serde_json::json!({
+        "status": "pass",
+        "detail": "canary rode compare → sink → flush end-to-end (1 record(s), counters agree)"
+    });
+    v
+}
+
+/// `evaluate_canary` emits `skipped` exactly when zero canary records were
+/// counted, so `canary_records: 1` beside a `skipped` canary check is a state
+/// no real verdict produces — only a torn or edited artifact carries it, and
+/// with the sink's one canary record reconciling (1 == 1) everything else
+/// about the page would read clean. It must not.
+#[test]
+fn a_skipped_canary_with_counted_records_is_an_impossible_verdict() {
+    let mut verdict = canary_backed_verdict();
+    verdict["checks"]["canary"] =
+        serde_json::json!({"status": "skipped", "detail": "--canary not requested"});
+    let ws = canonical().with_verdict(&verdict).with_sink_lines(&[line(
+        "2026-08-01T10:00:00Z",
+        CANARY_ROUTE_ID,
+        "canary-1",
+        &["body"],
+    )]);
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Failure, "{}", why(&model));
+    assert!(
+        model
+            .evidence
+            .verdict_violations
+            .iter()
+            .any(|v| v.contains("canary")),
+        "{:?}",
+        model.evidence.verdict_violations
+    );
+
+    // The inverse impossibility: a pass that counted nothing.
+    let mut verdict = clean_verdict();
+    verdict["checks"]["canary"] = serde_json::json!({"status": "pass", "detail": "impossible"});
+    let model = canonical().with_verdict(&verdict).model();
+    assert_eq!(model.banner.state, BannerState::Failure, "{}", why(&model));
+}
+
+/// **The cold-run regression.** A real campaign with no mismatches leaves no
+/// sink file at all — a file is created by the first record written to it — so
+/// the only way a clean run has evidence to show is the canary, which rides a
+/// record through the real pipeline on purpose. Counting that record as a
+/// mismatch turned every canary-backed clean campaign into FAILURE: the page
+/// read limen's proof that the sink works as proof that the run was dirty.
+#[test]
+fn a_canary_backed_clean_campaign_is_clean() {
+    let ws = canonical()
+        .with_verdict(&canary_backed_verdict())
+        .with_sink_lines(&[line(
+            "2026-08-01T10:00:00Z",
+            CANARY_ROUTE_ID,
+            "canary-1",
+            &["body"],
+        )]);
+    let model = ws.model();
+
+    assert_eq!(model.evidence.sink_counts.mismatches, 0);
+    assert_eq!(model.evidence.sink_counts.canary, 1);
+    assert!(model.evidence.sink_counts.other_reserved.is_empty());
+    assert_eq!(
+        model.evidence.sink_state,
+        SinkState::VerifiedZero,
+        "{}",
+        why(&model)
+    );
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    assert!(
+        model.evidence.drift.is_empty(),
+        "{:?}",
+        model.evidence.drift
+    );
+
+    // The canary is neither a route of this campaign nor an unknown one: it is
+    // limen's own namespace, and the coverage join has no column for it.
+    assert!(
+        !model.routes.iter().any(|r| r.id == CANARY_ROUTE_ID),
+        "the canary was joined as a route: {:?}",
+        model.routes.iter().map(|r| &r.id).collect::<Vec<_>>()
+    );
+
+    let html = ws.page();
+    assert_eq!(html.matches("CLEAN").count(), 1);
+    assert!(html.contains("CANARY RECORDS"), "{html}");
+    assert!(html.contains("excluded from the mismatch count"));
+    assert!(html.contains("The verdict counted the same 1."));
+}
+
+/// The canary is the one record limen writes on purpose, so a disagreement
+/// about it is the recording pipeline itself failing — real signal.
+#[test]
+fn a_canary_count_disagreement_is_a_failure() {
+    // The verdict says it wrote one; the sink holds none.
+    let model = canonical().with_verdict(&canary_backed_verdict()).model();
+    assert_failure_naming(&model, "holds 0 canary record(s) but the verdict counted 1");
+
+    // …and the mirror image: a record on disk no verdict accounts for.
+    let ws = canonical().with_sink_lines(&[line(
+        "2026-08-01T10:00:00Z",
+        CANARY_ROUTE_ID,
+        "canary-1",
+        &["body"],
+    )]);
+    let model = ws.model();
+    assert_failure_naming(&model, "holds 1 canary record(s) but the verdict counted 0");
+    assert!(ws.page().contains("they disagree"));
+}
+
+/// Nothing limen writes uses a reserved id other than the canary's, and
+/// `verdict`'s per-route reconciliation fails on one for the same reason: no
+/// counter can ever match it.
+#[test]
+fn an_unknown_reserved_route_id_fails() {
+    let ws = canonical().with_sink_lines(&[line(
+        "2026-08-01T10:00:00Z",
+        "__not_a_limen_record__",
+        "req-1",
+        &["body"],
+    )]);
+    let model = ws.model();
+    assert_eq!(
+        model.evidence.sink_counts.mismatches, 0,
+        "reserved records are outside the mismatch answer, as verdict has them"
+    );
+    assert_failure_naming(&model, "__not_a_limen_record__");
+    assert!(ws.page().contains("UNKNOWN RESERVED ID"));
+}
+
+/// The discipline the empty-directory state points at: without a canary a
+/// mismatch-free campaign has no evidence to show, and the page says which
+/// flag produces some rather than leaving the operator to guess.
+#[test]
+fn an_empty_sink_directory_names_the_canary_as_the_way_out() {
+    let ws = canonical();
+    std::fs::remove_file(ws.sink_dir.join("mismatches-2026-08-01.jsonl")).unwrap();
+    let model = ws.model();
+    assert_eq!(model.evidence.sink_state, SinkState::NoFiles);
+    assert!(
+        model
+            .banner
+            .incomplete
+            .iter()
+            .any(|r| r.contains("--canary")),
+        "{}",
+        why(&model)
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -13,16 +13,32 @@
 //!   banner to INCOMPLETE. An artifact that was provided but could not be read
 //!   or parsed is a FAILURE — a page that quietly dropped an unreadable verdict
 //!   would be reporting on a campaign it never looked at.
-//! - **An empty sink is not a clean run.** Sink files are only created on the
-//!   first mismatch, so their absence is indistinguishable from a pipeline that
-//!   never ran. `files_read == 0` is INCOMPLETE; a zero total across files that
+//! - **An empty sink is not a clean run.** A sink file is created by the first
+//!   record written to it, so an empty directory is indistinguishable from a
+//!   pipeline that never ran — or one that cannot write at all.
+//!   `files_read == 0` is INCOMPLETE; a zero mismatch count across files that
 //!   *do* exist is only rendered as clean when a clean verdict whose
 //!   `sink_integrity` check passed vouches for it.
+//!
+//!   This makes CLEAN reachable only once *something* has proven the sink
+//!   writes, which is deliberate. In practice that something is the canary:
+//!   `limen verdict --canary` rides a record through compare → sink → flush, so
+//!   a mismatch-free campaign still leaves a file behind. Canary records are
+//!   counted, excluded from the mismatch answer, and reconciled against the
+//!   verdict's `canary_records` — exactly as `verdict::evaluate` treats them
+//!   (see [`SinkCounts`]). Without the canary, a mismatch-free run has no
+//!   evidence to show and the page says so.
 //! - **Artifacts are cross-checked, not trusted.** Sink counts are reconciled
-//!   against the verdict's per-route map, verdict floors against the config's
+//!   against the verdict's per-route map, canary records against its
+//!   `canary_records`, verdict floors against the config's
 //!   `effective_min_comparisons()`, and every route id in an artifact against
 //!   the config's route table. Any disagreement is a named drift finding and a
 //!   FAILURE: two artifacts that disagree cannot both describe this campaign.
+//! - **The gate is mirrored, not re-invented.** Where this page reads the same
+//!   input `limen verdict` reads, it takes the same position — including on
+//!   what an absent metric family is allowed to mean (see [`FAMILIES`]). A page
+//!   stricter than the gate it reports on renders FAILURE against runs the gate
+//!   passed, and is worth no more than one that is laxer.
 //! - **The page always exists.** Producing it is exit 0 even when it renders
 //!   nothing but failures, because a CI artifact that vanishes on a bad run is
 //!   a CI artifact nobody looks at. Only a page that could not be *produced*
@@ -43,21 +59,41 @@ use serde::Deserialize;
 use crate::config::load::{load as load_config, ConfigOverrides};
 use crate::config::model::Config;
 use crate::observability::prometheus::{
-    COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_TOTAL,
+    COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL,
+    DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT, SHADOW_SKIPPED_TOTAL,
+    SHADOW_TOTAL,
 };
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
-use crate::verdict::{Scrape, RESERVED_ROUTE_ID_PREFIX};
+use crate::verdict::{Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
-/// Metric families the runtime-counters section is built from. All four must be
-/// present for the section to render: a scrape missing one is a scrape of
-/// something other than a limen control plane (or of a limen too old to export
-/// it), and rendering the families it *does* carry would present a partial
-/// picture as a complete one.
-const REQUIRED_FAMILIES: [&str; 4] = [
-    COMPARISONS_TOTAL,
-    COMPARISON_SKIPPED_TOTAL,
-    SHADOW_TOTAL,
-    SHADOW_FAILED_TOTAL,
+/// The metric families the runtime-counters section renders, each tagged with
+/// what an *absent* family is allowed to mean — mirroring
+/// [`crate::verdict`]'s contract exactly rather than restating it:
+///
+/// - [`Absence::Required`] is [`crate::verdict::REQUIRED_SERIES`], the four
+///   series `register_verdict_series` pre-touches at startup. Absent, a verdict
+///   is exit 50; absent, this section is unavailable.
+/// - [`Absence::ReadsAsZero`] is what `verdict::evaluate_floors` does with an
+///   absent `limen_comparisons_total`: reads it as zero, which is fail-closed
+///   only because a floored route needs at least one comparison to pass.
+/// - [`Absence::Informational`] is what `verdict::collect_informational` does:
+///   iterate whatever is there and gate on none of it.
+///
+/// Every family but the required four is registered *lazily*, on the first
+/// event of its kind, so a proxy that never skipped a comparison exports no
+/// `limen_comparison_skipped_total` at all. Requiring those families made this
+/// page stricter than the gate it claims to mirror — every quiet, healthy
+/// service rendered FAILURE.
+const FAMILIES: [(&str, Absence); 9] = [
+    (COMPARISONS_TOTAL, Absence::ReadsAsZero),
+    (COMPARISON_SKIPPED_TOTAL, Absence::Informational),
+    (SHADOW_TOTAL, Absence::Informational),
+    (SHADOW_SKIPPED_TOTAL, Absence::Informational),
+    (SHADOW_FAILED_TOTAL, Absence::Informational),
+    (SHADOW_IN_FLIGHT, Absence::Required),
+    (DIFF_SINK_ENQUEUED_TOTAL, Absence::Required),
+    (DIFF_SINK_WRITTEN_TOTAL, Absence::Required),
+    (DIFF_SINK_DROPPED_TOTAL, Absence::Required),
 ];
 
 /// How many sink examples the page shows per route.
@@ -373,39 +409,92 @@ impl ConfigView {
     }
 }
 
+/// What `limen verdict` does with a family the scrape does not carry. See
+/// [`FAMILIES`] for the mapping and the code each arm mirrors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Absence {
+    /// Fails the whole read closed ([`crate::verdict::REQUIRED_SERIES`]).
+    Required,
+    /// Read as zero, which is only safe because a floor of at least one turns
+    /// that zero into a failure (`verdict::evaluate_floors`).
+    ReadsAsZero,
+    /// Never gated on (`verdict::collect_informational`).
+    Informational,
+}
+
+impl Absence {
+    /// What the page says beside an absent family, in the page's own voice.
+    /// Never silence: an absent counter is a fact about the scrape, and a fact
+    /// a fail-closed page states rather than omits.
+    fn note(self) -> &'static str {
+        match self {
+            // Unreachable in a rendered section — a required family absent
+            // makes the whole section unavailable — but stated for symmetry.
+            Absence::Required => {
+                "absent — this series is registered at startup, so its absence means the \
+                 scrape did not come from a limen control plane"
+            }
+            Absence::ReadsAsZero => {
+                "absent from the scrape. `limen verdict` reads this as zero comparisons, which \
+                 is fail-closed only because a floored route needs at least one — the coverage \
+                 table above is where that bites, not here"
+            }
+            Absence::Informational => {
+                "absent from the scrape. This counter is registered on the first event of its \
+                 kind, so no such event was recorded by the scraped process. `limen verdict` \
+                 gates on none of these"
+            }
+        }
+    }
+}
+
 /// The runtime counters, flattened out of a scrape into renderable rows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricsView {
     pub families: Vec<MetricFamily>,
 }
 
-/// One metric family's rows.
+/// One metric family's standing in the scrape.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricFamily {
     pub name: String,
+    /// What this family's absence would mean.
+    pub absence: Absence,
+    /// Whether the scrape carried the family at all. `false` here is only ever
+    /// a tolerated absence: a required family absent is a section-level
+    /// unavailable, never a row.
+    pub present: bool,
     pub rows: Vec<MetricRow>,
 }
 
 /// One sample, split into the route label and everything else.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MetricRow {
-    pub route: String,
+    /// The `route` label, when the series carries one — the pipeline counters
+    /// are process-wide and do not.
+    pub route: Option<String>,
     /// The remaining labels, `k=v` joined — `reason=event_stream`, and so on.
     pub labels: String,
     pub value: u64,
 }
 
 impl MetricsView {
-    /// Build the view, or say why the scrape cannot be rendered. Never falls
-    /// back to zeros: a missing family means the exporter did not report the
-    /// series, which is a different claim from "the series is at zero".
+    /// Build the view, or say why the scrape cannot be rendered.
+    ///
+    /// Absence is tolerated exactly where `limen verdict` tolerates it (see
+    /// [`FAMILIES`]) and rendered as an explicit note rather than passed over
+    /// in silence. Values are *not* tolerated the same way: a count that is not
+    /// an exact non-negative integer is never a normal state of a limen
+    /// exporter, and rounding one would be fabricating a number.
     fn from_scrape(scrape: &Scrape) -> Result<MetricsView, String> {
-        let mut families = Vec::with_capacity(REQUIRED_FAMILIES.len());
-        for name in REQUIRED_FAMILIES {
-            if !scrape.has_family(name) {
+        let mut families = Vec::with_capacity(FAMILIES.len());
+        for (name, absence) in FAMILIES {
+            let present = scrape.has_family(name);
+            if !present && absence == Absence::Required {
                 return Err(format!(
-                    "required metric family {name} is absent from the scrape — an absent \
-                     series is not a zero count"
+                    "required metric family {name} is absent from the scrape — limen registers \
+                     it at startup, so its absence is a scrape of something else, never a zero \
+                     count"
                 ));
             }
             let mut rows = Vec::new();
@@ -430,11 +519,7 @@ impl MetricsView {
                     .collect::<Vec<_>>()
                     .join(", ");
                 rows.push(MetricRow {
-                    route: sample
-                        .labels
-                        .get("route")
-                        .cloned()
-                        .unwrap_or_else(|| "(no route label)".to_string()),
+                    route: sample.labels.get("route").cloned(),
                     labels,
                     value,
                 });
@@ -442,6 +527,8 @@ impl MetricsView {
             rows.sort_by(|a, b| a.route.cmp(&b.route).then_with(|| a.labels.cmp(&b.labels)));
             families.push(MetricFamily {
                 name: name.to_string(),
+                absence,
+                present,
                 rows,
             });
         }
@@ -453,10 +540,54 @@ impl MetricsView {
         self.families
             .iter()
             .flat_map(|f| f.rows.iter())
-            .filter(|r| r.route != "(no route label)")
-            .map(|r| r.route.clone())
+            .filter_map(|r| r.route.clone())
             .collect()
     }
+}
+
+/// The sink's records, split the way `verdict::evaluate` splits them.
+///
+/// The reserved `__` namespace is **not** part of the mismatch answer: the
+/// canary is a record limen writes on purpose to prove the record→flush→report
+/// pipeline works, and counting it as a mismatch turns the very evidence that
+/// the sink is healthy into a reason to call the run dirty. `limen verdict`
+/// subtracts the whole reserved namespace from `mismatches_total` and omits it
+/// from `sink_mismatches_by_route`, reporting the canary separately as
+/// `canary_records`; this mirrors that split exactly.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SinkCounts {
+    /// Records outside the reserved namespace: the mismatch answer.
+    pub mismatches: usize,
+    /// Records under [`CANARY_ROUTE_ID`].
+    pub canary: usize,
+    /// Records under some *other* reserved id, by id. Nothing limen writes
+    /// lands here, and `verdict`'s per-route reconciliation fails on one (no
+    /// counter can match it), so the page treats it the same way.
+    pub other_reserved: BTreeMap<String, usize>,
+}
+
+impl SinkCounts {
+    fn from_report(report: &Report) -> SinkCounts {
+        let mut counts = SinkCounts::default();
+        for route in &report.routes {
+            if route.route_id == CANARY_ROUTE_ID {
+                counts.canary += route.count;
+            } else if route.route_id.starts_with(RESERVED_ROUTE_ID_PREFIX) {
+                *counts
+                    .other_reserved
+                    .entry(route.route_id.clone())
+                    .or_default() += route.count;
+            } else {
+                counts.mismatches += route.count;
+            }
+        }
+        counts
+    }
+}
+
+/// Whether a route id belongs to limen's internal reserved namespace.
+fn is_reserved(route_id: &str) -> bool {
+    route_id.starts_with(RESERVED_ROUTE_ID_PREFIX)
 }
 
 /// How the sink directory reconciles — the one input whose *absence of
@@ -502,8 +633,10 @@ impl SinkState {
         match self {
             SinkState::Unavailable(why) => why,
             SinkState::NoFiles => {
-                "Sink files are written on the first mismatch, so an empty directory is \
-                 indistinguishable from a pipeline that never ran."
+                "A sink file is created by the first record written to it, so an empty \
+                 directory is indistinguishable from a pipeline that never ran — or one that \
+                 cannot write at all. A verdict run with --canary leaves a record and settles \
+                 the question."
             }
             SinkState::VerifiedZero => {
                 "Zero mismatch records across the files read, vouched for by a clean online \
@@ -638,6 +771,9 @@ pub struct Banner {
 #[derive(Debug, Clone)]
 pub struct Evidence {
     pub sink: Section<Report>,
+    /// The sink's records split into mismatches, canary and other reserved —
+    /// all zero when the directory could not be read.
+    pub sink_counts: SinkCounts,
     pub sink_state: SinkState,
     pub config: Section<ConfigView>,
     pub verdict: Section<VerdictArtifact>,
@@ -819,14 +955,27 @@ fn semantic_violations(v: &VerdictDto) -> Vec<String> {
                     continue; // already reported above
                 }
                 // The canary is the one check a clean run may legitimately
-                // skip: it only runs when `--canary` was asked for.
-                let acceptable = check.is_pass() || (name == "canary" && check.is_skipped());
+                // skip: it only runs when `--canary` was asked for — and
+                // `evaluate_canary` emits `skipped` exactly when zero canary
+                // records were counted, so a skip alongside a nonzero
+                // `canary_records` (or a pass alongside zero) is a state no
+                // real verdict produces. Only a torn or edited artifact can
+                // carry it, and it must not ride through as clean.
+                let acceptable = check.is_pass()
+                    || (name == "canary" && check.is_skipped() && v.canary_records == 0);
                 if !acceptable {
                     out.push(format!(
                         "exit_code 0 with the {name} check reporting {:?} — a clean run \
                          requires it to have passed",
                         check.status
                     ));
+                }
+                if name == "canary" && check.is_pass() && v.canary_records == 0 {
+                    out.push(
+                        "the canary check passed with canary_records 0 — a canary pass \
+                         requires at least one counted record"
+                            .to_string(),
+                    );
                 }
             }
         }
@@ -868,13 +1017,27 @@ fn drift_findings(
 ) -> Vec<String> {
     let mut out = Vec::new();
 
+    // The canary the verdict counted against the canary records on disk. The
+    // canary is the one record limen writes on purpose, so a disagreement here
+    // is the pipeline itself failing to record — real signal, not bookkeeping.
+    if let (Some(verdict), Some(sink)) = (verdict, sink) {
+        let counts = SinkCounts::from_report(sink);
+        if counts.canary as u64 != verdict.canary_records {
+            out.push(format!(
+                "the sink directory holds {} canary record(s) but the verdict counted {} — \
+                 the record it wrote to prove the pipeline works is not the one on disk",
+                counts.canary, verdict.canary_records
+            ));
+        }
+    }
+
     // The sink on disk against the verdict's per-route map. The verdict
     // excludes the reserved namespace from that map, so the sink side does too.
     if let (Some(verdict), Some(sink)) = (verdict, sink) {
         let sunk: BTreeMap<&str, u64> = sink
             .routes
             .iter()
-            .filter(|r| !r.route_id.starts_with(RESERVED_ROUTE_ID_PREFIX))
+            .filter(|r| !is_reserved(&r.route_id))
             .map(|r| (r.route_id.as_str(), r.count as u64))
             .collect();
         let mut ids: BTreeSet<&str> = sunk.keys().copied().collect();
@@ -936,7 +1099,9 @@ fn drift_findings(
         let known: BTreeSet<&str> = config.routes.iter().map(|r| r.id.as_str()).collect();
         let mut seen: BTreeMap<String, BTreeSet<&'static str>> = BTreeMap::new();
         let mut note = |id: &str, source: &'static str| {
-            if id.starts_with(RESERVED_ROUTE_ID_PREFIX) || known.contains(id) {
+            // The reserved namespace is limen's own — a config never declares
+            // it, so its absence there is not drift.
+            if is_reserved(id) || known.contains(id) {
                 return;
             }
             seen.entry(id.to_string()).or_default().insert(source);
@@ -1002,6 +1167,11 @@ fn join_routes(
         ids.extend(profile.routes.keys().cloned());
     }
     ids.extend(metric_ids.iter().cloned());
+    // Reserved ids are limen's own internal records, not routes: no config
+    // declares one, no floor applies to one, and every column of this table
+    // would read "unknown". The canary has its own line in the mismatches
+    // section, where it is evidence rather than an anomaly.
+    ids.retain(|id| !is_reserved(id));
 
     ids.into_iter()
         .map(|id| {
@@ -1010,9 +1180,6 @@ fn join_routes(
             let floor_class = match (config, verdict) {
                 (None, _) | (_, None) => FloorClass::Undetermined,
                 (Some(_), Some(_)) => match (configured, row) {
-                    (None, _) if id.starts_with(RESERVED_ROUTE_ID_PREFIX) => {
-                        FloorClass::NotApplicable
-                    }
                     // A floors row for a route the config does not declare is
                     // still rendered on its merits: unmet is red either way.
                     (None, Some(row)) if !row.met => FloorClass::Unmet,
@@ -1057,6 +1224,7 @@ fn join_routes(
 pub fn decide_banner(evidence: &Evidence) -> Banner {
     let Evidence {
         sink,
+        sink_counts: _,
         sink_state,
         config,
         verdict,
@@ -1151,12 +1319,24 @@ pub fn decide_banner(evidence: &Evidence) -> Banner {
                 report.malformed_lines
             ));
         }
+        // A reserved id limen does not write. `verdict`'s per-route
+        // reconciliation fails on one too (no counter can ever match it), and
+        // an id in limen's own namespace that limen did not put there is worth
+        // the whole page.
+        for (id, count) in &SinkCounts::from_report(report).other_reserved {
+            failures.push(format!(
+                "sink: {count} record(s) under the reserved route id {id} — the {RESERVED_ROUTE_ID_PREFIX} \
+                 namespace is limen's own, and nothing limen writes uses that id"
+            ));
+        }
     }
     match sink_state {
         SinkState::Unavailable(why) => incomplete.push(format!("sink: {why}")),
         SinkState::NoFiles => incomplete.push(
-            "sink: no sink files found — files are only created on the first mismatch, so \
-             their absence is not cleanliness"
+            "sink: no sink files found — nothing has ever been recorded here, which is \
+             indistinguishable from a sink that cannot write. Run the verdict with --canary: \
+             the canary rides the real pipeline and leaves a record, which is what turns an \
+             empty directory into evidence"
                 .to_string(),
         ),
         SinkState::UnverifiedZero => incomplete.push(
@@ -1205,11 +1385,17 @@ pub fn analyze(inputs: &Inputs) -> PageModel {
             && v.mode == "online"
             && v.checks.sink_integrity.is_pass()
     });
+    // Mismatches, not records: a canary record is limen proving its own sink
+    // works, and reading it as a mismatch would turn the evidence of a healthy
+    // pipeline into a reason to call the run dirty.
+    let sink_counts = sink.get().map(SinkCounts::from_report).unwrap_or_default();
     let sink_state = match &sink {
         Section::Unavailable(why) => SinkState::Unavailable(why.clone()),
         Section::NotProvided => SinkState::Unavailable("no sink directory".to_string()),
         Section::Ok(report) if report.files_read == 0 => SinkState::NoFiles,
-        Section::Ok(report) if report.total > 0 => SinkState::Mismatches(report.total),
+        Section::Ok(_) if sink_counts.mismatches > 0 => {
+            SinkState::Mismatches(sink_counts.mismatches)
+        }
         Section::Ok(_) if vouched => SinkState::VerifiedZero,
         Section::Ok(_) => SinkState::UnverifiedZero,
     };
@@ -1230,6 +1416,7 @@ pub fn analyze(inputs: &Inputs) -> PageModel {
     );
     let evidence = Evidence {
         sink,
+        sink_counts,
         sink_state,
         config,
         verdict,
@@ -1298,6 +1485,15 @@ fn present(yes: bool) -> String {
 fn route_cell(id: &str) -> String {
     let id = esc(id);
     format!("<td class=\"mono\" title=\"route id: {id}\">{id}</td>")
+}
+
+/// The same cell for a series that may carry no `route` label at all — the
+/// pipeline counters are process-wide. An em dash, never an invented id.
+fn route_label_cell(id: Option<&String>) -> String {
+    match id {
+        Some(id) => route_cell(id),
+        None => "<td class=\"mono\" title=\"no route label\">—</td>".to_string(),
+    }
 }
 
 /// A count, or an em dash where there is none to show. Never a zero: "the
@@ -1651,11 +1847,52 @@ fn render_mismatches(out: &mut String, model: &PageModel) {
     let Some(report) = model.evidence.sink.get() else {
         return;
     };
+    let sink_counts = &model.evidence.sink_counts;
     let _ = writeln!(
         out,
-        "<p class=\"note\">{} file(s) read, {} record(s), {} unparseable line(s).</p>",
-        report.files_read, report.total, report.malformed_lines
+        "<p class=\"note\">{} file(s) read, {} record(s) — {} mismatch(es), {} unparseable \
+         line(s).</p>",
+        report.files_read, report.total, sink_counts.mismatches, report.malformed_lines
     );
+    // The canary is limen's own record, written to prove the pipeline records
+    // at all. `limen verdict` excludes it from the mismatch total and reports
+    // it separately; counting it here would make the evidence of a healthy
+    // sink into a reason to call the run dirty.
+    if sink_counts.canary > 0 {
+        let vouched = model
+            .evidence
+            .full_verdict()
+            .map(|v| {
+                if v.canary_records == sink_counts.canary as u64 {
+                    format!(" The verdict counted the same {}.", v.canary_records)
+                } else {
+                    format!(" The verdict counted {} — they disagree.", v.canary_records)
+                }
+            })
+            .unwrap_or_default();
+        note(
+            out,
+            "good",
+            "CANARY RECORDS",
+            &format!(
+                "{} record(s) under {CANARY_ROUTE_ID}, excluded from the mismatch count above. \
+                 They are not findings: they are limen proving the record → flush → report \
+                 pipeline bites.{vouched}",
+                sink_counts.canary
+            ),
+        );
+    }
+    for (id, count) in &sink_counts.other_reserved {
+        note(
+            out,
+            "bad",
+            "UNKNOWN RESERVED ID",
+            &format!(
+                "{count} record(s) under {id}. The {RESERVED_ROUTE_ID_PREFIX} namespace is \
+                 limen's own and nothing limen writes uses that id."
+            ),
+        );
+    }
     if report.malformed_lines > 0 {
         let _ = writeln!(
             out,
@@ -1664,11 +1901,19 @@ fn render_mismatches(out: &mut String, model: &PageModel) {
             pill("bad", "TORN RECORDS")
         );
     }
-    if report.routes.is_empty() {
+    // Reserved ids are accounted for above; the per-route tables are the
+    // mismatch answer, and `verdict::sink_mismatches_by_route` excludes them
+    // from its copy of it for the same reason.
+    let mismatch_routes: Vec<&sink::RouteReport> = report
+        .routes
+        .iter()
+        .filter(|r| !is_reserved(&r.route_id))
+        .collect();
+    if mismatch_routes.is_empty() {
         return;
     }
     out.push_str("<table>\n<tr><th>Route</th><th class=\"num\">Count</th><th>Kinds</th></tr>\n");
-    for route in &report.routes {
+    for route in &mismatch_routes {
         let _ = writeln!(
             out,
             "<tr>{}<td class=\"num\">{}</td><td>{}</td></tr>",
@@ -1679,7 +1924,7 @@ fn render_mismatches(out: &mut String, model: &PageModel) {
     }
     out.push_str("</table>\n");
 
-    for route in &report.routes {
+    for route in &mismatch_routes {
         if route.examples.is_empty() {
             continue;
         }
@@ -1723,10 +1968,19 @@ fn render_counters(out: &mut String, model: &PageModel) {
         Section::Ok(view) => {
             for family in &view.families {
                 let _ = writeln!(out, "<h3>{}</h3>", esc(&family.name));
+                if !family.present {
+                    // Stated, not skipped: an absent family is a fact about the
+                    // scrape, and the note says which of limen's own tools
+                    // tolerates it and why.
+                    note(out, "warn", "ABSENT", family.absence.note());
+                    continue;
+                }
                 if family.rows.is_empty() {
-                    out.push_str(
-                        "<p class=\"note\">The family is exported but carries no \
-                                  samples.</p>\n",
+                    note(
+                        out,
+                        "warn",
+                        "NO SAMPLES",
+                        "The family is exported but carries no samples.",
                     );
                     continue;
                 }
@@ -1738,7 +1992,7 @@ fn render_counters(out: &mut String, model: &PageModel) {
                     let _ = writeln!(
                         out,
                         "<tr>{}<td>{}</td><td class=\"num\">{}</td></tr>",
-                        route_cell(&row.route),
+                        route_label_cell(row.route.as_ref()),
                         esc(&row.labels),
                         row.value
                     );
@@ -1981,17 +2235,95 @@ mod tests {
         assert!(serde_json::from_value::<VerdictDto>(serde_json::json!({"hello": 1})).is_err());
     }
 
+    /// The four series `register_verdict_series` pre-touches at startup — the
+    /// exposition any live limen renders from its very first scrape.
+    const REGISTERED: &str = "\
+limen_shadow_in_flight 0
+limen_diff_sink_enqueued_total 0
+limen_diff_sink_written_total 0
+limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
+limen_diff_sink_dropped_total{reason=\"io_error\"} 0
+limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
+";
+
+    /// The page must require exactly what `limen verdict` requires — no more,
+    /// or a page renders FAILURE against a run the gate itself passed.
+    #[test]
+    fn the_required_families_are_verdicts_required_series() {
+        let ours: BTreeSet<&str> = FAMILIES
+            .iter()
+            .filter(|(_, a)| *a == Absence::Required)
+            .map(|(name, _)| *name)
+            .collect();
+        let theirs: BTreeSet<&str> = crate::verdict::REQUIRED_SERIES.into_iter().collect();
+        assert_eq!(ours, theirs);
+    }
+
     #[test]
     fn a_scrape_missing_a_required_family_is_unavailable_not_zero() {
+        // Everything a busy proxy exports — except one series limen registers
+        // at startup, whose absence means this is not a limen control plane.
         let scrape = Scrape::parse(
-            "limen_comparisons_total{route=\"a\",result=\"match\"} 1\n\
-             limen_shadow_requests_total{route=\"a\"} 1\n\
-             limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0\n",
+            "limen_shadow_in_flight 0\n\
+             limen_diff_sink_enqueued_total 0\n\
+             limen_diff_sink_written_total 0\n\
+             limen_comparisons_total{route=\"a\",result=\"match\"} 1\n",
         )
         .unwrap();
         let err = MetricsView::from_scrape(&scrape).unwrap_err();
-        assert!(err.contains(COMPARISON_SKIPPED_TOTAL), "{err}");
-        assert!(err.contains("not a zero"), "{err}");
+        assert!(err.contains(DIFF_SINK_DROPPED_TOTAL), "{err}");
+        assert!(err.contains("never a zero count"), "{err}");
+    }
+
+    /// The bug a real run found: a service that never skipped a comparison
+    /// exports no `limen_comparison_skipped_total` at all, because that
+    /// counter is registered on its first event. The live verdict against that
+    /// same process exits 0, so the page must render it too.
+    #[test]
+    fn a_lazily_registered_family_may_be_absent() {
+        let scrape = Scrape::parse(&format!(
+            "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n\
+             limen_shadow_requests_total{{route=\"a\"}} 3\n"
+        ))
+        .unwrap();
+        let view = MetricsView::from_scrape(&scrape).expect("a quiet proxy is still a proxy");
+        let absent: Vec<&str> = view
+            .families
+            .iter()
+            .filter(|f| !f.present)
+            .map(|f| f.name.as_str())
+            .collect();
+        assert_eq!(
+            absent,
+            [
+                COMPARISON_SKIPPED_TOTAL,
+                SHADOW_SKIPPED_TOTAL,
+                SHADOW_FAILED_TOTAL
+            ],
+            "only the lazily-registered families are absent"
+        );
+        // …and every one of them says so on the page rather than reading as a
+        // silent zero.
+        for family in view.families.iter().filter(|f| !f.present) {
+            assert_eq!(family.absence, Absence::Informational);
+            assert!(family.absence.note().contains("first event of its kind"));
+        }
+    }
+
+    /// `limen_comparisons_total` is the one family verdict reads as zero when
+    /// absent, and it says why rather than rendering nothing.
+    #[test]
+    fn an_absent_comparisons_family_is_noted_as_verdicts_zero() {
+        let scrape = Scrape::parse(REGISTERED).unwrap();
+        let view = MetricsView::from_scrape(&scrape).expect("a proxy that served nothing");
+        let comparisons = view
+            .families
+            .iter()
+            .find(|f| f.name == COMPARISONS_TOTAL)
+            .unwrap();
+        assert!(!comparisons.present);
+        assert_eq!(comparisons.absence, Absence::ReadsAsZero);
+        assert!(comparisons.absence.note().contains("reads this as zero"));
     }
 
     #[test]
@@ -2005,7 +2337,7 @@ mod tests {
     fn fractional_and_negative_counts_are_refused() {
         let text = |value: &str| {
             format!(
-                "limen_comparisons_total{{route=\"a\",result=\"match\"}} {value}\n\
+                "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} {value}\n\
                  limen_comparison_skipped_total{{route=\"a\",reason=\"event_stream\"}} 1\n\
                  limen_shadow_requests_total{{route=\"a\"}} 1\n\
                  limen_shadow_failed_total{{route=\"a\",reason=\"timeout\"}} 0\n"
@@ -2036,10 +2368,17 @@ mod tests {
         }
         let scrape = Scrape::parse(&text("2")).unwrap();
         let view = MetricsView::from_scrape(&scrape).unwrap();
-        assert_eq!(view.families.len(), 4);
+        assert_eq!(view.families.len(), FAMILIES.len());
         assert_eq!(view.families[0].rows[0].value, 2);
-        assert_eq!(view.families[0].rows[0].route, "a");
+        assert_eq!(view.families[0].rows[0].route.as_deref(), Some("a"));
         assert_eq!(view.families[0].rows[0].labels, "result=match");
+        // A process-wide series carries no route label, and none is invented.
+        let enqueued = view
+            .families
+            .iter()
+            .find(|f| f.name == DIFF_SINK_ENQUEUED_TOTAL)
+            .unwrap();
+        assert_eq!(enqueued.rows[0].route, None);
         // The skip reasons L1 added are visible here by construction.
         let skipped = view
             .families

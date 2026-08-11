@@ -739,7 +739,15 @@ fn collect_informational(scrape: &Scrape) -> Vec<InfoCounter> {
 /// Series whose presence in the scrape is mandatory: their absence means the
 /// instrumentation the whole verdict rests on is missing (a proxy older than
 /// the verdict tool, or a renderer regression) — never "zero events".
-const REQUIRED_SERIES: [&str; 4] = [
+///
+/// These four and no others, because these four and no others are pre-touched
+/// at startup by [`crate::observability::prometheus::register_verdict_series`].
+/// Every other family limen exports is registered lazily, on the first event of
+/// its kind, so a proxy that has never skipped a comparison genuinely exports
+/// no `limen_comparison_skipped_total` — requiring it would fail every quiet,
+/// healthy run. Public so `limen report --format html` can mirror this contract
+/// rather than restate it (see [`crate::report_html`]).
+pub const REQUIRED_SERIES: [&str; 4] = [
     SHADOW_IN_FLIGHT,
     DIFF_SINK_ENQUEUED_TOTAL,
     DIFF_SINK_WRITTEN_TOTAL,
