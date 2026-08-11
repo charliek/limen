@@ -85,11 +85,11 @@ Be precise about what it does not catch. A mutating read with innocuous metadata
 **Inputs:**
 - Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough.
 - Representative traffic (a driving harness, replayed production shapes, or real traffic if Limen is already on the path).
-- The two doctrine pages this stage orchestrates: [observe mode](guides/observe-mode.md) for the mechanism, [classifying routes](guides/classifying-routes.md) for the judgment.
+- The two doctrine pages this stage orchestrates: [observe mode](https://charliek.github.io/limen/guides/observe-mode/) for the mechanism, [classifying routes](https://charliek.github.io/limen/guides/classifying-routes/) for the judgment.
 
 **Actions:**
 
-1. **Bind the control plane to loopback, then turn the `observe:` block on.** The profile discloses route topology and query-parameter *names*, so `metrics.listen_addr` must not be `0.0.0.0` anywhere but a laptop. Presence of the block is the whole switch — `observe: {}` is a complete, valid block, and `limen run` logs a loud warning whenever it is present. Field-by-field: [observe mode → turn the block on](guides/observe-mode.md#1-turn-the-block-on).
+1. **Bind the control plane to loopback, then turn the `observe:` block on.** The profile discloses route topology and query-parameter *names*, so `metrics.listen_addr` must not be `0.0.0.0` anywhere but a laptop. Presence of the block is the whole switch — `observe: {}` is a complete, valid block, and `limen run` logs a loud warning whenever it is present. Field-by-field: [observe mode → turn the block on](https://charliek.github.io/limen/guides/observe-mode/#1-turn-the-block-on).
 2. **Drive traffic at `sample_rate: 1.0`.** Coverage, not volume, is what this stage buys: the classifier's dangerous rules are *existential*, so a corpus that never exercises a route's redirect or flow-hop paths says nothing about them however many times it hits the happy path. Sampling below `1.0` and classification are mutually exclusive — a sampled profile is refused classification outright, not classified with lower confidence.
 3. **Read the profile.**
    ```bash
@@ -102,8 +102,8 @@ Be precise about what it does not catch. A mutating read with innocuous metadata
      > draft.limen.config.yaml
    limen validate-config -c draft.limen.config.yaml
    ```
-   `suggest-routes` polls until the profile stops changing **and** `limen_in_flight_requests` reads zero — never a blind sleep — then classifies every configured route and emits a complete, loadable config. `--format json` gives the same classification as a machine surface. Options and exit codes: [CLI → `suggest-routes`](reference/cli.md#suggest-routes).
-5. **Disposition each route against the class taxonomy.** The tool's three dispositions are evidence, not answers; map each one onto the taxonomy in [classifying routes](guides/classifying-routes.md#the-class-taxonomy) and record the class in the inventory:
+   `suggest-routes` polls until the profile stops changing **and** `limen_in_flight_requests` reads zero — never a blind sleep — then classifies every configured route and emits a complete, loadable config. `--format json` gives the same classification as a machine surface. Options and exit codes: [CLI → `suggest-routes`](https://charliek.github.io/limen/reference/cli/#suggest-routes).
+5. **Disposition each route against the class taxonomy.** The tool's three dispositions are evidence, not answers; map each one onto the taxonomy in [classifying routes](https://charliek.github.io/limen/guides/classifying-routes/#the-class-taxonomy) and record the class in the inventory:
 
    | Disposition | What it means | Where it lands in the taxonomy |
    |---|---|---|
@@ -120,7 +120,7 @@ Be precise about what it does not catch. A mutating read with innocuous metadata
 
 **Gate:** `suggest-routes` exits `0` when a draft was emitted on real classifications; `20` when nothing was usefully profiled (no observations, every route below the read floor, or a sampled profile); `40` when the profile never quiesced; `50` when a required input was unavailable. **Exit `20` still writes a draft** — the document goes to stdout either way — so the presence of a file proves nothing. What `20` says is that the draft rests on refusals to classify rather than on evidence, which makes it unadoptable, not absent. Automation must branch on the exit code, never on whether the redirect produced output.
 
-**What this stage cannot do.** Observation is per *route*; mutation is per *path*. A route matching a prefix folds every path underneath it into one profile, and the recorder deliberately stores path *hashes*, so no rule can see the fold happening — [sub-path aliasing](guides/classifying-routes.md#what-observation-can-and-cannot-tell-you) is unfixable from traffic and is the strongest argument for keeping route granularity a human decision. Stage 1b narrows where a human has to look. It does not replace the looking.
+**What this stage cannot do.** Observation is per *route*; mutation is per *path*. A route matching a prefix folds every path underneath it into one profile, and the recorder deliberately stores path *hashes*, so no rule can see the fold happening — [sub-path aliasing](https://charliek.github.io/limen/guides/classifying-routes/#what-observation-can-and-cannot-tell-you) is unfixable from traffic and is the strongest argument for keeping route granularity a human decision. Stage 1b narrows where a human has to look. It does not replace the looking.
 
 **For the agent:** treat `compare_candidate` as a hypothesis to check against the handler's source, never as a result. Never pass `--adopt-suggestions` on the strength of a profile alone, and never widen a route's `path_prefix` to make more traffic land in one classification — that is the wildcard-granularity sharp edge, manufactured on purpose.
 
@@ -297,7 +297,7 @@ A route marked `has-external-side-effects` (email, third-party call, payment, jo
 
 Some services use POST for complex queries that don't mutate state. If you can **confirm** (from code) that such a route is side-effect-free, it may be treated as a read for shadowing — but this requires explicit confirmation, not assumption, and should be noted in the route inventory.
 
-Limen makes that confirmation explicit in config: the route opts the method in with `comparison.shadow_methods: ["POST"]` (see the [config reference](reference/config-reference.md)). The request body is buffered within `max_body_bytes` and replayed byte-identically to both upstreams; a larger body streams to the primary and is not shadowed (`shadow_skipped{reason="request_too_large"}`). Nothing changes for routes that don't opt in.
+Limen makes that confirmation explicit in config: the route opts the method in with `comparison.shadow_methods: ["POST"]` (see the [config reference](https://charliek.github.io/limen/reference/config-reference/)). The request body is buffered within `max_body_bytes` and replayed byte-identically to both upstreams; a larger body streams to the primary and is not shadowed (`shadow_skipped{reason="request_too_large"}`). Nothing changes for routes that don't opt in.
 
 ---
 
@@ -334,7 +334,7 @@ This is where validation moves from deterministic testing to live traffic, and w
 
 For each route, define a **budget** the route must satisfy to advance. The latency and error-rate rows are conventions the engineer maintains against Limen's exposed metrics and the service's own — nothing in Limen judges whether the new service is fast enough.
 
-The parity row is different in kind, and the difference matters: [`limen verdict`](reference/cli.md#verdict) is **zero-tolerance**. It does not compare a mismatch *rate* against a threshold; any remaining non-canary mismatch is exit `10`. So read the parity row below as a **triage** target — how much unexplained divergence you tolerate while working a route toward the gate — and never as the gate itself, which is 8.3.
+The parity row is different in kind, and the difference matters: [`limen verdict`](https://charliek.github.io/limen/reference/cli/#verdict) is **zero-tolerance**. It does not compare a mismatch *rate* against a threshold; any remaining non-canary mismatch is exit `10`. So read the parity row below as a **triage** target — how much unexplained divergence you tolerate while working a route toward the gate — and never as the gate itself, which is 8.3.
 
 Default budget (tune per route/service):
 
@@ -384,7 +384,7 @@ Three fields there are not about routing at all — they exist so the gate in 8.
 
 A request the sampler never selected appears in **neither**: no shadow is planned, so there is nothing to record a skip against. Coverage is therefore arithmetic you do yourself — `sample_rate` against eligible request volume — not a metric to read off. A route whose comparisons are mostly skipped has a parity result resting on very little traffic. Read recurring mismatch diffs for *what* differs and feed them back as new Pharos scenarios (closing the loop), or accept them as `intentional-change`.
 
-Clients have been served **only** legacy this entire time, and the shadow leg is fire-and-forget off the client path, so it carries no user-facing risk. The **sampled comparison** is not quite free, and it is worth being honest about the two costs it does put on the client path: buffering the primary response to compare it delays the client's first byte (bounded by `primary_ms`, then demoted to streaming — see [resilience & failover](guides/resilience.md#timeouts)), and a primary body that errors *while* it is being buffered is returned as Limen's own `502` rather than as a truncated stream. Both fall only on the sampled fraction, and bounding them is exactly what `sample_rate` and that deadline are for. What shadow mode never risks is sending a client to `new`.
+Clients have been served **only** legacy this entire time, and the shadow leg is fire-and-forget off the client path, so it carries no user-facing risk. The **sampled comparison** is not quite free, and it is worth being honest about the two costs it does put on the client path: buffering the primary response to compare it delays the client's first byte (bounded by `primary_ms`, then demoted to streaming — see [resilience & failover](https://charliek.github.io/limen/guides/resilience/#timeouts)), and a primary body that errors *while* it is being buffered is returned as Limen's own `502` rather than as a truncated stream. Both fall only on the sampled fraction, and bounding them is exactly what `sample_rate` and that deadline are for. What shadow mode never risks is sending a client to `new`.
 
 The remaining risk in this stage is proving nothing at all, which is what 8.3 exists to rule out.
 
@@ -407,7 +407,7 @@ In one invocation `verdict` waits for the shadow/comparison/sink pipeline to qui
 | `40` | Drain timeout — the pipeline never quiesced. | Re-run with traffic actually stopped; the mismatch and floor numbers from a run that never drained are unreliable, which is why `40` outranks `10` and `20`. |
 | `50` | A required input was unavailable (control plane unreachable, sink unreadable, a required metric series absent, a refused canary trigger). | A refused verdict, not a failed one. Fix the invocation. |
 
-The disciplines behind those codes are set out in full in [prove your lens bites](guides/prove-your-lens-bites.md) — read it once before the first campaign rather than deriving them from the exit table. Two of them decide whether a clean exit means anything:
+The disciplines behind those codes are set out in full in [prove your lens bites](https://charliek.github.io/limen/guides/prove-your-lens-bites/) — read it once before the first campaign rather than deriving them from the exit table. Two of them decide whether a clean exit means anything:
 
 - **Floors prove something was compared.** A floor counts comparisons, not coverage; `min_comparisons: 20` is met by 20 comparisons out of 20 eligible requests exactly as much as by 20 out of 20,000. Coverage is a `sample_rate` and traffic-volume decision made *before* the campaign runs.
 - **The canary proves the recording pipeline is live.** A campaign with real mismatches would eventually notice a broken sink; a campaign with zero real mismatches never would, because an empty sink and a correctly empty sink render identically. Run `--canary` in *every* campaign wrapper — a standing check that only runs when someone remembers is not a standing check. Note what it does not prove: it goes through no route's comparison rules and says nothing about whether any real shadow request was dispatched. Floors plus real traffic cover that half; the two are complementary, not redundant.
