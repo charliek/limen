@@ -25,6 +25,15 @@ pub enum SkipReason {
     /// it could not be buffered for replay (spec §6.1); the primary still
     /// received it, streamed and unchanged.
     RequestTooLarge,
+    /// The primary response was a `text/event-stream`, which by design never
+    /// completes — it is skipped before a byte is buffered so the client keeps
+    /// the streaming path.
+    EventStream,
+    /// Buffering the primary response for comparison ran out of the request's
+    /// `primary_ms` budget (a trickling or stalled body); the client is served
+    /// the streamed body instead of waiting on a comparison that may never
+    /// become possible.
+    ResponseBufferTimeout,
 }
 
 impl SkipReason {
@@ -34,6 +43,8 @@ impl SkipReason {
             SkipReason::ConcurrencyLimit => "concurrency_limit",
             SkipReason::ResponseTooLarge => "response_too_large",
             SkipReason::RequestTooLarge => "request_too_large",
+            SkipReason::EventStream => "event_stream",
+            SkipReason::ResponseBufferTimeout => "response_buffer_timeout",
         }
     }
 }

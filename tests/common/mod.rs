@@ -2,14 +2,20 @@
 //!
 //! Tests drive the data-plane router directly via `tower`'s `oneshot` against
 //! real `wiremock` upstreams — no production ports are bound, so the tests are
-//! fast and isolated. Each test binary uses a subset of these helpers, so the
-//! module-level `allow(dead_code)` keeps `-D warnings` happy.
+//! fast and isolated. The exception is [`raw_upstream`], for the properties no
+//! mock template can produce. Each test binary uses a subset of these helpers,
+//! so the module-level `allow(dead_code)` keeps `-D warnings` happy.
 #![allow(dead_code)]
+
+use std::future::Future;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
 use axum::Router;
 use limen::config::model::Config;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tower::ServiceExt;
 
 /// Parse a test config from YAML.
@@ -135,6 +141,77 @@ pub async fn wait_until(what: &str, cond: impl Fn() -> bool) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+/// A gate the test opens when it wants an upstream to continue. A `watch`
+/// rather than a `oneshot` so one upstream can gate several connections.
+#[derive(Clone)]
+pub struct Gate(tokio::sync::watch::Sender<bool>);
+
+impl Gate {
+    pub fn new() -> Self {
+        Self(tokio::sync::watch::channel(false).0)
+    }
+    pub fn open(&self) {
+        self.0.send_replace(true);
+    }
+    pub async fn wait(&self) {
+        let mut rx = self.0.subscribe();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
+/// A raw-TCP upstream: accepts connections for the lifetime of the test and
+/// hands each one, plus its request head, to `serve`. Returns the origin URL.
+///
+/// Raw sockets rather than `wiremock` because the properties these tests pin
+/// need response shapes no mock template can produce — a body held
+/// half-written, a stream that never ends, a socket closed mid-body.
+pub async fn raw_upstream<F, Fut>(serve: F) -> String
+where
+    F: Fn(TcpStream, String) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let serve = Arc::new(serve);
+    tokio::spawn(async move {
+        while let Ok((mut sock, _)) = listener.accept().await {
+            let serve = serve.clone();
+            tokio::spawn(async move {
+                if let Some(head) = read_head(&mut sock).await {
+                    serve(sock, head).await;
+                }
+            });
+        }
+    });
+    format!("http://{addr}")
+}
+
+/// Read a request head off a raw socket. The test requests carry no body, so
+/// the head is the whole request; `None` means the peer hung up first.
+async fn read_head(sock: &mut TcpStream) -> Option<String> {
+    let mut head = Vec::new();
+    let mut buf = [0u8; 1024];
+    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+        let n = sock.read(&mut buf).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        head.extend_from_slice(&buf[..n]);
+    }
+    Some(String::from_utf8_lossy(&head).into_owned())
+}
+
+/// Write raw bytes to a socket and flush, so the peer sees them before the
+/// handler goes on to wait on whatever comes next.
+pub async fn write(sock: &mut TcpStream, data: &str) {
+    sock.write_all(data.as_bytes()).await.unwrap();
+    sock.flush().await.unwrap();
 }
 
 /// The status, headers, and body text of a response.
