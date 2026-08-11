@@ -42,6 +42,15 @@ test:  ## Run the test suite
 bench:  ## Run the criterion benchmarks
 	$(CARGO) bench
 
+.PHONY: audit
+audit:  ## Check dependency licenses + advisories with cargo-deny (not wired into CI)
+	@if $(CARGO) deny --version >/dev/null 2>&1; then \
+		$(CARGO) deny check licenses advisories -W unmaintained; \
+	else \
+		echo "AUDIT SKIPPED (cargo-deny not installed -- cargo install cargo-deny)"; \
+		exit 1; \
+	fi
+
 # ---- docs --------------------------------------------------------------
 
 .PHONY: docs docs-serve
