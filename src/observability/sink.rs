@@ -41,7 +41,7 @@ use std::thread;
 
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
-use time::{Date, OffsetDateTime};
+use time::{Date, Month, OffsetDateTime};
 use tracing::warn;
 
 use crate::compare::result::{
@@ -558,26 +558,45 @@ fn sink_files(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 }
 
 /// Whether a file name is exactly what [`file_name`] writes:
-/// `mismatches-YYYY-MM-DD.jsonl`, digits checked.
+/// `mismatches-YYYY-MM-DD.jsonl`, over a real calendar date.
 ///
 /// Deliberately strict rather than a `mismatches-*.jsonl` glob. A sink directory
 /// tends to accumulate operator copies — `mismatches-backup.jsonl`,
 /// `mismatches-2026-07-28-copy.jsonl` — and counting those would double-report
 /// the very mismatches an operator is trying to size up.
 fn is_sink_file_name(name: &str) -> bool {
-    let Some(rest) = name.strip_prefix(FILE_PREFIX) else {
-        return false;
-    };
-    let Some(date) = rest.strip_suffix(FILE_SUFFIX) else {
-        return false;
-    };
-    let date = date.as_bytes();
-    date.len() == 10
-        && date[4] == b'-'
-        && date[7] == b'-'
-        && [0, 1, 2, 3, 5, 6, 8, 9]
-            .iter()
-            .all(|i| date[*i].is_ascii_digit())
+    sink_file_date(name).is_some()
+}
+
+/// The UTC date a sink file name encodes, or `None` if the name is not one
+/// [`file_name`] could have produced.
+///
+/// The date is *parsed*, not merely shaped: the writer derives the name from a
+/// real `Date`, so `mismatches-2026-99-99.jsonl` is a name limen cannot have
+/// written. A digits-only check would count it as a sink file, and an empty one
+/// dropped into the directory would then turn "no evidence" into "a file was
+/// read and held nothing" — absence promoted to a clean bill of health, which
+/// is the one direction this reader must never fail in.
+fn sink_file_date(name: &str) -> Option<Date> {
+    let rest = name.strip_prefix(FILE_PREFIX)?;
+    let date = rest.strip_suffix(FILE_SUFFIX)?;
+    let bytes = date.as_bytes();
+    if bytes.len() != 10 || bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    if ![0, 1, 2, 3, 5, 6, 8, 9]
+        .iter()
+        .all(|i| bytes[*i].is_ascii_digit())
+    {
+        return None;
+    }
+    // Zero-padded fixed widths, digit-checked above, so these parses cannot
+    // overflow or sign-flip; the calendar check is what does the real work
+    // (month 13, day 31 in November, February 29 in a common year).
+    let year: i32 = date[0..4].parse().ok()?;
+    let month: u8 = date[5..7].parse().ok()?;
+    let day: u8 = date[8..10].parse().ok()?;
+    Date::from_calendar_date(year, Month::try_from(month).ok()?, day).ok()
 }
 
 /// Roll one route's records up into its [`RouteReport`], keeping the newest
@@ -894,6 +913,54 @@ mod tests {
                 !is_sink_file_name(decoy),
                 "{decoy} should not be a sink file"
             );
+        }
+    }
+
+    /// A name the writer could never have produced is not a sink file, however
+    /// well-shaped it looks. The digits are a calendar date or they are
+    /// nothing: an empty `mismatches-2026-99-99.jsonl` dropped into a sink
+    /// directory would otherwise read as a file that *was* read and held no
+    /// mismatches — absence promoted to a clean bill of health.
+    #[test]
+    fn an_impossible_date_is_not_a_sink_file() {
+        for impossible in [
+            "mismatches-2026-99-99.jsonl",
+            "mismatches-2026-13-01.jsonl",
+            "mismatches-2026-00-01.jsonl",
+            "mismatches-2026-01-00.jsonl",
+            "mismatches-2026-01-32.jsonl",
+            "mismatches-2026-11-31.jsonl",
+            // 2026 is not a leap year.
+            "mismatches-2026-02-29.jsonl",
+        ] {
+            assert!(
+                !is_sink_file_name(impossible),
+                "{impossible} should not be a sink file"
+            );
+        }
+        // …and the real dates on either side of those still are.
+        for real in [
+            "mismatches-2026-02-28.jsonl",
+            "mismatches-2024-02-29.jsonl",
+            "mismatches-2026-11-30.jsonl",
+            "mismatches-2026-12-31.jsonl",
+            "mismatches-0001-01-01.jsonl",
+        ] {
+            assert!(is_sink_file_name(real), "{real} should be a sink file");
+        }
+    }
+
+    /// Whatever the writer names a file, the reader accepts — checked over a
+    /// year of dates rather than the one or two a hand-written list covers.
+    #[test]
+    fn every_name_the_writer_produces_is_read_back() {
+        let mut date = Date::from_calendar_date(2024, Month::January, 1).unwrap();
+        let end = Date::from_calendar_date(2025, Month::January, 1).unwrap();
+        while date < end {
+            let name = file_name(date);
+            assert!(is_sink_file_name(&name), "{name} was written but not read");
+            assert_eq!(sink_file_date(&name), Some(date));
+            date = date.next_day().unwrap();
         }
     }
 }

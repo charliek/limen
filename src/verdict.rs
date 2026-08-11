@@ -162,6 +162,16 @@ pub struct Sample {
     pub name: String,
     pub labels: BTreeMap<String, String>,
     pub value: f64,
+    /// The value exactly as it appeared on the wire.
+    ///
+    /// `value` is an `f64` because the drain loop's arithmetic is, but an
+    /// `f64` cannot represent every counter a scrape can carry: `2^64` reads
+    /// back as a finite, integral, non-negative float and saturates to
+    /// `u64::MAX` on cast. Readers that need an exact count parse this token
+    /// instead, so a value they cannot represent is a refusal rather than a
+    /// fabrication. (This verdict's own math keeps using `value`; it validates
+    /// the exact-integer range it needs separately.)
+    pub raw_value: String,
 }
 
 /// A parsed `/metrics` scrape.
@@ -188,8 +198,10 @@ impl Scrape {
         Ok(Scrape { samples })
     }
 
-    /// All samples of a metric family.
-    fn family<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Sample> + 'a {
+    /// All samples of a metric family. Public so the HTML report can render a
+    /// family's rows off the same parser this verdict does its math with,
+    /// rather than growing a second exposition reader that could drift from it.
+    pub fn family<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a Sample> + 'a {
         self.samples.iter().filter(move |s| s.name == name)
     }
 
@@ -246,8 +258,9 @@ impl Scrape {
 
 /// Parse one `name{label="value",...} value` (or `name value`) line.
 fn parse_sample(line: &str) -> Option<Sample> {
-    let (head, value) = line.rsplit_once(' ')?;
-    let value: f64 = value.trim().parse().ok()?;
+    let (head, raw_value) = line.rsplit_once(' ')?;
+    let raw_value = raw_value.trim();
+    let value: f64 = raw_value.parse().ok()?;
     let (name, labels) = match head.split_once('{') {
         None => (head.trim().to_string(), BTreeMap::new()),
         Some((name, rest)) => {
@@ -263,6 +276,7 @@ fn parse_sample(line: &str) -> Option<Sample> {
         name,
         labels,
         value,
+        raw_value: raw_value.to_string(),
     })
 }
 

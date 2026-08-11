@@ -25,10 +25,12 @@
 //! | [`health`]      | `/health/live` and `/health/ready` endpoints + readiness.  |
 //! | [`error`]       | Top-level error types crossing module boundaries.          |
 //!
-//! Two modules sit outside that map because they implement operator commands
-//! rather than a data-plane concern: [`verdict`] (`limen verdict`) and the
+//! Three modules sit outside that map because they implement operator commands
+//! rather than a data-plane concern: [`verdict`] (`limen verdict`), the
 //! [`suggest`]/[`draft`] pair (`limen suggest-routes`), which classify an
-//! observe-mode profile and render a draft configuration from it.
+//! observe-mode profile and render a draft configuration from it, and
+//! [`report_html`] (`limen report --format html`), which renders those
+//! artifacts into a fail-closed status page.
 
 pub mod cli;
 pub mod compare;
@@ -40,6 +42,7 @@ pub mod flags;
 pub mod health;
 pub mod http;
 pub mod observability;
+pub mod report_html;
 pub mod resilience;
 pub mod routing;
 pub mod suggest;
