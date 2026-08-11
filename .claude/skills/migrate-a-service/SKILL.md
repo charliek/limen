@@ -114,12 +114,12 @@ routes:
     contract: "./contracts/user-service.contract.yaml#get-user"   # same file Pharos consumes
     comparison: { enabled: true, sample_rate: 0.1, max_body_bytes: 262144, min_comparisons: 20 }
 
-diff_sink: { dir: "./campaign-diffs" }   # durable trail; reset on every proxy start
+diff_sink: { dir: "./campaign-diffs" }   # durable trail — reset it on every proxy start; limen only appends
 debug:     { sink_canary: true }         # exposes POST /debug/canary
 ```
 
-`min_comparisons` is an *exercise floor* (default `1`; `0` an explicit, visible exemption) read only by
-`verdict` — not a tolerance. Coverage is `sample_rate` against eligible volume, arithmetic you do
+`min_comparisons` is an *exercise floor* (default `1`; `0` an explicit, visible exemption) read by
+`verdict` and cross-checked by `report --format html` — not a tolerance. Coverage is `sample_rate` against eligible volume, arithmetic you do
 yourself: an unsampled request appears in no skip metric. Validate the contract with `limen check-contract
 ./contracts/user-service.contract.yaml`. `comparison.shadow_methods: ["POST"]` opts a write into shadowing
 — body buffered within `max_body_bytes`, replayed byte-identically to both upstreams. It exists and it is

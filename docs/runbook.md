@@ -345,7 +345,7 @@ Default budget (tune per route/service):
 | **New-service latency** | New **p95 ≤ legacy p95** (or within a **documented exception**, e.g. "+15% p95 allowed because Z") for the route over the window. p99 not pathologically worse. |
 | **Proxy overhead** | Limen's own added latency within its SLO (streaming p50 < 1 ms, p99 < 5 ms; buffer-for-compare p50 < 3 ms) — i.e. confirm the *proxy* is healthy, separately from the service. |
 
-`comparison.min_comparisons` is **not** a budget row and does not belong in this table: it is an *exercise floor* — did this route get compared at all — read only by `limen verdict`, and set from the traffic you expect rather than from a tolerance you accept.
+`comparison.min_comparisons` is **not** a budget row and does not belong in this table: it is an *exercise floor* — did this route get compared at all — read by `limen verdict` (and cross-checked against the verdict's floors by `limen report --format html`), and set from the traffic you expect rather than from a tolerance you accept.
 
 A **migration exception** is a deliberate, documented allowance for a route to regress within a bound (e.g. a route that does more work in the new implementation by design). Record it next to the route; it changes the gate for that route only. There is no such thing as a parity exception expressed as a rate — an accepted difference is accepted *in the contract*, where it is reviewable, or it is a mismatch.
 

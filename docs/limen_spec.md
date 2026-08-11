@@ -145,8 +145,13 @@ limen/
       example-service.contract.yaml
   src/
     main.rs                 # bootstrap, signal handling, listener wiring
-    cli.rs                  # clap subcommands: run, validate-config, print-routes, check-contract, report
+    cli.rs                  # clap subcommands: run, validate-config, print-routes,
+                            #   check-contract, report, verdict, suggest-routes
     error.rs                # top-level error types
+    verdict.rs              # `limen verdict`: drain, floors, sink integrity, canary (§12.1)
+    suggest.rs              # observe-profile → per-route classification
+    draft.rs                # `limen suggest-routes`: draft config emission
+    report_html.rs          # `limen report --format html`: fail-closed status page (§10.4)
     config/
       mod.rs
       model.rs              # serde structs for limen.config.yaml
@@ -188,9 +193,11 @@ limen/
       headers.rs            # set_cookie/location comparison dimensions (§4.2)
     observability/
       mod.rs
-      metrics.rs            # metric definitions + registration
+      metrics.rs            # observer traits + metric event vocabulary
+      prometheus.rs         # metric definitions, labels, exposition rendering
       logging.rs            # tracing setup, structured fields
       request_id.rs         # request/trace id extraction + propagation
+      observe.rs            # observe mode: passive per-route traffic profiling
       sink.rs               # durable mismatch diff sink + `limen report` (§10.4)
     resilience/
       mod.rs
@@ -901,10 +908,29 @@ Behavior:
 `limen report` aggregates a sink directory without needing the proxy's configuration:
 
 ```bash
-limen report --dir ./limen-diffs [--route <id>] [--since <RFC3339>] [--format human|json]
+limen report --dir ./limen-diffs [--route <id>] [--since <RFC3339>] [--format human|json] [--out <path>]
 ```
 
-It reads every `mismatches-*.jsonl` file in the directory, applies the filters, and prints per-route mismatch counts (total and by `mismatch_kinds`) plus the most recent examples per route. Unparseable lines are **counted and reported**, never fatal — a record torn by a killed process must not cost you the rest of the report. Unknown fields are ignored, so a directory written by a newer Limen still reports against an older binary.
+It reads every `mismatches-*.jsonl` file in the directory, applies the filters, and prints per-route mismatch counts (total and by `mismatch_kinds`) plus the most recent examples per route. Unparseable lines are **counted and reported**, never fatal — a record torn by a killed process must not cost you the rest of the report. Unknown fields are ignored, so a directory written by a newer Limen still reports against an older binary. Output goes to stdout unless `--out` names a file.
+
+#### `--format html`: the campaign status page
+
+The third format renders a self-contained HTML page over a whole campaign's artifacts rather than the sink alone:
+
+```bash
+limen report --dir ./limen-diffs --format html \
+  [--config limen.config.yaml] [--verdict verdict.json] \
+  [--profile profile.json] [--metrics metrics.txt] [--out report.html]
+```
+
+Each optional input is a file that already exists — the config the campaign ran under, a document captured from `limen verdict --format json`, a saved `GET /observe/profile` body, a saved `/metrics` scrape. The page runs nothing and contacts nothing; `--dir` alone still works, and everything not given is rendered as "not provided".
+
+Its defining property is negative: **it must be unable to render a failure or a missing input as success.** The banner has three states — CLEAN, INCOMPLETE, FAILURE — and reaching CLEAN requires the sink directory, `--config` and `--verdict` all present and parsed, every *provided* optional input parsed, a self-consistent verdict that exited 0 online, and no disagreement between artifacts. Sink counts are reconciled against the verdict's per-route map, canary records against its `canary_records`, and verdict floors against the config's `effective_min_comparisons()`; any disagreement is a named finding and a FAILURE. Where the page reads an input `limen verdict` also reads, it takes the same position on it — including which metric families may legitimately be absent (§12.1's required series are required here too; the lazily-registered ones are not).
+
+Two rules follow from that property:
+
+- **`--route` and `--since` are refused with `--format html`** (exit 1). Both filter records *before* aggregation, so a filtered page could reconcile a dirty sink to zero and render green.
+- **Producing the page is exit 0 even when every section of it is a failure.** A CI artifact that vanishes on a bad run is one nobody looks at. Only a page that could not be produced — an unwritable `--out`, an incoherent flag combination — is exit 1; an unreadable *input* is a section of the page, not a process failure.
 
 ---
 

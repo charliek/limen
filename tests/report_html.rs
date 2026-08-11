@@ -290,6 +290,26 @@ fn the_canonical_fixture_is_the_one_clean_page() {
         1,
         "exactly one page-level claim of success"
     );
+
+    // The other side of that contract, and the reason the incomplete headline
+    // does not say "NOT A CLEAN RESULT": a page that is not clean must not
+    // contain the word at all, or "did this page claim success?" stops being
+    // answerable by searching for it.
+    let incomplete = Workspace::new();
+    let failure =
+        canonical().with_sink_lines(&[line("2026-08-01T10:00:00Z", "a", "req-1", &["body"])]);
+    for (expected, ws) in [
+        (BannerState::Incomplete, &incomplete),
+        (BannerState::Failure, &failure),
+    ] {
+        let model = ws.model();
+        assert_eq!(model.banner.state, expected, "{}", why(&model));
+        assert_eq!(
+            render(&model).matches("CLEAN").count(),
+            0,
+            "a {expected:?} page printed the word CLEAN"
+        );
+    }
     assert!(html.contains("event_stream"), "the L1 skip reasons surface");
     assert!(html.contains("response_buffer_timeout"));
     // The five gating checks are on the page with their own details, and the
@@ -347,7 +367,7 @@ fn a_missing_verdict_is_incomplete() {
         why(&model)
     );
     assert_eq!(model.evidence.verdict, Section::NotProvided);
-    assert!(ws.page().contains("NOT A CLEAN RESULT"));
+    assert!(ws.page().contains("NOT A PASSING RESULT"));
 }
 
 #[test]

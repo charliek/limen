@@ -186,6 +186,59 @@ mod tests {
         assert!(matches!(out, Buffered::TimedOut(_)));
     }
 
+    /// The other half of the deadline contract, and the one a stalled-stream
+    /// test cannot see: an upstream whose chunks are *always immediately
+    /// ready*, staying under the size cap forever.
+    ///
+    /// This is the input that separates the pinned, biased timer from a
+    /// per-chunk `timeout_at`. `timeout_at` polls the inner future first and
+    /// builds a fresh `Sleep` each turn; a fresh `Sleep` is never ready on its
+    /// first poll, so a stream that is always ready means the timer is never
+    /// reached and the read runs forever with the size cap as its only bound.
+    /// Every other deadline test here uses a stream that stops yielding, which
+    /// a reverted implementation passes just as happily.
+    ///
+    /// Two runtime details make it testable, and both are load-bearing:
+    ///
+    /// - **A multi-thread runtime.** The buffering task never returns
+    ///   `Poll::Pending`, so it never yields to the scheduler, so a
+    ///   current-thread runtime never parks and its time driver never advances
+    ///   — the deadline could not fire on any implementation. With a second
+    ///   worker, an idle thread drives the timer while the first one spins.
+    ///   (Measured: ~35k empty chunks buffered over the 20ms window.)
+    /// - **Its own thread plus a channel.** A regression here is a hang, not a
+    ///   failed assertion, and a hot loop that never yields cannot be
+    ///   cancelled by runtime shutdown. `recv_timeout` turns the hang into a
+    ///   verdict this test can report.
+    #[test]
+    fn an_always_ready_stream_still_trips_the_deadline() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .enable_time()
+                .build()
+                .expect("runtime");
+            let out = rt.block_on(async {
+                // Empty chunks: always ready, and the running total never
+                // moves, so the size cap can never end this read. Only the
+                // clock can.
+                let hot = stream::repeat_with(|| Ok::<Bytes, std::io::Error>(Bytes::new()));
+                let deadline = Instant::now() + std::time::Duration::from_millis(20);
+                buffer_bounded(hot, 1024, Some(deadline)).await
+            });
+            let _ = tx.send(matches!(out, Buffered::TimedOut(_)));
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(true) => {}
+            Ok(false) => panic!("an always-ready stream ended some other way than the deadline"),
+            Err(_) => panic!(
+                "an always-ready stream ran past its deadline — the timer is being starved by \
+                 a stream that is always ready to yield"
+            ),
+        }
+    }
+
     #[tokio::test]
     async fn a_body_that_completes_inside_the_deadline_is_buffered_whole() {
         // The false-demotion control at the unit level: having a deadline must

@@ -13,6 +13,12 @@
 //!   banner to INCOMPLETE. An artifact that was provided but could not be read
 //!   or parsed is a FAILURE — a page that quietly dropped an unreadable verdict
 //!   would be reporting on a campaign it never looked at.
+//!
+//!   The sink directory is the one carve-out, because it is the one input that
+//!   is always "provided": an unreadable or absent `--dir` is INCOMPLETE, not
+//!   FAILURE, because it is indistinguishable from a campaign that has not
+//!   recorded anything yet — the same reason `files_read == 0` is. It is never
+//!   CLEAN either way, which is the property that matters.
 //! - **An empty sink is not a clean run.** A sink file is created by the first
 //!   record written to it, so an empty directory is indistinguishable from a
 //!   pipeline that never ran — or one that cannot write at all.
@@ -714,12 +720,15 @@ pub enum BannerState {
 }
 
 impl BannerState {
-    /// The headline. The clean headline is the only uppercase `CLEAN` the page
-    /// ever prints, so "does this page claim success?" is a substring search.
+    /// The headline. Uppercase `CLEAN` appears nowhere on this page but the
+    /// clean banner — which is why the incomplete headline says "PASSING"
+    /// rather than the "NOT A CLEAN RESULT" it once did: the phrase read well
+    /// and quietly broke the contract, since "does this page claim success?"
+    /// is a substring search and the denial contained the claim.
     fn headline(self) -> &'static str {
         match self {
             BannerState::Clean => "CLEAN",
-            BannerState::Incomplete => "INCOMPLETE — NOT A CLEAN RESULT",
+            BannerState::Incomplete => "INCOMPLETE — NOT A PASSING RESULT",
             BannerState::Failure => "FAILURE",
         }
     }
