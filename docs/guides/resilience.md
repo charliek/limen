@@ -127,14 +127,42 @@ In both cases the breaker still records the failure and steers later traffic.
 
 Each route sets `timeouts.primary_ms` and `timeouts.shadow_ms` (spec §9.2):
 
-- **`primary_ms`** bounds the client-facing request's *time to response* (connect
-  + send + first byte). The streaming response body is then relayed without a
-  total deadline, so large or slow downloads are not truncated. A primary that
-  doesn't respond in time yields `504 Gateway Timeout` (or fails over, if
+- **`primary_ms`** is **one absolute deadline for the whole primary leg**, taken
+  immediately before the request is sent. It bounds the *time to response*
+  (connect + send + first byte) and — on a request sampled for comparison — the
+  response buffering that follows it, from the same budget. A primary that never
+  responds within it yields `504 Gateway Timeout` (or fails over, if
   `failover_safe`).
 - **`shadow_ms`** bounds the entire shadow exchange. Because the shadow runs off
   the client path, **it can never extend client-visible latency** — a slow or
   hung shadow is abandoned without touching the client's response.
+
+**Unsampled traffic keeps its unbounded stream.** On the default streaming path
+the response body is relayed with no total deadline at all, so large or slow
+downloads are never truncated. That is unchanged: the deadline exists only on
+the *sampled* primary response leg, which is the only buffering that sits on the
+client's response path.
+
+**A sampled response that outlives the budget demotes; it is not failed.** When
+buffering for comparison runs past what is left of `primary_ms`, Limen hands the
+client the already-read prefix chained to the rest of the live stream and skips
+the comparison
+(`limen_comparison_skipped_total{reason="response_buffer_timeout"}`). The client
+still receives the **complete** body — nothing is truncated and no error is
+synthesized — and the worst-case time to first byte on a sampled route is back
+to ≈ `primary_ms` rather than however long a trickling body cares to take. A
+response declaring `text/event-stream` skips comparison *eagerly*, before a byte
+is buffered (`reason="event_stream"`): an event stream never completes, so
+buffering one could only ever stall the first byte and then skip anyway.
+
+!!! note "What a dying body costs depends on when it dies"
+    A body that errors **while still being buffered** has never had a byte sent
+    to the client, so Limen replaces the upstream's `2xx` with its own `502` —
+    a broken response is never passed off as a good one. A body that errors
+    **after a demotion** cannot be recalled: the status and headers are already
+    on the wire, so the client sees a truncated stream, exactly as it would on
+    the ordinary streaming path. The demotion is the moment the response stops
+    being retractable.
 
 ## Bounded buffers & shadow concurrency
 
@@ -148,8 +176,10 @@ Limen never buffers unbounded data (spec §9.3–9.4):
   the limit is never fully buffered: it streams to the primary unchanged and
   shadowing is skipped, incrementing `shadow_skipped{reason="request_too_large"}`.
 - **Comparison buffering** for shadows is bounded per route by
-  `comparison.max_body_bytes`; an over-limit response is streamed to the client
-  with the comparison skipped.
+  `comparison.max_body_bytes`, **and in time** by the remainder of the route's
+  `primary_ms` (above); an over-limit *or* out-of-budget response is streamed to
+  the client with the comparison skipped. A size bound alone would still let a
+  body that trickles under the limit hold the client's first byte indefinitely.
 - **Concurrent shadows** are capped by `server.shadow_concurrency_limit`. Over
   the cap, shadows are **skipped** (never queued unboundedly), incrementing
   `shadow_skipped{reason="concurrency_limit"}` — checked *before* a

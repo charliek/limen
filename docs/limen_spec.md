@@ -39,7 +39,7 @@ The two share a **behavioral contract** (Section 4) but are independently deploy
 - Protocols beyond HTTP/1.1 and HTTP/2 over TCP. No gRPC, no WebSockets, no GraphQL-specific handling in MVP.
 - Dual-writing or reconciling production *data*. Limen shadows reads (and, only where a route explicitly opts a method in, replays a write to the new upstream for comparison); it never reconciles data between the two implementations.
 - Hot-reloading of behavioral comparison rules mid-run (flag *values* hot-reload; comparison *semantics* are fixed for the duration of a run — see Section 4.4).
-- A web UI.
+- A web UI. `limen report --format html` is not one: it renders a single self-contained static page from artifacts that already exist on disk — no server, no JavaScript, no external references, nothing live — so it is a report artifact in a second format, not a dashboard and not a UI.
 
 ### 1.3 Assumed migration pattern
 
@@ -110,7 +110,7 @@ This is a central design decision. Limen has **two deliberately separate code pa
 
 1. **Streaming path (default).** Used when a route has comparison disabled, or when a request is not selected for comparison sampling. Request and response bodies are **streamed** between client and upstream without full buffering. Limen observes only status, headers, and latency. Lowest overhead; unbounded body size is fine. This is the path most production traffic should take.
 
-2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client. The *request* body is buffered under the same bound only for a write the route opted into shadowing (Section 6.1), so the shadow can replay identical bytes; over that limit → shadowing is skipped with reason `request_too_large` and the request body streams to the primary unchanged.
+2. **Buffer-for-compare path.** Used only when comparison is enabled for the route **and** this request is selected by sampling **and** the body is within `max_body_bytes`. Both relevant responses are buffered, normalized, hashed, and (if hashes differ and sampling selected this request for detailed diffing) diffed. Bounded by `max_body_bytes`; over the limit → comparison is skipped with reason `response_too_large`, and the primary response is still streamed to the client. It is bounded in **time** by the same `primary_ms` budget as the send that preceded it — one absolute per-request deadline covering send-to-headers *and* this buffering — so on expiry the response demotes to streaming with comparison skipped (`response_buffer_timeout`) rather than holding the client's first byte for a body that trickles. A `text/event-stream` response skips comparison eagerly (`event_stream`) before a byte is buffered, since an event stream never completes and buffering one could only ever end at that deadline. The *request* body is buffered under the same bound only for a write the route opted into shadowing (Section 6.1), so the shadow can replay identical bytes; over that limit → shadowing is skipped with reason `request_too_large` and the request body streams to the primary unchanged.
 
 The sampling decision is made **per request**, before buffering, so that on a route with `sample_rate: 0.1` you pay buffering cost on ~10% of traffic and stream the other ~90%.
 
@@ -824,7 +824,7 @@ A global and/or per-route limit on concurrent in-flight shadow requests. When ex
 
 ### 9.4 Bounded buffers
 
-All buffering (request bodies, comparison buffering) is bounded by configured limits. The proxy must never buffer unbounded data; over-limit bodies fall back to streaming with comparison skipped.
+All buffering (request bodies, comparison buffering) is bounded by configured limits. The proxy must never buffer unbounded data; over-limit bodies fall back to streaming with comparison skipped. Comparison buffering of the primary response is additionally bounded in **time**: it draws down the same absolute `primary_ms` budget as the send that preceded it (Section 3.3), and an expiry demotes to the same streaming fallback with reason `response_buffer_timeout` — a bound on size alone would still let a trickling body hold the client's first byte indefinitely.
 
 ---
 
@@ -843,7 +843,7 @@ Required metrics (avoid high-cardinality labels — **no** user IDs, tenant IDs,
 - Comparison attempted count.
 - Comparison match count.
 - Comparison mismatch count.
-- Comparison skipped count by reason (`response_too_large`, `not_sampled`, `non_json`, …).
+- Comparison skipped count by reason (`response_too_large`, `event_stream`, `response_buffer_timeout`) — a shadow that was planned but whose comparison could not complete. A request the sampler never selected makes no shadow plan at all and is therefore counted in neither this series nor the shadow-skip one; comparison coverage follows from `sample_rate` and eligible request volume, not from a skip count.
 - Diff sampled count.
 - Circuit-breaker state by route and upstream.
 - Feature-flag provider health.

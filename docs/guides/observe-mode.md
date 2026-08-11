@@ -169,6 +169,44 @@ complete; a config file handed to `suggest-routes` later cannot be trusted to
 restate it accurately, so the two are cross-checked and a mismatch is a typed
 failure rather than a silent average.
 
+### Length-less responses collapse to one bucket
+
+`length_repeats` / `length_varied` / `length_missing` are the whole stability
+signal, and the third counter is the one worth reading closely. A response that
+never declares `Content-Length` — an SSE stream (`text/event-stream`), a chunked
+response, a reply whose length header is absent or unparseable — contributes no
+stability evidence either way, so it is counted in `length_missing` rather than
+guessed at in either direction.
+
+Two consequences follow, and they point in the same direction:
+
+- **Classification narrows on *any* length-less read.** The
+  `stability-unobserved` rule fires when `length_missing > 0`, not only when
+  *every* read lacked a length, so a route serving one SSE endpoint among
+  otherwise ordinary JSON reads is suggested `compare_narrowed` rather than
+  `compare_candidate`. That is deliberate, honest narrowing: one length-less
+  read means the evidence is incomplete, and incomplete evidence about body
+  trustworthiness argues for comparing status instead of body — the same safe
+  direction as [the false demotion](classifying-routes.md#what-observation-can-and-cannot-tell-you)
+  the `Content-Length` signal already accepts.
+- **Only one of these shapes is refused at comparison time.** A sampled
+  `text/event-stream` response is comparison-skipped by content type
+  (`event_stream`) before a byte is buffered, since an event stream never
+  completes. Every *other* length-less response — chunked, or simply missing the
+  header — is buffered and compared exactly like a length-declaring one, and is
+  skipped (`response_buffer_timeout`) only if it is still arriving when the
+  route's `timeouts.primary_ms` budget runs out. A slow body of *known* length
+  hits that same deadline just as readily: the timeout is a property of pace,
+  not of framing. Whichever way it goes, the client gets the complete body; only
+  the comparison is given up. See [resilience &
+  failover](resilience.md#timeouts).
+
+So a high `length_missing` means the classifier could not build stability
+evidence for the route — not that the route will be hard to compare once it is
+shadowed. Read it as a prompt to establish body trustworthiness some other way
+(the service's source, a Pharos scenario) before promoting the route past
+`compare_narrowed`.
+
 ## 4. Run `limen suggest-routes`
 
 ```bash
@@ -213,8 +251,10 @@ safer one wins a tie):
 | `compare_candidate` | A request fingerprint repeated with a stable length and no danger signal fired. **Not a safety claim** — see [classifying routes](classifying-routes.md#what-observation-can-and-cannot-tell-you) for exactly what this can and cannot establish. |
 
 Every rule's machine-readable `reason` (`redirecting-read`, `mints-state`,
-`one-time-token-query`, and eleven others) is a stable, documented vocabulary
-— the same page linked above catalogs what each one means and why it exists.
+`one-time-token-query`, `stability-unobserved`, and eleven others) is a stable,
+published vocabulary, and the *shapes* those names describe — a flow hop that
+redirects, a read that mints a session, a single-use token riding in a query —
+are catalogued on the same page linked above.
 
 ## 5. Why the default draft shadows nothing
 

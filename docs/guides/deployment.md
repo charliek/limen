@@ -87,6 +87,31 @@ overwriting it, and only sets `http` (its own listener's scheme; the MVP has
 no listener TLS) when the header is absent. `X-Forwarded-Host` is intentionally
 never set — point upstreams at their own base URL rather than relying on it.
 
+## Operational limitations
+
+Two properties surprise operators at deploy time rather than at config time, so
+check both against the traffic you intend to put behind Limen.
+
+**Protocol upgrades are stripped, not proxied.** `Connection` and `Upgrade` are
+hop-by-hop headers (RFC 7230 §6.1), and Limen drops them — along with every
+header a `Connection` token names — on both the request and response legs. There
+is no `101 Switching Protocols` path in the proxy at all, so a WebSocket
+handshake sent through Limen does not become a tunnel: the upstream sees an
+ordinary HTTP request with the upgrade headers removed, and answers it as one.
+This is not a gap to work around with configuration — protocols beyond HTTP/1.1
+and HTTP/2 over TCP are an explicit spec non-goal (§1.2). Route WebSocket
+traffic around Limen.
+
+**`graceful_shutdown_timeout_ms` is a hard cap on open streams, not just on slow
+requests.** On `SIGTERM`/`SIGINT` Limen stops accepting, waits for in-flight
+requests up to that window (default **10 s**), and then forces exit, logging
+that it did. A long-lived response — SSE, long-poll, a large download — gets no
+special treatment: it is an in-flight request that will still be open when the
+window closes, and it is dropped mid-stream. If streams like that must survive a
+restart, raise `server.graceful_shutdown_timeout_ms` past the longest one you
+intend to outlive (and the orchestrator's termination grace period past that).
+Otherwise, expect stream drops on every deploy and make sure clients reconnect.
+
 ## Operating it
 
 - Probe `/health/live` for liveness and `/health/ready` for readiness — the

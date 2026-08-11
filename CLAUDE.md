@@ -98,6 +98,15 @@ behavioral rules, never both (validation error).
 
 ## Commits
 
-The build proceeds phase by phase (spec Section 14). Each phase: implement →
-quality gate green → `/simplify` → `/codex:rescue` review → quality gate green
-→ commit to `main`. Keep commits scoped to a phase or a coherent slice of one.
+The build proceeds phase by phase (spec Section 14), and **a phase is a feature
+branch, not a series of commits on `main`.** Branch
+(`feature/plan-0NN-<slug>`, or `feature/<slug>` for work outside the plan
+sequence), land the phase's commits there, then open a PR and merge it once CI
+is green;
+`main` moves by merge commit. Keep each commit scoped to a phase or a coherent
+slice of one.
+
+Every commit on the branch is gated the same way: implement → quality gate green
+→ `/simplify` → `/codex:rescue` review → quality gate green → commit. The gate
+is the section above, unchanged — the branch changes where the commits land, not
+what has to be true before one is made.
