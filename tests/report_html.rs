@@ -867,12 +867,16 @@ fn an_impossibly_dated_sink_file_is_not_evidence() {
 /// a count no proxy ever emitted, on an otherwise green page.
 #[test]
 fn a_counter_too_large_for_an_f64_is_refused_not_saturated() {
-    let ws = canonical().with_metrics(
-        "limen_comparisons_total{route=\"a\",result=\"match\"} 18446744073709551616\n\
-         limen_comparison_skipped_total{route=\"a\",reason=\"event_stream\"} 1\n\
-         limen_shadow_requests_total{route=\"a\"} 1\n\
-         limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0\n",
-    );
+    // Prefixed with `REGISTERED` so the required families are all present and
+    // this test can only fail (or pass) on the oversized value itself, not on
+    // whichever family `FAMILIES` happens to visit first.
+    let ws = canonical().with_metrics(&format!(
+        "{REGISTERED}\
+         limen_comparisons_total{{route=\"a\",result=\"match\"}} 18446744073709551616\n\
+         limen_comparison_skipped_total{{route=\"a\",reason=\"event_stream\"}} 1\n\
+         limen_shadow_requests_total{{route=\"a\"}} 1\n\
+         limen_shadow_failed_total{{route=\"a\",reason=\"timeout\"}} 0\n",
+    ));
     let model = ws.model();
     match &model.evidence.metrics {
         Section::Unavailable(reason) => {

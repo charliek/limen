@@ -25,7 +25,7 @@
 //! | [`health`]      | `/health/live` and `/health/ready` endpoints + readiness.  |
 //! | [`error`]       | Top-level error types crossing module boundaries.          |
 //!
-//! Three modules sit outside that map because they implement operator commands
+//! Four modules sit outside that map because they implement operator commands
 //! rather than a data-plane concern: [`verdict`] (`limen verdict`), the
 //! [`suggest`]/[`draft`] pair (`limen suggest-routes`), which classify an
 //! observe-mode profile and render a draft configuration from it, and

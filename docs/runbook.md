@@ -425,6 +425,8 @@ limen verdict -c campaign.config.yaml --canary --format json > verdict.json \
 # unparseable" — a FAILURE on the page — which is strictly worse than not
 # passing the flag at all. (`/observe/profile` 404s unless the campaign config
 # carries an `observe:` block, so `curl -f` is doing real work here.)
+# 127.0.0.1:9090 below is this runbook's example `metrics.listen_addr`; substitute
+# your campaign config's control-plane address and metrics path throughout.
 page_flags=()
 if curl -sf http://127.0.0.1:9090/observe/profile > profile.json && [ -s profile.json ]; then
   page_flags+=(--profile profile.json)
