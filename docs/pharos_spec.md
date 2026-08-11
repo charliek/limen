@@ -1256,6 +1256,7 @@ Scaffolds a runnable conformance directory into a target repo (default `dir`: cu
 ### 19.3 Cwd-based config resolution
 
 Pharos resolves its config file and the directories within it relative to the **current working directory** at invocation time (Section 6.1). `pharos init` therefore writes paths relative to the scaffold root, and the scaffold's README documents that the runner (the target repo's `conformance`-style script) must be invoked from that root — not from the target repo's own root if the scaffold lives in a subdirectory.
+
 ---
 
 ## Appendix A. Streaming and SSE Endpoints Are Out of Scope
