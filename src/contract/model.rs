@@ -139,7 +139,8 @@ impl BehavioralRules {
 /// `Set-Cookie` comparison rules (spec §4.2 / Pharos §8.6). A *separate*
 /// comparison dimension reading every `Set-Cookie` value — not an extension of
 /// the single-value `compare_headers` allowlist, which is why listing
-/// `set-cookie` there while this block is present is a validation error.
+/// `set-cookie` there is a validation error whether or not this block is
+/// present: the allowlist path would compare one value and drop the rest.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetCookieRules {

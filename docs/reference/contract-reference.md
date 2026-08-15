@@ -109,9 +109,12 @@ location:
   normative and pinned in lockstep with Pharos; see
   [the spec](../limen_spec.md#42-contract-format) §4.2.
 - Because these are separate dimensions rather than `compare_headers` entries,
-  listing `set-cookie` or `location` (any case) in `compare_headers` while the
-  corresponding block is present anywhere in a route's resolved rules is a
-  **load-time validation error** — drop the `compare_headers` entry.
+  naming them in `compare_headers` (any case) is a **load-time validation
+  error** — drop the entry. `set-cookie` is rejected unconditionally:
+  `compare_headers` reads the single-value header map, so a multi-cookie
+  response would be compared on one value with the rest dropped; use a
+  `set_cookie` block. `location` is rejected only while a `location` block is
+  present anywhere in a route's resolved rules.
 
 ## Merge semantics
 

@@ -432,10 +432,16 @@ implementing the dimensions; they are as binding as the field names:
   an unbounded log line.
 
 **`compare_headers` conflict:** because these are separate dimensions rather
-than `compare_headers` entries, listing `set-cookie` or `location` (in any
-case) in a `compare_headers` list while the corresponding block is present
-anywhere in a route's resolved rules is a **load-time validation error** — the
-block wins conceptually, and the error keeps the author's intent unambiguous.
+than `compare_headers` entries, naming them in a `compare_headers` list is a
+**load-time validation error** — asymmetrically, because the two headers differ
+on the wire. Listing `set-cookie` (in any case) is *always* an error, block or
+no block: `compare_headers` reads the single-value header map, so a response
+carrying several `Set-Cookie` headers would be compared on one value with the
+rest silently dropped; the `set_cookie` block is the only way to compare
+cookies. Listing `location` is an error only while a `location` block is
+present anywhere in a route's resolved rules — `Location` is genuinely
+single-valued, so the generic path compares it faithfully and only the
+duplicated intent is ambiguous; there the block wins conceptually.
 
 **Lockstep:** this vocabulary — field names, parsing, merge (Section 4.4), and
 validation semantics — must remain **identical** between Limen and Pharos, the

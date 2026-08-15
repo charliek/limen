@@ -27,9 +27,10 @@ Headers are compared only when a contract lists them in `compare_headers`.
 A contract's `set_cookie` and `location` blocks (`defaults` or per-route
 `comparison`) turn on comparison of every `Set-Cookie` response header and of
 the `Location` header, respectively — read separately from the single-value
-header map `compare_headers` uses, which is why listing `set-cookie` or
-`location` there while the corresponding block is present is a load-time
-validation error.
+header map `compare_headers` uses, which is why listing `set-cookie` there is
+always a load-time validation error (that map holds one value, so the rest of a
+multi-cookie response would be dropped), and listing `location` there is one
+while the `location` block is present.
 
 - `set_cookie` pairs cookies by name and compares their attributes (and, by
   default, their values — `compare_values: presence` relaxes that to "a value
