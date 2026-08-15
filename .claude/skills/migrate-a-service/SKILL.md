@@ -14,6 +14,11 @@ is the [migration runbook](https://charliek.github.io/limen/runbook/).
 Never promote a suggestion, enable a comparison, or call a campaign green on tool output alone.
 `-c/--config` also reads `LIMEN_CONFIG`, default `limen.config.yaml`; confirm any flag with `--help`.
 
+**Getting the binary.** There is no package install — build from the limen repo. `mise exec -- cargo build
+--release` from the repo root resolves the pinned 1.97.1 toolchain (`.mise.toml`, `rust-toolchain.toml`)
+and writes `target/release/limen`; `mise exec -- make release` is the same thing. If `cargo` is missing
+without mise, a rustup install puts it at `~/.cargo/bin/cargo` even when that directory is off `PATH`.
+
 ## 1. Observe — let real traffic name the risky routes
 
 **Bind the control plane to loopback first** — `metrics.listen_addr` defaults to `0.0.0.0:9090`, and the
@@ -25,6 +30,12 @@ need not exist yet), then add the block — `limen run` warns loudly whenever it
 metrics: { listen_addr: "127.0.0.1:9090" }   # or an internal-only interface
 observe: {}    # presence is the whole switch; no `enabled` field; sample_rate defaults to 1.0
 ```
+
+**Where the route inventory comes from**, in descending fidelity: the service's own OpenAPI document or
+route table (one `curl -s http://legacy/openapi.json | jq '.paths | keys'` for a FastAPI-style service),
+else the framework's router registration read from source, else path sampling from access logs. Folding
+operations onto `path_prefix` routes is a judgement call and the first one you make — keep it coarse
+enough to read and expect stage 3 to refine it against the handler source.
 
 Drive representative traffic **unsampled**: the classifier's danger rules are existential, so sampling and
 classification are mutually exclusive. A sampled profile is refused outright — every route lands
