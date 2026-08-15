@@ -1090,6 +1090,37 @@ routes:
     }
 
     #[test]
+    fn inline_compare_headers_set_cookie_without_a_block_is_caught() {
+        // No `set_cookie` block: still rejected, because the generic header
+        // path would compare one value of a multi-cookie response. `location`
+        // on its own stays legal.
+        let errs = errors(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison:
+      enabled: true
+      sample_rate: 1.0
+      max_body_bytes: 1024
+      compare_headers: ["set-cookie", "location"]
+"#,
+        );
+        assert_eq!(errs.len(), 1, "{errs:?}");
+        let conflicts: Vec<&str> = errs
+            .iter()
+            .filter(|e| e.message.contains("separate comparison dimension"))
+            .map(|e| e.message.as_str())
+            .collect();
+        assert_eq!(conflicts.len(), 1, "{errs:?}");
+        assert!(conflicts[0].contains("\"set-cookie\""));
+        assert!(conflicts[0].contains("`set_cookie` block"));
+    }
+
+    #[test]
     fn inline_blocks_without_the_header_entry_are_fine() {
         let config = parse(
             r#"

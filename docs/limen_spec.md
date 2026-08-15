@@ -432,10 +432,16 @@ implementing the dimensions; they are as binding as the field names:
   an unbounded log line.
 
 **`compare_headers` conflict:** because these are separate dimensions rather
-than `compare_headers` entries, listing `set-cookie` or `location` (in any
-case) in a `compare_headers` list while the corresponding block is present
-anywhere in a route's resolved rules is a **load-time validation error** — the
-block wins conceptually, and the error keeps the author's intent unambiguous.
+than `compare_headers` entries, naming them in a `compare_headers` list is a
+**load-time validation error** — asymmetrically, because the two headers differ
+on the wire. Listing `set-cookie` (in any case) is *always* an error, block or
+no block: `compare_headers` reads the single-value header map, so a response
+carrying several `Set-Cookie` headers would be compared on one value with the
+rest silently dropped; the `set_cookie` block is the only way to compare
+cookies. Listing `location` is an error only while a `location` block is
+present anywhere in a route's resolved rules — `Location` is genuinely
+single-valued, so the generic path compares it faithfully and only the
+duplicated intent is ambiguous; there the block wins conceptually.
 
 **Lockstep:** this vocabulary — field names, parsing, merge (Section 4.4), and
 validation semantics — must remain **identical** between Limen and Pharos, the
@@ -562,7 +568,6 @@ routes:
       enabled: true                         # operational gate
       sample_rate: 0.1                       # fraction of eligible requests to compare
       max_body_bytes: 262144                 # skip comparison above this
-      shadow_methods: ["POST"]               # opt writes into shadowing; default [] = reads only
     circuit_breaker:
       enabled: true
       failure_rate_threshold: 0.25
@@ -576,6 +581,26 @@ routes:
       max_new_p95_latency_ratio: 1.0          # new p95 / legacy p95 ceiling (1.0 = no worse)
       max_new_error_rate_ratio: 1.0           # new 5xx rate / legacy 5xx rate ceiling
       max_mismatch_rate: 0.001                # parity ceiling (fraction of compared requests)
+```
+
+**Shadowing a write.** `get-device` above only reads, so it never opts into
+`comparison.shadow_methods`. Shadowing a write is a separate, explicit choice
+(Section 6.1): the method must be listed in **both** `match.methods` and
+`comparison.shadow_methods`, or validation rejects it as inert. A minimal
+route opting `create-device` into write-shadowing:
+
+```yaml
+  - id: "create-device"
+    match:
+      methods: ["POST"]
+      path_prefix: "/devices"
+    legacy_upstream: "https://legacy-device.internal"
+    new_upstream: "https://new-device.internal"
+    mode: "shadow_legacy_primary"
+    contract: "./contracts/device-service.contract.yaml#create-device"
+    comparison:
+      enabled: true
+      shadow_methods: ["POST"]              # must also appear in match.methods above
 ```
 
 **Query-aware matching.** A route's `match` may narrow beyond method + path with two optional presence conditions over the request's query parameters:
@@ -620,6 +645,7 @@ migration.get-device.shadow_enabled: true
 - Those names are **literal decoded names**: no `%`, no `+`, no leading or trailing whitespace. The request's query is percent-decoded before comparison and config names are not, so an encoded spelling could never match — and a condition that matches nothing fails *open*, letting the traffic it was meant to except fall through to a sibling route. Rejected at startup rather than normalized (safety invariant: refuse invalid config).
 - Two query-conditioned routes sharing a `path_prefix` and at least one method must be **provably disjoint**: some parameter appears in one route's `query_present` and the other's `query_absent`, so no single request can satisfy both. The check is deliberately conservative — anything not provably disjoint (two `query_present` sets a request could carry together; a `query_present` / `query_absent` pair over unrelated names) fails validation, even where a cleverer analysis might prove it safe. Routes on different prefixes never need this: longest prefix still decides.
 - A route in `failover_to_legacy` mode whose `match.methods` include non-idempotent methods (POST, and PATCH unless declared idempotent) **must** set `failover_safe: true` explicitly, or validation fails. This forces an operator to consciously affirm that auto-failover is safe for that route (Section 6.5).
+- Validation refuses `shadow_methods` entries that could not take effect: a method other than `POST`, a mode that does not shadow, `comparison.enabled: false`, or a method `match.methods` does not carry (Section 6.1).
 - `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
 - `diff_sink.dir`, if the block is present, is non-empty. The directory (and its parent) need **not** exist — it is created on the first mismatch, so a fresh deploy is not failed for a directory nothing has written to yet.
 

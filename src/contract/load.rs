@@ -146,11 +146,22 @@ fn lists_header(layer: &BehavioralRules, header: &str) -> bool {
         .any(|h| h.trim().eq_ignore_ascii_case(header))
 }
 
-/// Every optional comparison dimension that `layers`, taken together, both
-/// lists in `compare_headers` and declares a block for, as `(header, block)`
-/// pairs. `set_cookie`/`location` are separate comparison dimensions rather
-/// than `compare_headers` entries, so declaring both is ambiguous intent rather
-/// than redundancy — hence an error, not a warning (spec §4.2).
+/// Every misuse of `compare_headers` as a stand-in for an optional comparison
+/// dimension that `layers`, taken together, commit, as `(header, block)` pairs.
+/// `set_cookie`/`location` are separate comparison dimensions rather than
+/// `compare_headers` entries — hence an error, not a warning (spec §4.2).
+///
+/// The two dimensions are deliberately **asymmetric**:
+///
+/// - `set-cookie` is an error *unconditionally*, block or no block. The generic
+///   header path compares one `HeaderMap::get` value per name (see
+///   `compare::compare_headers`), so a response carrying several `Set-Cookie`
+///   headers silently loses all but the first — comparing cookies through it is
+///   always a config bug. The dedicated `set_cookie` block is the only correct
+///   tool, so listing the header never has a legitimate reading.
+/// - `location` is a genuinely single-value header, so the generic path
+///   compares it faithfully; only declaring it *alongside* a `location` block is
+///   ambiguous intent. Listing it on its own stays legal.
 ///
 /// Layers are considered together because they resolve together: a
 /// `compare_headers` entry in service defaults conflicts with a block declared
@@ -160,9 +171,7 @@ pub fn header_dimension_conflicts(
     layers: &[&BehavioralRules],
 ) -> Vec<(&'static str, &'static str)> {
     let mut out = Vec::new();
-    if layers.iter().any(|l| lists_header(l, "set-cookie"))
-        && layers.iter().any(|l| l.set_cookie.is_some())
-    {
+    if layers.iter().any(|l| lists_header(l, "set-cookie")) {
         out.push(("set-cookie", "set_cookie"));
     }
     if layers.iter().any(|l| lists_header(l, "location"))
@@ -177,15 +186,25 @@ pub fn header_dimension_conflicts(
 /// surface (contract check, inline route rules) reports it identically. Callers
 /// prefix the subject (`route "x" …`, `` `defaults` … ``, or a config location).
 pub fn header_dimension_conflict_message(header: &str, block: &str) -> String {
+    if header.eq_ignore_ascii_case("set-cookie") {
+        // Unconditional: there may be no block at all to point at, and the
+        // generic path is lossy either way.
+        return format!(
+            "lists {header:?} in `compare_headers` — `{block}` is a separate comparison \
+             dimension, and the generic header path compares a single value, silently \
+             dropping the rest of a multi-cookie response; drop the `compare_headers` \
+             entry and use a `{block}` block instead"
+        );
+    }
     format!(
         "lists {header:?} in `compare_headers` and also declares a `{block}` block — \
          `{block}` is a separate comparison dimension; drop the `compare_headers` entry"
     )
 }
 
-/// Report `compare_headers`/block conflicts across a contract: once at
-/// `defaults` when the conflict lives entirely there (it would otherwise repeat
-/// on every route), else per affected route.
+/// Report `compare_headers` dimension misuse across a contract: once at
+/// `defaults` when it lives entirely there (it would otherwise repeat on every
+/// route), else per affected route.
 fn validate_header_dimension_conflicts(contract: &Contract, issues: &mut Vec<String>) {
     let empty = BehavioralRules::default();
     let in_defaults = header_dimension_conflicts(&[&contract.defaults]);
@@ -212,7 +231,7 @@ fn validate_header_dimension_conflicts(contract: &Contract, issues: &mut Vec<Str
 
 /// Validate contract *semantics* beyond serde shape: the schema version is
 /// supported, `service` is non-empty, route ids are non-empty and unique, and
-/// no `compare_headers` entry collides with a `set_cookie`/`location` block.
+/// no `compare_headers` entry usurps the `set_cookie`/`location` dimensions.
 /// Returns human-readable messages (empty = valid). JSONPath-subset compliance
 /// is reported separately by [`validate_paths`].
 pub fn validate_semantics(contract: &Contract) -> Vec<String> {
@@ -368,8 +387,33 @@ routes:
 
     #[test]
     fn compare_headers_conflicting_with_a_route_block_is_an_error() {
-        // Header listed in defaults, block declared on the route: the conflict
-        // only exists in the resolved route, so the route is named.
+        // `location` listed in defaults, block declared on the route: the
+        // conflict only exists in the resolved route, so the route is named.
+        let yaml = r#"
+version: 1
+service: s
+defaults:
+  compare_headers: ["Content-Type", "Location"]
+routes:
+  - id: r
+    match: { methods: [POST], path_template: "/sessions" }
+    comparison:
+      location:
+        origin: ignore
+  - id: clean
+    match: { methods: [GET], path_template: "/x" }
+"#;
+        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let issues = validate_semantics(&contract);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("route \"r\""));
+        assert!(issues[0].contains("location"));
+    }
+
+    #[test]
+    fn compare_headers_set_cookie_alongside_a_block_is_an_error() {
+        // Listing the header is rejected at its source — `defaults` here — and
+        // a `set_cookie` block elsewhere changes nothing.
         let yaml = r#"
 version: 1
 service: s
@@ -387,7 +431,7 @@ routes:
         let contract: Contract = serde_yaml::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
-        assert!(issues[0].contains("route \"r\""));
+        assert!(issues[0].contains("`defaults`"));
         assert!(issues[0].contains("set-cookie"));
         assert!(issues[0].contains("set_cookie"));
     }
@@ -412,6 +456,48 @@ routes:
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("`defaults`"));
         assert!(issues[0].contains("location"));
+    }
+
+    #[test]
+    fn compare_headers_set_cookie_without_any_block_is_still_an_error() {
+        // No `set_cookie` block anywhere: the generic header path would compare
+        // a single value and drop the rest, so the entry is rejected on its own.
+        let yaml = r#"
+version: 1
+service: s
+defaults:
+  compare_headers: ["content-type"]
+routes:
+  - id: r
+    match: { methods: [POST], path_template: "/sessions" }
+    comparison:
+      compare_headers: ["Set-Cookie"]
+  - id: clean
+    match: { methods: [GET], path_template: "/x" }
+"#;
+        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let issues = validate_semantics(&contract);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert!(issues[0].contains("route \"r\""));
+        assert!(issues[0].contains("set-cookie"));
+        assert!(issues[0].contains("`set_cookie` block"));
+    }
+
+    #[test]
+    fn compare_headers_location_without_a_block_is_allowed() {
+        // `location` is a genuine single-value header: listing it is only an
+        // error when a `location` block is present too.
+        let yaml = r#"
+version: 1
+service: s
+defaults:
+  compare_headers: ["Location"]
+routes:
+  - id: r
+    match: { methods: [GET], path_template: "/x" }
+"#;
+        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        assert!(validate_semantics(&contract).is_empty());
     }
 
     #[test]

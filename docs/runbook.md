@@ -180,7 +180,7 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 
 **Tagging:** every scenario gets tags. At minimum `read`/`write`, a maturity tag (`smoke` for the few that gate CI, `regression` for the rest), and `migration-ready` once it's trusted. Use `intentional-change` and `legacy-bug-compatible` to mark deliberate deviations.
 
-**Outputs:** a set of `*.yaml` scenarios per route; all validate with `pharos -- validate`.
+**Outputs:** a set of `*.yaml` scenarios per route; all validate with `bun run validate`.
 
 **For the agent:** generate **small, focused** scenarios — one behavior each — rather than large scenarios that assert many things. A focused scenario produces a precise failure. Always generate both the success **and** the error/edge cases; a suite that only covers happy paths gives false confidence.
 
@@ -557,7 +557,7 @@ Both must be true to call a route green. Conflating them is a common mistake: a 
 [ ] DISCOVER: route classified (read/write, idempotent?, risk, side-effects), samples captured
 [ ] OBSERVE: profiled unsampled; suggest-routes disposition recorded; candidates confirmed against source
 [ ] DRAFT: contract rules derived narrowly from observable signals; check-contract passes
-[ ] GENERATE: success + error + edge scenarios; correctly tagged; pharos validate passes
+[ ] GENERATE: success + error + edge scenarios; correctly tagged; `bun run validate` passes
 [ ] REVIEW (human gate): contract justified & narrow; scenarios = intended behavior; signed off
 [ ] REFINE: suite green; failures diagnosed correctly; no unjustified ignore rules; contract validated
 [ ] BUDGET: latency + error-rate + parity budget defined (with any documented exceptions)
