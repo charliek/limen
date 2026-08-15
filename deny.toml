@@ -25,7 +25,10 @@ ignore = []
 # serde_yaml 0.9 (a direct dependency, also deprecated upstream) isn't
 # currently flagged by RustSec, but would fall under the same `-W
 # unmaintained` treatment if/when it is -- the swap away from serde_yaml is
-# tracked separately and deliberately deferred.
+# tracked separately and deliberately deferred. The decision (swap or stay,
+# and to what) is recorded on the limen+pharos refinement roadmap's gap list
+# (slauth plans/limen-pharos-refinement.md) with serde_norway, serde-yaml-ng,
+# and saphyr as the candidates to vet when it next matters.
 
 [licenses]
 # Licenses allowed for any crate in the dependency graph. Kept to the
