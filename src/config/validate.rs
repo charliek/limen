@@ -1109,6 +1109,7 @@ routes:
       compare_headers: ["set-cookie", "location"]
 "#,
         );
+        assert_eq!(errs.len(), 1, "{errs:?}");
         let conflicts: Vec<&str> = errs
             .iter()
             .filter(|e| e.message.contains("separate comparison dimension"))
