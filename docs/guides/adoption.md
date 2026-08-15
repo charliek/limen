@@ -236,12 +236,17 @@ interventions**.
 
 | Stage | Wall clock | Result |
 |---|---|---|
+| Setup — read the skill, build Limen, author the observe config | ~2m | a binary and a `legacy_only` route table |
 | Observe | 3m35s | 19 routes profiled |
 | Draft | 20s | 7 `compare_candidate` · 1 `compare_narrowed` · 11 `relay_only` |
 | Classify | 1m35s | 3 demotions against the handler source |
 | Same-upstream rehearsal | 20s | 128 comparisons, 0 skips |
 | Verdict | 1s | exit `0`, canary landed |
 | Report | 22s | one self-contained HTML status page |
+
+The headline number is launch-to-status-page wall clock, so it also carries the
+few seconds spent between each stage; the rows are not meant to sum to it
+exactly.
 
 Four things that run taught, none of which were engineered to happen.
 
@@ -268,21 +273,29 @@ proxy, and the stream relays to the client intact. The guard is a backstop, not
 a plan — but it is a backstop that engages before the expensive, duplicating
 part of the pipeline, not after.
 
-**The cardinality and token rules earned their place.** R6 (a one-time-token
-query name), R7 (reads spread over more distinct paths than the ceiling) and R8
-(nearly every read hitting a distinct path) each fired on real traffic shapes
-this service produced, not on synthetic fixtures. When `--adopt-suggestions` was
-finally run, it promoted exactly one route — the stable control route — which is
-the correct outcome for a service whose remaining candidates had not yet had
-their sources read.
+**The cardinality and token rules earned their place — in a separate,
+untimed diagnostic.** Four engineered routes were driven through the proxy with
+real traffic so each rule had a live shape to fire on rather than a unit
+fixture: R6 (a one-time-token query name), R7 (reads spread over more distinct
+paths than the ceiling) and R8 (nearly every read hitting a distinct path) each
+demoted its route to `relay_only`, while the fourth — a stable control — reached
+`compare_candidate`. Running `--adopt-suggestions` over that draft promoted the
+control and nothing else. Read that as the *classifier's relay rules* doing the
+discriminating, not the flag: `--adopt-suggestions` promotes every
+`compare_candidate` and `compare_narrowed` suggestion it is handed, and has no
+knowledge of whether anyone read a handler source. The timed cold run never used
+the flag at all — the driver worked from the plain draft and dispositioned every
+route by hand.
 
-**Counters are not the gate, and a mid-flight scrape shows why.** A `/metrics`
-scrape taken while traffic was still settling read **8 shadows dispatched
-against 7 comparisons recorded** — a discrepancy that looks alarming and means
-nothing, because the eighth comparison was in flight. `limen verdict`'s drain
-step waits for the pipeline to quiesce before scoring anything, and resolved it
-to **8/8**. Any campaign wrapper that gated on a raw counter scrape instead of
-the verdict would have flagged a phantom failure here.
+**Counters are not the gate, and a mid-flight scrape shows why.** The rehearsal
+recorded 128 comparisons across eight routes, and a `/metrics` scrape taken
+before the verdict caught one of them — an image-serving route — at **8 shadows
+dispatched against 7 comparisons recorded**. That discrepancy looks alarming and
+means nothing: shadowing is fire-and-forget off the client path, so the eighth
+shadow was simply still in flight when the scrape landed. `limen verdict`'s
+drain step waits for the pipeline to quiesce before scoring anything, and
+resolved that route to **8/8**. Any campaign wrapper that gated on a raw counter
+scrape instead of the verdict would have flagged a phantom failure here.
 
 ## What remains — the honest ledger
 
