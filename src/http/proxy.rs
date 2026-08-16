@@ -257,11 +257,21 @@ async fn dispatch(
     // real connections (see `forwarded::apply`).
     forwarded::apply(&mut request_headers, client_addr(&parts.extensions));
 
-    // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
-    // request body so a new-side failure can be replayed against legacy. Handled
-    // before planning a shadow, which `shadow::plan` never produces for this mode
-    // anyway — so the shadow setup below is dead work on this path.
-    if route.mode == RouteMode::FailoverToLegacy && route.failover_safe && upstream == Upstream::New
+    // Failover-safe path: a route that has attested idempotence and is sending
+    // this request to new buffers the request body so a new-side failure can be
+    // replayed against legacy. Both modes that can put new in front of a live
+    // legacy qualify — `failover_to_legacy` always, and `percentage_split` on the
+    // requests its bucket sent to new. `new_only` is excluded by construction:
+    // there is no legacy leg to replay against, so the flag cannot mean anything
+    // there. Handled before planning a shadow, which `shadow::plan` produces only
+    // for `shadow_legacy_primary` — neither mode here ever shadows, so the shadow
+    // setup below is dead work on this path rather than something it skips.
+    if route.failover_safe
+        && upstream == Upstream::New
+        && matches!(
+            route.mode,
+            RouteMode::FailoverToLegacy | RouteMode::PercentageSplit
+        )
     {
         if let Some(legacy_url) = route
             .legacy_upstream
@@ -482,6 +492,17 @@ fn release_breaker(reservation: &Option<BreakerReservation>) {
 /// response whose body errors or times out mid-read: because this path buffers
 /// the (bounded) new response before committing, such a body failure fails over
 /// to legacy rather than streaming a truncated response to the client.
+///
+/// **Both legs share one `primary_ms` budget.** `timeout` is turned into a
+/// single absolute deadline before the new attempt, and the replay gets only
+/// what new left of it — the replay is the second leg of *this* client request,
+/// not a fresh one, and a client must never wait ~2× the deadline its route
+/// declared (`docs/guides/resilience.md`: "one absolute deadline for the whole
+/// primary leg"). The practical consequence is that a new attempt that *times
+/// out* has spent the budget and is not replayed: the client gets the 504.
+/// Failover buys resilience against failures that come back fast — connection
+/// refused, connection reset, a prompt 5xx — which is where nearly all of it
+/// lives, and it cannot buy it by doubling the latency ceiling.
 #[allow(clippy::too_many_arguments)]
 async fn failover_dispatch(
     state: &AppState,
@@ -496,12 +517,23 @@ async fn failover_dispatch(
 ) -> Dispatched {
     // Buffer the request body so it can be replayed. failover_safe is opt-in, so
     // an over-limit body that can't be buffered is rejected rather than sent
-    // un-replayable.
-    let bytes = match axum::body::to_bytes(body, state.request_body_limit()).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // We never reach new on this path, so settle the reserved breaker
-            // slot by releasing it (not recording a failure against new).
+    // un-replayable. Neither refusal below reaches new, so both settle the
+    // reserved breaker slot by *releasing* it — recording a failure would blame
+    // new for a request it never saw, and leaking the slot would wedge a
+    // half-open breaker shut.
+    //
+    // The two refusals are deliberately different statuses, because they are
+    // different faults: a body over the limit is the client asking for more
+    // than this route buffers (413, and the operator can raise the limit),
+    // while a body that errors mid-read is a broken or abandoned upload (400 —
+    // the same `unreadable_body` the streaming path returns). Reporting an
+    // aborted upload as 413 would send an operator hunting a size limit that
+    // was never reached.
+    let bytes = match body::buffer_request_or_stream(body, state.request_body_limit()).await {
+        Buffered::Full(bytes) => bytes,
+        // `TimedOut` cannot arise — this read passes no deadline — but it would
+        // mean what the over-limit arm means: no complete body to replay.
+        Buffered::TooLarge(_) | Buffered::TimedOut(_) => {
             release_breaker(breaker);
             let resp = (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -510,7 +542,17 @@ async fn failover_dispatch(
                 .into_response();
             return Dispatched::refused(resp, Upstream::New);
         }
+        Buffered::Error => {
+            release_breaker(breaker);
+            return Dispatched::refused(unreadable_body(), Upstream::New);
+        }
     };
+
+    // One absolute budget for the whole exchange, taken after the client's own
+    // upload (which is bounded by the client, not by this route) and before the
+    // first upstream byte — the same discipline `dispatch` applies on the
+    // streaming path.
+    let deadline = tokio::time::Instant::now() + timeout;
 
     let new_result = send_buffered(
         state.client(),
@@ -524,8 +566,9 @@ async fn failover_dispatch(
 
     // A transport-level new failure is an upstream error/timeout (a 5xx is a
     // response, counted by the request metric, not an upstream error).
-    if let Err(error) = &new_result {
-        if error.is_timeout() {
+    let new_timed_out = new_result.as_ref().is_err_and(reqwest::Error::is_timeout);
+    if new_result.is_err() {
+        if new_timed_out {
             prometheus::record_upstream_timeout(route_id, Upstream::New);
         } else {
             prometheus::record_upstream_error(route_id, Upstream::New);
@@ -569,10 +612,42 @@ async fn failover_dispatch(
     }
 
     // New failed (5xx, transport error/timeout, or a body that errored
-    // mid-read) — replay legacy.
+    // mid-read) — replay legacy with whatever is left of the one budget.
     record_breaker(breaker, false);
-    warn!("new upstream failed; failing over to legacy");
-    match send_buffered(state.client(), method, legacy_url, headers, bytes, timeout).await {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining.is_zero() {
+        // New spent the whole budget before failing — the usual way to get here
+        // is a new attempt that timed out. There is no time left to replay in
+        // without breaking the route's declared deadline, so the client gets
+        // new's failure. The breaker has already recorded it, so *subsequent*
+        // requests are steered to legacy: the route still converges away from a
+        // sick new upstream, it just does not do so by doubling this client's
+        // wait.
+        warn!(
+            timeout_ms = timeout.as_millis(),
+            "new upstream failed with the primary budget spent; not replaying to legacy"
+        );
+        let resp = if new_timed_out {
+            gateway_timeout()
+        } else {
+            bad_gateway()
+        };
+        return Dispatched::silent(resp, Upstream::New);
+    }
+    warn!(
+        remaining_ms = remaining.as_millis(),
+        "new upstream failed; failing over to legacy"
+    );
+    match send_buffered(
+        state.client(),
+        method,
+        legacy_url,
+        headers,
+        bytes,
+        remaining,
+    )
+    .await
+    {
         Ok(resp) => Dispatched::relayed(relay_response(resp), Upstream::Legacy),
         Err(error) => {
             if error.is_timeout() {
