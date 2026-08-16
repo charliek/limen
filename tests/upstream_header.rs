@@ -45,29 +45,68 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// counted or gated fixture.
 const DEAD_UPSTREAM: &str = "http://127.0.0.1:1";
 
-/// A `percentage_split` route over a static flag, with an optional debug
-/// block and optional `failover_safe`. `percentage` is static so the tests
-/// don't need a stable assignment key: 0 always buckets legacy, 100 always
-/// buckets new.
-fn split_config(
-    legacy: &str,
-    new: &str,
+/// A `percentage_split` route over a static flag, plus the handful of knobs
+/// these tests vary. They all come through here so that a difference in
+/// outcome is attributable to the knob under test rather than to a
+/// hand-copied YAML block that drifted from its siblings — mirrors
+/// `tests/failover_safe.rs`'s `Split` fixture.
+#[derive(Clone)]
+struct SplitCase {
+    legacy: String,
+    new: String,
+    /// The static rollout percentage: 0 always buckets legacy, 100 always
+    /// buckets new — static so the tests don't need a stable assignment key.
     percentage: u32,
     failover_safe: bool,
+    /// `debug.upstream_header`.
     upstream_header: bool,
+    /// `server.request_body_limit_bytes`, for the tests about the buffer bound.
     body_limit: Option<u64>,
-) -> Config {
-    let debug = if upstream_header {
-        "debug:\n  upstream_header: true\n"
-    } else {
-        ""
-    };
-    let server = match body_limit {
-        Some(bytes) => format!("server: {{ request_body_limit_bytes: {bytes} }}\n"),
-        None => String::new(),
-    };
-    config_from_yaml(&format!(
-        r#"
+    /// YAML list body for `match.methods`.
+    methods: String,
+    /// `timeouts.primary_ms` — a caller-chosen value only for the one test
+    /// that needs a short timeout against an upstream that never answers.
+    primary_ms: u64,
+}
+
+impl SplitCase {
+    /// The default fixture: legacy-only, no debug header, `GET`+`POST`,
+    /// unbounded body, a 1s primary budget.
+    fn new(legacy: &str, new: &str) -> Self {
+        Self {
+            legacy: legacy.to_string(),
+            new: new.to_string(),
+            percentage: 0,
+            failover_safe: false,
+            upstream_header: false,
+            body_limit: None,
+            methods: r#""GET", "POST""#.to_string(),
+            primary_ms: 1000,
+        }
+    }
+
+    fn build(&self) -> Config {
+        let Self {
+            legacy,
+            new,
+            percentage,
+            failover_safe,
+            upstream_header,
+            methods,
+            primary_ms,
+            ..
+        } = self;
+        let debug = if *upstream_header {
+            "debug:\n  upstream_header: true\n"
+        } else {
+            ""
+        };
+        let server = match self.body_limit {
+            Some(bytes) => format!("server: {{ request_body_limit_bytes: {bytes} }}\n"),
+            None => String::new(),
+        };
+        config_from_yaml(&format!(
+            r#"
 {debug}{server}flags:
   provider: static
   static:
@@ -77,48 +116,19 @@ fn split_config(
   fail_safe_mode: legacy_only
 routes:
   - id: r
-    match: {{ methods: ["GET", "POST"], path_prefix: "/" }}
+    match: {{ methods: [{methods}], path_prefix: "/" }}
     legacy_upstream: "{legacy}"
     new_upstream: "{new}"
     mode: percentage_split
     failover_safe: {failover_safe}
-    timeouts: {{ primary_ms: 1000, shadow_ms: 1000 }}
-    rollout:
-      percentage_flag: "migration.r.rollout_percentage"
-      default_percentage: 0
-      assignment_key: {{ header: "x-tenant-id", fallback: request_random }}
-"#
-    ))
-}
-
-/// Like [`split_config`] (always 100% new, `debug.upstream_header` on), but
-/// with a caller-chosen `primary_ms` — for the one test that needs a short
-/// timeout against an upstream that never answers.
-fn split_config_with_timeout(legacy: &str, new: &str, primary_ms: u64) -> Config {
-    config_from_yaml(&format!(
-        r#"
-debug:
-  upstream_header: true
-flags:
-  provider: static
-  static:
-    values:
-      "migration.r.rollout_percentage": 100
-  stale_ttl_ms: 30000
-  fail_safe_mode: legacy_only
-routes:
-  - id: r
-    match: {{ methods: ["GET"], path_prefix: "/" }}
-    legacy_upstream: "{legacy}"
-    new_upstream: "{new}"
-    mode: percentage_split
     timeouts: {{ primary_ms: {primary_ms}, shadow_ms: 1000 }}
     rollout:
       percentage_flag: "migration.r.rollout_percentage"
       default_percentage: 0
       assignment_key: {{ header: "x-tenant-id", fallback: request_random }}
 "#
-    ))
+        ))
+    }
 }
 
 /// A mock answering `GET`/`POST` with `status` and an `x-marker` header
@@ -204,27 +214,19 @@ async fn post(app: &Router, body: &str) -> (u16, Option<String>, Option<String>)
 async fn header_absent_on_a_relay_when_the_flag_is_off() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
 
-    let all_legacy = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        false,
-        None,
-    ));
+    let all_legacy = router(&SplitCase::new(&legacy.uri(), &new.uri()).build());
     assert_eq!(
         get(&all_legacy).await,
         (200, None, Some("legacy".to_string()))
     );
 
-    let all_new = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        100,
-        false,
-        false,
-        None,
-    ));
+    let all_new = router(
+        &SplitCase {
+            percentage: 100,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
     assert_eq!(get(&all_new).await, (200, None, Some("new".to_string())));
 }
 
@@ -233,14 +235,13 @@ async fn header_absent_on_a_relay_when_the_flag_is_off() {
 #[tokio::test]
 async fn flag_on_attributes_a_legacy_served_relay() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
     assert_eq!(
         get(&app).await,
         (200, Some("legacy".to_string()), Some("legacy".to_string()))
@@ -250,14 +251,14 @@ async fn flag_on_attributes_a_legacy_served_relay() {
 #[tokio::test]
 async fn flag_on_attributes_a_new_served_relay() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        100,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
     assert_eq!(
         get(&app).await,
         (200, Some("new".to_string()), Some("new".to_string()))
@@ -273,14 +274,15 @@ async fn flag_on_attributes_a_new_served_relay() {
 #[tokio::test]
 async fn failover_replay_of_legacy_is_attributed_legacy() {
     let legacy = marker_upstream("legacy", 200).await;
-    let app = router(&split_config(
-        &legacy.uri(),
-        DEAD_UPSTREAM,
-        100,
-        true,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            failover_safe: true,
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), DEAD_UPSTREAM)
+        }
+        .build(),
+    );
     assert_eq!(
         get(&app).await,
         (200, Some("legacy".to_string()), Some("legacy".to_string()))
@@ -294,14 +296,14 @@ async fn failover_replay_of_legacy_is_attributed_legacy() {
 #[tokio::test]
 async fn synthesized_502_without_replay_carries_no_header() {
     let legacy = marker_upstream("legacy", 200).await;
-    let app = router(&split_config(
-        &legacy.uri(),
-        DEAD_UPSTREAM,
-        100,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), DEAD_UPSTREAM)
+        }
+        .build(),
+    );
     assert_eq!(get(&app).await, (502, None, None));
 }
 
@@ -310,14 +312,16 @@ async fn synthesized_502_without_replay_carries_no_header() {
 #[tokio::test]
 async fn synthesized_413_over_limit_carries_no_header() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        100,
-        true,
-        true,
-        Some(64),
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            failover_safe: true,
+            upstream_header: true,
+            body_limit: Some(64),
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
     let big = "x".repeat(4096);
     assert_eq!(post(&app, &big).await, (413, None, None));
 }
@@ -327,14 +331,16 @@ async fn synthesized_413_over_limit_carries_no_header() {
 #[tokio::test]
 async fn synthesized_400_unreadable_body_carries_no_header() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        100,
-        true,
-        true,
-        Some(1_048_576),
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            failover_safe: true,
+            upstream_header: true,
+            body_limit: Some(1_048_576),
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
 
     let broken = Body::from_stream(futures::stream::iter(vec![
         Ok(Bytes::from_static(b"half")),
@@ -361,7 +367,16 @@ async fn synthesized_400_unreadable_body_carries_no_header() {
 async fn synthesized_504_timeout_carries_no_header() {
     let legacy = marker_upstream("legacy", 200).await;
     let new = never_responds_upstream().await;
-    let app = router(&split_config_with_timeout(&legacy.uri(), &new, 200));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            upstream_header: true,
+            methods: r#""GET""#.to_string(),
+            primary_ms: 200,
+            ..SplitCase::new(&legacy.uri(), &new)
+        }
+        .build(),
+    );
 
     let (status, header, marker) = get(&app).await;
     assert_eq!(status, 504);
@@ -390,14 +405,16 @@ async fn an_over_limit_new_response_on_a_failover_safe_route_still_attributes_ne
         )
         .mount(&new)
         .await;
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        100,
-        true,
-        true,
-        Some(64),
-    ));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            failover_safe: true,
+            upstream_header: true,
+            body_limit: Some(64),
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
 
     assert_eq!(
         get(&app).await,
@@ -429,7 +446,14 @@ async fn attribution_survives_a_post_commit_body_stream_failure() {
         // declared 100 bytes — a real body-stream failure, not a slow one.
     })
     .await;
-    let app = router(&split_config(&legacy.uri(), &new, 100, false, true, None));
+    let app = router(
+        &SplitCase {
+            percentage: 100,
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new)
+        }
+        .build(),
+    );
 
     let resp = send(
         &app,
@@ -473,14 +497,13 @@ async fn attribution_survives_a_post_commit_body_stream_failure() {
 #[tokio::test]
 async fn duplicate_spoofed_inbound_headers_are_both_stripped() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
 
     let req = Request::builder()
         .method("GET")
@@ -523,14 +546,7 @@ async fn duplicate_spoofed_inbound_headers_are_both_stripped() {
 #[tokio::test]
 async fn spoofed_inbound_header_is_stripped_before_the_upstream_flag_off() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        false,
-        None,
-    ));
+    let app = router(&SplitCase::new(&legacy.uri(), &new.uri()).build());
 
     let (status, header, marker) = get_with_optional_spoof(&app, Some("evil")).await;
     assert_eq!(status, 200);
@@ -555,14 +571,13 @@ async fn spoofed_inbound_header_is_stripped_before_the_upstream_flag_off() {
 #[tokio::test]
 async fn spoofed_inbound_header_is_stripped_before_the_upstream_flag_on() {
     let (legacy, new) = tokio::join!(marker_upstream("legacy", 200), marker_upstream("new", 200));
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
 
     let (status, header, marker) = get_with_optional_spoof(&app, Some("evil")).await;
     assert_eq!(status, 200);
@@ -594,14 +609,7 @@ async fn upstream_with_forged_response_header(name: &str) -> MockServer {
 async fn a_forged_response_header_from_the_upstream_is_stripped_flag_off() {
     let legacy = upstream_with_forged_response_header("legacy").await;
     let new = marker_upstream("new", 200).await;
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        false,
-        None,
-    ));
+    let app = router(&SplitCase::new(&legacy.uri(), &new.uri()).build());
 
     let resp = send(
         &app,
@@ -622,14 +630,13 @@ async fn a_forged_response_header_from_the_upstream_is_stripped_flag_off() {
 async fn a_forged_response_header_from_the_upstream_is_replaced_flag_on() {
     let legacy = upstream_with_forged_response_header("legacy").await;
     let new = marker_upstream("new", 200).await;
-    let app = router(&split_config(
-        &legacy.uri(),
-        &new.uri(),
-        0,
-        false,
-        true,
-        None,
-    ));
+    let app = router(
+        &SplitCase {
+            upstream_header: true,
+            ..SplitCase::new(&legacy.uri(), &new.uri())
+        }
+        .build(),
+    );
 
     let resp = send(
         &app,

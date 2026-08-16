@@ -1767,12 +1767,17 @@ fn an_impossible_transition_tuple_rejects_the_row() {
     assert_row_is_unavailable(&ws.page(), "split");
 }
 
-/// Counters *behind* the gauge cannot be a race: the transition counter is
-/// incremented under the same lock that stores the state, so no scrape can
-/// show a state whose own transition has not been counted yet.
+/// `Closed` and `HalfOpen` are not connected by any single legal transition —
+/// the state machine only ever reaches `HalfOpen` from `Open` — so a scrape
+/// pairing them is rejected outright. This is not a question of which
+/// reading is "ahead": counts `[3, 3, 2, 0]` are, if anything, numerically
+/// ahead of the `[2, 2, 2, 0]` baseline in every column that moved, and it is
+/// still rejected, because no edge in [`BreakerState::TRANSITIONS`] runs
+/// `closed`→`half_open`.
 #[test]
-fn counters_lagging_the_state_gauge_reject_the_row() {
-    // Counts leave the breaker half-open; the gauge says closed.
+fn a_gauge_and_counters_pair_with_no_legal_edge_rejects_the_row() {
+    // Counts leave the breaker half-open; the gauge says closed — and no
+    // legal transition connects `closed` to `half_open` directly.
     let ws = rollout().with_metrics(&rollout_metrics().replace(
         &transitions("split", [2, 2, 2, 0]),
         &transitions("split", [3, 3, 2, 0]),
@@ -1780,6 +1785,42 @@ fn counters_lagging_the_state_gauge_reject_the_row() {
     let model = ws.model();
     assert_failure_naming(&model, "not describing the same breaker");
     assert_row_is_unavailable(&ws.page(), "split");
+}
+
+/// The other legitimate cause of a one-step skew, running the opposite
+/// direction from [`a_one_step_state_skew_is_reported_not_rejected`]:
+/// `CircuitBreaker::state()` reports `HalfOpen` the instant the open window
+/// elapses, without touching the counter — the counter only bumps inside the
+/// next admitted request. A scrape landing in that gap sees a gauge already
+/// at `half_open` while the transition counts still describe the breaker as
+/// `open`. It is accepted through the same `half_open`→`open` edge that also
+/// covers a failed half-open trial reopening the breaker — the two races are
+/// indistinguishable from one scrape, and both are legal.
+#[test]
+fn a_gauge_ahead_of_a_lazy_half_open_read_is_reported_not_rejected() {
+    // Counts `[3, 2, 2, 0]` leave the breaker open by the transition history;
+    // the gauge already reads half-open, having advanced ahead of it.
+    let ws = rollout().with_metrics(
+        &rollout_metrics()
+            .replace(
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 0",
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 1",
+            )
+            .replace(
+                &transitions("split", [2, 2, 2, 0]),
+                &transitions("split", [3, 2, 2, 0]),
+            ),
+    );
+    let model = ws.model();
+    let row = rollout_row_of(&ws.page(), "split");
+    assert!(row.contains("STATE/COUNTERS SKEWED"), "{row}");
+    assert!(
+        row.contains(">open<"),
+        "the skew reported the more diverting of the two readings: {row}"
+    );
+    // Reported as open, so the diverting-breaker failure applies — a skew is
+    // never a way to a clean page.
+    assert_failure_naming(&model, "breaker open on route split");
 }
 
 /// The three flag gauges come from one `health()` snapshot, so a tuple that

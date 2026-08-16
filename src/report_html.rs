@@ -1178,19 +1178,40 @@ fn transition_order() -> String {
 /// Reconcile the state gauge against the state the transition counts imply.
 ///
 /// `Ok(None)` is agreement. `Ok(Some(implied))` is a **one-step skew**, which
-/// is benign and expected: the `/metrics` handler refreshes the state gauge for
-/// every route and *then* renders the exposition, so a transition landing
-/// inside that window is already counted but not yet in the gauge.
+/// is benign and expected: acceptance means a legal
+/// [`BreakerState::TRANSITIONS`] edge runs from the gauge's reading to the
+/// state the counters imply. Two distinct races produce this pattern, and
+/// they are not both "counters ahead" — the second runs the other way:
 ///
-/// The tolerance is **directional** — the counters may be one transition *ahead*
-/// of the gauge, never behind it. `CircuitBreaker::publish` increments the
-/// counter with the state mutex still held, in the same critical section that
-/// stores the new phase, so no reader can see a new state beside an
-/// un-incremented counter. A symmetric tolerance would also be vacuous: the
-/// four legal transitions connect all three states pairwise, so accepting
-/// either direction would accept every mismatch there is.
+/// - **Scrape-time gauge refresh vs. in-flight counter publish.** The
+///   `/metrics` handler refreshes the state gauge for every route and *then*
+///   renders the exposition. A transition landing inside that window is
+///   already counted — `CircuitBreaker::publish` increments the counter with
+///   the state mutex still held, in the same critical section that stores the
+///   new phase — but the gauge was read (and fixed for this render) before
+///   that write happened. Here the counters hold the newer reading and the
+///   gauge is the stale `from` of the transition that just landed.
+/// - **The lazy `Open`→`HalfOpen` read.** `CircuitBreaker::state()` reports
+///   `HalfOpen` the instant the open window elapses, purely by comparing
+///   clocks — it mutates nothing. The actual phase flip, and the counter bump
+///   that goes with it, only happen inside the *next* `allow()` call. A
+///   scrape landing in that gap sees a gauge already at `HalfOpen` while the
+///   transition counts still describe the breaker as `Open`. Here the *gauge*
+///   holds the newer reading, the reverse of the case above — yet it is
+///   accepted by the very same edge check below, because `HalfOpen`→`Open` is
+///   independently a legal transition (a failed half-open trial reopening the
+///   breaker) and the two causes cannot be told apart from one scrape alone.
 ///
-/// Two steps apart is not tolerated. It is possible in principle (two
+/// So the tolerance is **not "counters may run ahead, never behind"** — that
+/// framing is only true of the first cause, and the second cause runs the
+/// opposite way through a pair the transition table would have accepted
+/// regardless. What actually gates acceptance is narrower and direction-free:
+/// a single legal edge from the gauge's state to the implied one. That is
+/// still not vacuous — most state pairs (`Closed`/`HalfOpen`, for instance)
+/// are connected by no such edge in either role, so a mismatch there is
+/// rejected outright no matter which reading looks newer.
+///
+/// Two steps apart is not tolerated either. It is possible in principle (two
 /// transitions inside one render) and vanishingly rare in practice, and a page
 /// that shrugged at arbitrary drift could never catch the torn scrape this
 /// check exists for.
@@ -1201,22 +1222,19 @@ fn reconcile_state(
     if gauge == implied {
         return Ok(None);
     }
-    let one_step_ahead = BreakerState::TRANSITIONS
+    let one_step_apart = BreakerState::TRANSITIONS
         .iter()
         .any(|(from, to)| *from == gauge && *to == implied);
-    if one_step_ahead {
+    if one_step_apart {
         return Ok(Some(implied));
     }
-    // Every pair that is not one step *ahead* is one step behind: the four
-    // transitions connect all three states pairwise, so there is no third
-    // case to word. Behind is the impossible one — the counter is incremented
-    // under the same lock that stores the state, so a scrape cannot show a
-    // state whose own transition has not been counted yet.
+    // No legal transition runs from the gauge's reading to the implied one —
+    // not a scrape-time race along any edge this state machine has, whichever
+    // reading is the newer of the two.
     Err(format!(
         "{CIRCUIT_BREAKER_STATE} reads {} but the {BREAKER_TRANSITIONS_TOTAL} counts describe a \
-         breaker that is {} — the counters are published under the same lock that stores the \
-         state, so they can run one transition ahead of the gauge but never behind it. The gauge \
-         and the counters are not describing the same breaker",
+         breaker that is {} — no legal transition runs from the gauge's reading to the counters' \
+         implied one, so the gauge and the counters are not describing the same breaker",
         gauge.as_str(),
         implied.as_str(),
     ))
@@ -3064,9 +3082,13 @@ fn observed_cell(observed: &Reading<ObservedShare>) -> String {
 /// number. "2" on a status page is not a state anybody reads.
 ///
 /// A one-step skew between the gauge and the transition history says so in the
-/// cell. The race is benign — the scrape handler refreshes the gauge and then
-/// renders — but a page that silently picked one of the two readings would be
-/// presenting a coin flip as a measurement.
+/// cell. The race is benign, and it is not always the same race: a transition
+/// can land between the scrape's gauge refresh and its render (the counters
+/// are then the newer reading), or the gauge's lazily-computed `Open`→
+/// `HalfOpen` read can outpace a counter that only bumps on the next admitted
+/// request (the gauge is then the newer one). Either way, a page that silently
+/// picked one of the two readings would be presenting a coin flip as a
+/// measurement.
 fn breaker_cell(truth: &RouteTruth) -> String {
     let cell = reading_cell(&truth.breaker_state, |state| {
         let (class, word) = match state {
@@ -3087,9 +3109,9 @@ fn breaker_cell(truth: &RouteTruth) -> String {
         .unwrap_or(&cell)
         .to_string();
     format!(
-        "<td>{inner} {} the transition counts describe a breaker that is {} — a transition landed \
-         between the gauge refresh and this render, so the more diverting of the two is \
-         reported</td>",
+        "<td>{inner} {} the transition counts describe a breaker that is {} — the gauge and the \
+         counters are one benign scrape-time race apart (either can be the newer reading), so the \
+         more diverting of the two is reported</td>",
         pill("warn", "STATE/COUNTERS SKEWED"),
         esc(implied.as_str())
     )
@@ -3983,24 +4005,29 @@ limen_flag_provider_consecutive_failures 0
         }
     }
 
-    /// The counters may run one transition ahead of the gauge (the handler
-    /// refreshes the gauge, then renders), never behind it.
+    /// Only a gauge/implied pair connected by a single legal
+    /// [`BreakerState::TRANSITIONS`] edge is tolerated — not "counters ahead,
+    /// never behind": `(HalfOpen, Open)` covers both the ordinary
+    /// counters-ahead race (a failed half-open trial already counted, gauge
+    /// not yet refreshed) and the lazy `Open`→`HalfOpen` read outpacing its
+    /// own counter (gauge ahead), and both are accepted through the very same
+    /// edge. The two pairs with no edge in either role are rejected
+    /// regardless of which reading looks "ahead".
     #[test]
-    fn only_a_counters_ahead_skew_is_tolerated() {
+    fn only_a_single_legal_edge_apart_is_tolerated() {
         use BreakerState::{Closed, HalfOpen, Open};
         assert_eq!(reconcile_state(Closed, Closed), Ok(None));
         assert_eq!(reconcile_state(Closed, Open), Ok(Some(Open)));
         assert_eq!(reconcile_state(Open, HalfOpen), Ok(Some(HalfOpen)));
         assert_eq!(reconcile_state(HalfOpen, Closed), Ok(Some(Closed)));
         assert_eq!(reconcile_state(HalfOpen, Open), Ok(Some(Open)));
-        // The only two pairs left, and both are the counters lagging the
-        // gauge — impossible, because the counter is incremented under the
-        // same lock that stores the state. (The four transitions connect the
-        // three states pairwise, so "not one ahead" always means "one behind":
-        // there is no third case to word.)
+        // The only two pairs left are connected by no legal edge at all, in
+        // either role — not a question of which reading is "ahead", since
+        // `(Open, Closed)` and `(Closed, HalfOpen)` are simply not transitions
+        // this state machine can make.
         for (gauge, implied) in [(Open, Closed), (Closed, HalfOpen)] {
             let err = reconcile_state(gauge, implied).unwrap_err();
-            assert!(err.contains("never behind it"), "{err}");
+            assert!(err.contains("no legal transition runs"), "{err}");
             assert!(err.contains("not describing the same breaker"), "{err}");
         }
     }

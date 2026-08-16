@@ -154,6 +154,42 @@ routes:
     ))
 }
 
+/// A `percentage_split` route over a static flag, with a circuit breaker
+/// attached — for the spec §6.4 pin that the resolved target gauge is
+/// flag-resolved, not breaker-adjusted.
+fn split_with_breaker(
+    route: &str,
+    legacy: &str,
+    new: &str,
+    percentage: f64,
+    open_ms: u64,
+) -> Config {
+    config_from_yaml(&format!(
+        r#"
+flags:
+  provider: static
+  static:
+    values: {{ "migration.{route}.percentage": {percentage} }}
+routes:
+  - id: {route}
+    match: {{ methods: ["GET"], path_prefix: "/" }}
+    legacy_upstream: "{legacy}"
+    new_upstream: "{new}"
+    mode: percentage_split
+    rollout:
+      percentage_flag: "migration.{route}.percentage"
+      default_percentage: 0
+      assignment_key: {{ header: "x-tenant-id", fallback: request_random }}
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 0.5
+      min_requests: 2
+      open_duration_ms: {open_ms}
+      half_open_max_requests: 1
+"#
+    ))
+}
+
 /// A `failover_to_legacy` route guarded by a fast-cycling breaker.
 fn breaker_config(route: &str, legacy: &str, new: &str, open_ms: u64) -> Config {
     config_from_yaml(&format!(
@@ -551,4 +587,70 @@ async fn a_failing_probe_counts_half_open_open() {
         Some(0.0),
         "nothing closed:\n{body}"
     );
+}
+
+/// Spec §6.4: `limen_rollout_resolved_target_percentage{route}` is the
+/// flag-resolved *target*, deliberately not the effective share — an open
+/// breaker does not move it. A `percentage_split` route pinned at 100%, with
+/// its breaker driven open by new-side 500s, still scrapes the gauge at 100
+/// even while every request is actually served by legacy.
+#[tokio::test]
+async fn an_open_breaker_does_not_move_the_resolved_target_off_the_flag_value() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).insert_header("x-upstream", "legacy"))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&new)
+        .await;
+
+    let cfg = split_with_breaker(
+        "target-under-open",
+        &legacy.uri(),
+        &new.uri(),
+        100.0,
+        60_000,
+    );
+    let (data, control) = planes(&cfg);
+
+    // Two new-side 500s at min_requests=2 open the breaker — the split is
+    // 100%, so both land on new.
+    for _ in 0..2 {
+        send(
+            &data,
+            Request::builder()
+                .uri("/x")
+                .header("x-tenant-id", "a")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await;
+    }
+
+    let body = scrape(&control).await;
+    assert_eq!(
+        transition(&body, "target-under-open", "closed", "open"),
+        Some(1.0),
+        "the breaker must actually be open for this test to mean anything:\n{body}"
+    );
+    assert_eq!(
+        series(&body, TARGET, &[("route", "target-under-open")]),
+        Some(100.0),
+        "the resolved target is flag-resolved, not breaker-adjusted:\n{body}"
+    );
+
+    // And traffic agrees the breaker is open: every subsequent request the
+    // split still assigns to new is steered to legacy instead, even though
+    // the gauge above reads 100.
+    for tenant in ["b", "c", "d"] {
+        assert_eq!(
+            served_by(&data, tenant).await,
+            "legacy",
+            "the open breaker steers new-assigned traffic to legacy while the target gauge \
+             still reads the flag's 100"
+        );
+    }
 }

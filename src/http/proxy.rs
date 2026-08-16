@@ -57,6 +57,15 @@ const HOP_BY_HOP: &[&str] = &[
 /// unfiltered (spoof/leak resistance, spec plan 016 W3).
 const X_LIMEN_UPSTREAM: &str = "x-limen-upstream";
 
+/// The shortest budget worth replaying legacy in. Below this floor a replay
+/// cannot do the job replay exists for: a sub-millisecond attempt is far more
+/// likely to record a fresh legacy *timeout* — one that describes the budget
+/// that was left, not legacy's actual health — than to complete, so it would
+/// misinform the very breaker/steering decisions it is meant to inform. Below
+/// the floor the client gets new's own failure instead, exactly as it would
+/// with nothing left at all.
+const MIN_REPLAY_BUDGET: Duration = Duration::from_millis(10);
+
 /// The data-plane fallback handler: every client request flows through here.
 ///
 /// This thin wrapper owns the cross-cutting concerns — the in-flight gauge, the
@@ -660,17 +669,21 @@ async fn failover_dispatch(
     // mid-read) — replay legacy with whatever is left of the one budget.
     record_breaker(breaker, false);
     let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-    if remaining.is_zero() {
-        // New spent the whole budget before failing — the usual way to get here
-        // is a new attempt that timed out. There is no time left to replay in
-        // without breaking the route's declared deadline, so the client gets
-        // new's failure. The breaker has already recorded it, so *subsequent*
-        // requests are steered to legacy: the route still converges away from a
-        // sick new upstream, it just does not do so by doubling this client's
-        // wait.
+    if remaining < MIN_REPLAY_BUDGET {
+        // New spent the whole budget (or all but a sliver of it) before
+        // failing — the usual way to get here is a new attempt that timed
+        // out. There is not enough time left to replay in without breaking
+        // the route's declared deadline — and a replay too small to complete
+        // in would just record a *legacy* timeout that describes the budget
+        // left over, not legacy's health — so the client gets new's failure.
+        // The breaker has already recorded it, so *subsequent* requests are
+        // steered to legacy: the route still converges away from a sick new
+        // upstream, it just does not do so by doubling this client's wait.
         warn!(
             timeout_ms = timeout.as_millis(),
-            "new upstream failed with the primary budget spent; not replaying to legacy"
+            remaining_ms = remaining.as_millis(),
+            "new upstream failed with the primary budget spent or too small to replay in; not \
+             replaying to legacy"
         );
         let resp = if new_timed_out {
             gateway_timeout()
