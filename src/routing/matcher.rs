@@ -88,6 +88,23 @@ pub struct RouteComparison {
     pub rules: ComparisonRules,
 }
 
+/// Marks a [`PathMatcher::basis`] string as naming a `path_prefix` route.
+const PREFIX_BASIS: &str = "prefix:";
+/// Marks a [`PathMatcher::basis`] string as naming a `path_template` route.
+const TEMPLATE_BASIS: &str = "template:";
+
+/// Whether a recorded [`PathMatcher::basis`] describes a matcher that folds
+/// concrete paths — the read side of [`PathMatcher::observed_path`], for a
+/// consumer holding the string a profile recorded rather than the matcher.
+///
+/// It lives here so the sigils stay private to the one module that writes them:
+/// a reader that spelled `starts_with("template:")` itself would go on
+/// compiling, and silently stop agreeing with `observed_path`, the first time
+/// this enum grows a variant.
+pub fn basis_normalizes_paths(basis: &str) -> bool {
+    basis.starts_with(TEMPLATE_BASIS)
+}
+
 /// A route's compiled path expression. An enum rather than two optional fields
 /// so "both" and "neither" are unrepresentable past `RouteTable::build` — the
 /// matcher can then never face a route it has no way to test.
@@ -104,6 +121,36 @@ impl PathMatcher {
         match self {
             Self::Prefix(prefix) => path.starts_with(prefix.as_str()),
             Self::Template(template) => template.matches_path(path),
+        }
+    }
+
+    /// How this route names its paths, as one string: `prefix:/devices` or
+    /// `template:/conversations/{id}`.
+    ///
+    /// The single definition of that wire form, which an observe profile
+    /// records per route — see
+    /// [`crate::observability::observe::RouteProfile::match_basis`] for why the
+    /// matcher has to travel with the document it produced.
+    pub fn basis(&self) -> String {
+        match self {
+            Self::Prefix(prefix) => format!("{PREFIX_BASIS}{prefix}"),
+            Self::Template(template) => format!("{TEMPLATE_BASIS}{}", template.as_str()),
+        }
+    }
+
+    /// The path a *distinct-path count* should be keyed on: the template's own
+    /// text for a templated route, the raw path for a prefix route.
+    ///
+    /// Absorbing path cardinality is what a template is *for* — every
+    /// `/conversations/<id>` is one operation, and counting the ids again
+    /// after the operator has named the shape would report the one number the
+    /// template was written to stop reporting. Prefix routes are untouched:
+    /// under a prefix, path cardinality is still the only evidence available
+    /// that the route is a subtree rather than an endpoint.
+    pub fn observed_path<'a>(&'a self, path: &'a str) -> &'a str {
+        match self {
+            Self::Prefix(_) => path,
+            Self::Template(template) => template.as_str(),
         }
     }
 
@@ -786,6 +833,36 @@ routes:
         assert_eq!(t.match_route("GET", "/a/1", None).unwrap().id, "one");
         assert_eq!(t.match_route("GET", "/a/1/2", None).unwrap().id, "two");
         assert!(t.match_route("GET", "/a", None).is_none());
+    }
+
+    /// The two strings an observe profile is built from: the basis it records
+    /// per route, and the key its distinct-path count is taken over.
+    #[test]
+    fn a_matcher_names_its_basis_and_normalizes_only_a_template() {
+        let t = table(TEMPLATE_AND_CATCH_ALL);
+        let route = |id: &str| t.iter().find(|r| r.id == id).expect("route");
+
+        let templated = &route("conversation").path;
+        assert_eq!(templated.basis(), "template:/conversations/{id}");
+        // Every id keys to the shape, which is what makes the count "how many
+        // operations" rather than "how many conversations".
+        assert_eq!(
+            templated.observed_path("/conversations/123"),
+            "/conversations/{id}"
+        );
+        assert_eq!(
+            templated.observed_path("/conversations/456"),
+            templated.observed_path("/conversations/123")
+        );
+
+        let prefixed = &route("conversations-all").path;
+        assert_eq!(prefixed.basis(), "prefix:/conversations/");
+        // Untouched: under a prefix the concrete path is the only evidence
+        // available that the route is a subtree rather than an endpoint.
+        assert_eq!(
+            prefixed.observed_path("/conversations/123"),
+            "/conversations/123"
+        );
     }
 
     #[test]

@@ -45,6 +45,10 @@ routes:
     match: {{ methods: ["GET"], path_prefix: "/api" }}
     legacy_upstream: "{legacy}"
     mode: legacy_only
+  - id: conversation
+    match: {{ methods: ["GET"], path_template: "/conversations/{{id}}" }}
+    legacy_upstream: "{legacy}"
+    mode: legacy_only
 "#,
         legacy = legacy.uri(),
     ))
@@ -62,6 +66,16 @@ routes:
     for _ in 0..8 {
         assert!(client.get(&url).send().await.unwrap().status().is_success());
     }
+    // …and nine conversations, each read twice. Raw, that is nine distinct
+    // paths — over the default `--max-compare-paths` of eight, so R7 would
+    // demote the route as a wildcard proxy. The template says those nine ids
+    // are one operation, and the live recorder counts it that way.
+    for n in 0..9 {
+        let url = format!("http://127.0.0.1:{data_port}/conversations/c{n}");
+        for _ in 0..2 {
+            assert!(client.get(&url).send().await.unwrap().status().is_success());
+        }
+    }
 
     let opts = SuggestOptions {
         source: ProfileSource::ControlPlane {
@@ -77,13 +91,33 @@ routes:
         .await
         .expect("the profile should quiesce once traffic has stopped");
     assert_eq!(live.exit_code, 0, "{:?}", live.warnings);
-    assert_eq!(live.suggestions.len(), 1);
+    assert_eq!(live.suggestions.len(), 2);
     assert_eq!(
         live.suggestions[0].disposition,
         Disposition::CompareCandidate
     );
     assert_eq!(live.suggestions[0].reason, Reason::StableRepeatedReads);
     assert!(live.suggestions[0].evidence.reads >= 8);
+    assert_eq!(live.suggestions[0].evidence.match_basis, "prefix:/api");
+
+    // The live path's half of the basis contract: the proxy recorded the
+    // matcher it was running, and this same config passed the cross-check —
+    // which it can only do because both sides compile the route the same way.
+    let templated = &live.suggestions[1];
+    assert_eq!(templated.route_id, "conversation");
+    assert_eq!(
+        templated.evidence.match_basis,
+        "template:/conversations/{id}"
+    );
+    assert_eq!(templated.evidence.reads, 18);
+    assert_eq!(
+        templated.evidence.distinct_read_paths, 1,
+        "nine ids, one shape"
+    );
+    // …and the classification that normalization buys: nine raw paths would
+    // have tripped R7's ceiling of eight and demoted the route.
+    assert_eq!(templated.disposition, Disposition::CompareCandidate);
+    assert_eq!(templated.reason, Reason::StableRepeatedReads);
 
     // The same document, saved and re-read, must classify identically —
     // otherwise `--profile` would be a different tool wearing the same flag.

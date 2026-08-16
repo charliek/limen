@@ -48,6 +48,7 @@ use tokio::time::Instant;
 use crate::config::model::{ComparisonConfig, Config, RouteConfig, RouteMode};
 use crate::observability::observe::{ObserveProfile, RouteProfile, OBSERVE_PROFILE_PATH};
 use crate::observability::prometheus::IN_FLIGHT;
+use crate::routing::matcher::{basis_normalizes_paths, PathMatcher};
 use crate::suggest::{self, Disposition, Reason, SuggestThresholds, Suggestion};
 use crate::verdict::Scrape;
 
@@ -196,8 +197,9 @@ pub async fn run_suggest_routes(
     Ok(evaluate(config, &profile, opts))
 }
 
-/// The config supplies the route table; the profile supplies the sample rate.
-/// This is where the two are made to agree.
+/// The config supplies the route table; the profile supplies the sample rate
+/// and the matcher each route was profiled under. This is where the two are
+/// made to agree.
 ///
 /// The rate is not read from the config at all (see
 /// [`ObserveProfile::sample_rate`]), but the config still has to be *the
@@ -232,6 +234,72 @@ fn check_config_describes_the_profiled_proxy(
              table cannot be trusted to describe the traffic",
             profile.sample_rate, observe.sample_rate
         )));
+    }
+    check_match_bases(config, profile)
+}
+
+/// Refuse a profile whose routes were matched by a different expression than
+/// this config declares.
+///
+/// The same argument as the sample rate, one level down. `distinct_read_paths`
+/// counts *paths* under a `path_prefix` route and *shapes* under a
+/// `path_template` one, so R7 and R8 read the identical number to opposite
+/// conclusions depending on a fact the number itself does not carry. A profile
+/// recorded before a route was templated therefore classifies as if the
+/// operator had never split it — silently, and in the unsafe direction: the
+/// per-id path spread that R7/R8 exist to catch reads as one tidy endpoint. It
+/// is not a discrepancy to average over but the wrong input, so the run stops.
+///
+/// Checked per route and only where both sides have one: a config route the
+/// profile never carried is classified against a zero-filled profile (landing
+/// on `no-observations`), and a profile id this config does not define is
+/// already reported as a warning by [`evaluate`].
+fn check_match_bases(config: &Config, profile: &ObserveProfile) -> Result<(), SuggestError> {
+    // A profile that shares NO route id with the configuration is some other
+    // proxy's profile; skipping every per-route comparison must not read as
+    // agreement (absence is never evidence). Partial overlap stays legal —
+    // routes added or removed between capture and this run are a normal
+    // workflow, and each unmatched side is handled on its own terms.
+    let any_shared = config
+        .routes
+        .iter()
+        .any(|r| profile.routes.contains_key(&r.id));
+    if !config.routes.is_empty() && !profile.routes.is_empty() && !any_shared {
+        return Err(SuggestError::InputUnavailable(format!(
+            "the profile's routes ({}) share no id with this configuration's routes — this is \
+             not a profile of the configured proxy, so none of its counts describe these \
+             routes. Point --profile/-c at a matching pair",
+            profile
+                .routes
+                .keys()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    for route in &config.routes {
+        let Some(observed) = profile.routes.get(&route.id) else {
+            continue;
+        };
+        // Compiled through the same code the proxy compiled its table with, so
+        // the two bases cannot disagree over spelling — only over substance.
+        let configured = PathMatcher::compile(&route.id, &route.r#match)
+            .map_err(|e| {
+                SuggestError::InputUnavailable(format!(
+                    "route {:?} has no usable match expression: {e}",
+                    route.id
+                ))
+            })?
+            .basis();
+        if configured != observed.match_basis {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {:?} was profiled as {:?} but this configuration declares {:?} — the \
+                 profile's path counts were recorded against a matcher this config no longer \
+                 uses, so they do not mean what the classifier would read them as. Re-profile \
+                 against this configuration",
+                route.id, observed.match_basis, configured
+            )));
+        }
     }
     Ok(())
 }
@@ -881,17 +949,25 @@ fn headline(suggestion: &Suggestion) -> String {
 /// The evidence items, in the order a reader wants them.
 fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
     let e = &suggestion.evidence;
+    // Said out loud, because "1 path" on a route serving thousands of ids is
+    // otherwise the most misreadable number on the page: the template folded
+    // them, and the path-spread rules had nothing left to see.
+    let normalized = if basis_normalizes_paths(&e.match_basis) {
+        " (template-normalized)"
+    } else {
+        ""
+    };
     let mut items = vec![
         format!("{} reads / {} writes", e.reads, e.writes),
         format!(
-            "{}{} path{}",
+            "{}{} path{}{normalized}",
             e.distinct_read_paths,
             if e.distinct_read_paths_overflow {
                 "+"
             } else {
                 ""
             },
-            if e.distinct_read_paths == 1 { "" } else { "s" }
+            if e.distinct_read_paths == 1 { "" } else { "s" },
         ),
     ];
     items.push(if e.status_classes.is_empty() {
@@ -1364,16 +1440,7 @@ routes:
     /// through the model.
     #[test]
     fn a_templated_route_round_trips_through_the_draft() {
-        let config = config_from(
-            r#"
-observe: {}
-routes:
-  - id: conversation
-    match: { methods: ["GET"], path_template: "/conversations/{id}" }
-    legacy_upstream: "http://legacy.internal"
-    mode: legacy_only
-"#,
-        );
+        let config = matched_config("path_template", "/conversations/{id}");
         let draft = draft_of(
             &config,
             &candidate_profile("conversation"),
@@ -1683,6 +1750,136 @@ routes:
         assert!(
             check_config_describes_the_profiled_proxy(&hostile_config(), &empty_profile()).is_ok()
         );
+    }
+
+    /// A one-route config whose route matches `path` written as `field`.
+    fn matched_config(field: &str, path: &str) -> Config {
+        config_from(&format!(
+            r#"
+observe: {{}}
+routes:
+  - id: conversation
+    match: {{ methods: ["GET"], {field}: "{path}" }}
+    legacy_upstream: "http://legacy.internal"
+    mode: legacy_only
+"#
+        ))
+    }
+
+    /// `candidate_profile`, recorded under a named matcher — the provenance the
+    /// stale-profile check reads.
+    fn candidate_profile_matched(route_id: &str, basis: &str) -> ObserveProfile {
+        let mut profile = candidate_profile(route_id);
+        profile.routes.get_mut(route_id).expect("route").match_basis = basis.to_string();
+        profile
+    }
+
+    /// The three ways a route's matcher can move under a profile that has
+    /// already been recorded. Each is refused, because the profile's path
+    /// counts were taken against a matcher that is no longer in force and the
+    /// classifier would read them as if it were.
+    #[test]
+    fn a_profile_recorded_under_a_different_matcher_is_input_unavailable() {
+        for (field, path, recorded) in [
+            // A route that was templated after the profile was taken: the
+            // recorded per-id path spread would read as one tidy endpoint.
+            (
+                "path_template",
+                "/conversations/{id}",
+                "prefix:/conversations/",
+            ),
+            // …and the reverse: a count of one shape read as a count of one
+            // path, which is the same mistake pointing the other way.
+            (
+                "path_prefix",
+                "/conversations/",
+                "template:/conversations/{id}",
+            ),
+            // The template itself moved. `{id}` and `{id}/messages` are
+            // different operations, and their profiles are not interchangeable.
+            (
+                "path_template",
+                "/conversations/{id}",
+                "template:/conversations/{id}/messages",
+            ),
+        ] {
+            let config = matched_config(field, path);
+            let profile = candidate_profile_matched("conversation", recorded);
+            let err = check_config_describes_the_profiled_proxy(&config, &profile)
+                .expect_err("a profile recorded under another matcher must be refused");
+            assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+            let message = err.to_string();
+            // Named in full: the operator has to be able to tell which of the
+            // two ran ahead of the other.
+            assert!(message.contains("conversation"), "{message}");
+            assert!(message.contains(recorded), "{message}");
+            assert!(message.contains(path), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_profile_recorded_under_the_configured_matcher_passes() {
+        // The control the three refusals above need: the check is not simply
+        // refusing every templated route.
+        for (field, path, recorded) in [
+            (
+                "path_template",
+                "/conversations/{id}",
+                "template:/conversations/{id}",
+            ),
+            ("path_prefix", "/conversations/", "prefix:/conversations/"),
+        ] {
+            let config = matched_config(field, path);
+            let profile = candidate_profile_matched("conversation", recorded);
+            assert!(
+                check_config_describes_the_profiled_proxy(&config, &profile).is_ok(),
+                "{recorded} must classify against {field} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_the_profile_never_carried_is_not_a_basis_mismatch() {
+        // It is classified against a zero-filled profile and lands on
+        // `no-observations`. Refusing the whole run because a route saw no
+        // traffic would make the command unusable on any config with a quiet
+        // route in it.
+        let config = matched_config("path_template", "/conversations/{id}");
+        assert!(check_config_describes_the_profiled_proxy(&config, &empty_profile()).is_ok());
+    }
+
+    #[test]
+    fn a_profile_sharing_no_route_id_with_the_config_is_refused() {
+        // codex review (C2): with a fully disjoint id set every per-route
+        // basis comparison is skipped, and zero comparisons must not read as
+        // agreement — this is some other proxy's profile. Partial overlap
+        // stays legal (see the quiet-route test above).
+        let config = matched_config("path_template", "/conversations/{id}");
+        let profile = candidate_profile_matched("some-other-service", "prefix:/api/");
+        let err = check_config_describes_the_profiled_proxy(&config, &profile)
+            .expect_err("disjoint ids must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("share no id"), "{msg}");
+        assert!(msg.contains("some-other-service"), "{msg}");
+    }
+
+    #[test]
+    fn a_templated_routes_path_count_is_labelled_as_normalized() {
+        // "1 path" on a route that served thousands of conversations is true
+        // and, unlabelled, deeply misleading — the template folded them, which
+        // is also why the path-spread rules stayed quiet.
+        let config = matched_config("path_template", "/conversations/{id}");
+        let profile = candidate_profile_matched("conversation", "template:/conversations/{id}");
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(draft.contains("1 path (template-normalized)"), "{draft}");
+
+        // A prefix route's count is not relabelled: there it really is a count
+        // of distinct paths.
+        let config = matched_config("path_prefix", "/conversations/");
+        let profile = candidate_profile_matched("conversation", "prefix:/conversations/");
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(draft.contains("1 path"), "{draft}");
+        assert!(!draft.contains("template-normalized"), "{draft}");
     }
 
     #[test]

@@ -161,11 +161,14 @@ pub fn build_state_with_observer(
     let request_body_limit = config.server.request_body_limit_bytes as usize;
     // Built from the *compiled* route table, so the profile's key set is
     // exactly the routes that can match traffic — "never observed" and "no such
-    // route" stay distinguishable, and traffic can never add a key.
+    // route" stay distinguishable, and traffic can never add a key. The
+    // compiled path expression rides along: it is what the profile records as
+    // each route's match basis, and what normalizes a templated route's
+    // distinct-path count.
     let observe = config.observe.map(|observe| {
         Arc::new(ObserveRecorder::new(
             observe,
-            routes.iter().map(|route| route.id.as_str()),
+            routes.iter().map(|route| (route.id.as_str(), &route.path)),
         ))
     });
     Ok(AppState::new(

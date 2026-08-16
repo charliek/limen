@@ -96,8 +96,14 @@ routes:
 /// A route that looks like a clean, stable read: one path, one content type,
 /// repeats at a stable length. Candidate-shaped unless a config-derived rule
 /// (R1's catch-all, R6's `query_present`) says otherwise.
-fn stable_reads(reads: u64) -> RouteProfile {
+///
+/// `basis` is the matcher the route was profiled under (`prefix:/devices`,
+/// `template:/conversations/{id}`) and must agree with the config the fixture
+/// is classified against — a profile that disagrees is a *stale* profile, which
+/// the command refuses, and refusing it is the subject of its own tests below.
+fn stable_reads(reads: u64, basis: &str) -> RouteProfile {
     RouteProfile {
+        match_basis: basis.to_string(),
         observations: reads,
         reads,
         distinct_read_paths: 1,
@@ -124,10 +130,10 @@ fn profile_document(sample_rate: f64, routes: Vec<(&str, RouteProfile)>) -> Stri
 /// than for lack of evidence — `contracted` excepted, which is missing some
 /// `Content-Length`s (R11) and is therefore the narrowed route.
 fn hostile_profile() -> String {
-    let mut contracted = stable_reads(20);
+    let mut contracted = stable_reads(20, "prefix:/devices");
     contracted.length_missing = 3;
     contracted.distinct_read_paths = 2;
-    let mut pat_validate = stable_reads(34);
+    let mut pat_validate = stable_reads(34, "prefix:/api/v1/pat/validate");
     pat_validate.observations = 40;
     pat_validate.writes = 6;
     profile_document(
@@ -135,12 +141,12 @@ fn hostile_profile() -> String {
         vec![
             ("pat-validate", pat_validate),
             ("contracted", contracted),
-            ("split", stable_reads(20)),
-            ("failover", stable_reads(20)),
-            ("verifier-hop", stable_reads(9)),
-            ("oauth2-auth", stable_reads(16)),
-            ("migrated", stable_reads(12)),
-            ("catchall", stable_reads(9)),
+            ("split", stable_reads(20, "prefix:/split")),
+            ("failover", stable_reads(20, "prefix:/failover")),
+            ("verifier-hop", stable_reads(9, "prefix:/oauth2/auth")),
+            ("oauth2-auth", stable_reads(16, "prefix:/oauth2/auth")),
+            ("migrated", stable_reads(12, "prefix:/migrated")),
+            ("catchall", stable_reads(9, "prefix:/")),
         ],
     )
 }
@@ -407,7 +413,13 @@ routes:
     legacy_upstream: "http://legacy.internal"
     mode: legacy_only
 "#,
-        &profile_document(1.0, vec![("pat-validate", stable_reads(2))]),
+        &profile_document(
+            1.0,
+            vec![(
+                "pat-validate",
+                stable_reads(2, "prefix:/api/v1/pat/validate"),
+            )],
+        ),
     );
     assert_eq!(code(&suggest(dir.path(), &[])), 20);
 }
@@ -486,7 +498,13 @@ fn a_config_whose_sample_rate_contradicts_the_profile_is_exit_fifty() {
     // config instead.
     let dir = workspace(
         HOSTILE_CONFIG, // declares the default sample_rate 1.0
-        &profile_document(0.25, vec![("pat-validate", stable_reads(34))]),
+        &profile_document(
+            0.25,
+            vec![(
+                "pat-validate",
+                stable_reads(34, "prefix:/api/v1/pat/validate"),
+            )],
+        ),
     );
     let output = suggest(dir.path(), &[]);
     assert_eq!(code(&output), 50);
@@ -508,8 +526,11 @@ fn a_sampled_profile_classifies_nothing_at_all() {
         &profile_document(
             0.25,
             vec![
-                ("pat-validate", stable_reads(34)),
-                ("catchall", stable_reads(9)),
+                (
+                    "pat-validate",
+                    stable_reads(34, "prefix:/api/v1/pat/validate"),
+                ),
+                ("catchall", stable_reads(9, "prefix:/")),
             ],
         ),
     );
@@ -565,6 +586,86 @@ fn adopt_says_nothing_about_a_json_run() {
     assert!(String::from_utf8_lossy(&yaml.stderr).contains("enabled: true"));
 }
 
+/// A config whose one route is a template, plus the profile a proxy running it
+/// would have written: one shape, however many conversations it served.
+const TEMPLATED_CONFIG: &str = r#"
+observe: {}
+routes:
+  - id: conversation
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    legacy_upstream: "http://legacy.internal"
+    mode: legacy_only
+"#;
+
+fn templated_profile(basis: &str) -> String {
+    profile_document(1.0, vec![("conversation", stable_reads(40, basis))])
+}
+
+#[test]
+fn a_templated_route_adopts_into_a_config_limen_accepts() {
+    // The end of the line for a templated route: classified, drafted, adopted,
+    // and then loaded back by limen itself. The match block has to survive that
+    // round trip verbatim or the adopted config proxies something else.
+    let dir = workspace(
+        TEMPLATED_CONFIG,
+        &templated_profile("template:/conversations/{id}"),
+    );
+    let draft = draft_and_validate(
+        dir.path(),
+        &[
+            "--adopt-suggestions",
+            "--new-upstream",
+            "http://new.internal",
+        ],
+    );
+    let routes = routes_of(&draft);
+    assert_eq!(
+        route(&routes, "conversation")["match"]["path_template"].as_str(),
+        Some("/conversations/{id}")
+    );
+    assert!(route(&routes, "conversation")["match"]["path_prefix"].is_null());
+    assert_eq!(
+        route(&routes, "conversation")["mode"].as_str(),
+        Some("shadow_legacy_primary")
+    );
+    assert_eq!(
+        route(&routes, "conversation")["comparison"]["enabled"].as_bool(),
+        Some(true)
+    );
+    // The count the template folded is labelled as folded, so "1 path" on a
+    // route that served forty conversations cannot be misread.
+    assert!(
+        comment_text(&draft).contains("1 path (template-normalized)"),
+        "{draft}"
+    );
+}
+
+#[test]
+fn a_profile_recorded_under_another_matcher_is_exit_fifty() {
+    // The stale-profile case end to end: the route was templated after this
+    // profile was taken, so its per-id path spread would now read as one tidy
+    // endpoint. Refused rather than reinterpreted.
+    let dir = workspace(
+        TEMPLATED_CONFIG,
+        &templated_profile("prefix:/conversations/"),
+    );
+    let output = suggest(dir.path(), &[]);
+    assert_eq!(
+        code(&output),
+        50,
+        "stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for named in [
+        "conversation",
+        "prefix:/conversations/",
+        "/conversations/{id}",
+    ] {
+        assert!(stderr.contains(named), "{stderr}");
+    }
+}
+
 #[test]
 fn a_route_with_no_new_upstream_drafts_as_legacy_only() {
     let dir = workspace(
@@ -576,7 +677,7 @@ routes:
     legacy_upstream: "http://legacy.internal"
     mode: legacy_only
 "#,
-        &profile_document(1.0, vec![("only-legacy", stable_reads(9))]),
+        &profile_document(1.0, vec![("only-legacy", stable_reads(9, "prefix:/api"))]),
     );
     let draft = draft_and_validate(dir.path(), &["--adopt-suggestions"]);
     let routes = routes_of(&draft);

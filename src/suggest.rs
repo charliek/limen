@@ -300,6 +300,17 @@ pub struct Suggestion {
 /// narrowing rule) that are the actual content of a rule firing.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct Evidence {
+    /// The matcher the profile was recorded under, verbatim — `prefix:/orders/`
+    /// or `template:/conversations/{id}` — copied from
+    /// [`RouteProfile::match_basis`], and empty for a route the profile never
+    /// carried.
+    ///
+    /// It is evidence in its own right, because it says which question
+    /// [`Self::distinct_read_paths`] answers: under a template that count is
+    /// the number of distinct *shapes* (always one), under a prefix it is the
+    /// number of distinct paths. A reader handed the count alone could not tell
+    /// a route with one endpoint from a route whose ids were folded away.
+    pub match_basis: String,
     pub observations: u64,
     pub reads: u64,
     pub writes: u64,
@@ -426,6 +437,20 @@ pub struct Evidence {
 ///   strings on the control plane, which the profile refuses to do. This is the
 ///   strongest single argument for the emitted draft never enabling comparison
 ///   on its own: candidacy has to survive a human reading the route's source.
+///   The operator's lever against it is `match.path_template`: splitting
+///   `/orders/` into `/orders/{id}` and `/orders/{id}/mark-read` makes the two
+///   operations two routes with two profiles, which is a config change no rule
+///   here can make on its own.
+/// - **R7 and R8 do not fire on a templated route, and that is the feature
+///   working.** Both read `distinct_read_paths`, which the recorder normalizes
+///   to the matched template ([`RouteProfile::match_basis`] says which basis
+///   was used), so a templated route reports exactly one distinct path however
+///   many ids it served. Absorbing path cardinality is what naming the shape
+///   *does*: the two rules exist to catch a route that is really a subtree
+///   nobody has enumerated, and a template is the operator enumerating it. The
+///   rules are unchanged and still bite on every `path_prefix` route — which is
+///   why a stale profile (recorded under a prefix, classified against a
+///   template, or the reverse) is refused outright rather than reinterpreted.
 /// - **`transport_errors` deliberately does not demote.** A silent upstream
 ///   contributes nothing to the content-type, cookie, redirect or stability
 ///   evidence (the recorder attributes by origin), so a flapping upstream can
@@ -442,6 +467,11 @@ pub fn classify(
     let narrowing_matches = narrowing_rules(profile);
 
     let evidence = Evidence {
+        // From the profile, not from `route`: it describes how the numbers
+        // beside it were produced, and only the proxy that produced them knows
+        // that. `draft::run_suggest_routes` has already refused the run if this
+        // config's matcher contradicts it.
+        match_basis: profile.match_basis.clone(),
         observations: profile.observations,
         reads: profile.reads,
         writes: profile.writes,
@@ -760,6 +790,7 @@ mode: legacy_only
     /// classifier that demoted unconditionally would fail every control.
     fn clean_profile() -> RouteProfile {
         RouteProfile {
+            match_basis: "prefix:/orders/".to_string(),
             observations: 12,
             reads: 12,
             writes: 0,
@@ -1386,6 +1417,40 @@ mode: legacy_only
             ..clean_profile()
         };
         assert_candidate(&profile);
+    }
+
+    /// R7 and R8 are unchanged; what changed is the number they read. The same
+    /// traffic profiled under a prefix and under a template classifies
+    /// differently *because the recorder counted a different thing*, and the
+    /// classifier is not told which — it reads one field, exactly as before.
+    #[test]
+    fn a_template_normalized_path_count_is_what_keeps_r7_and_r8_quiet() {
+        let folded = RouteProfile {
+            match_basis: "prefix:/conversations/".to_string(),
+            observations: 50,
+            reads: 50,
+            // Fifty conversations under a prefix: over R7's ceiling.
+            distinct_read_paths: DEFAULT_MAX_COMPARE_PATHS + 1,
+            length_repeats: 41,
+            ..clean_profile()
+        };
+        assert_demoted(&folded, Disposition::RelayOnly, Reason::WildcardGranularity);
+
+        // The identical traffic once the operator has named the shape: one
+        // distinct path, and the route reaches candidacy on its stability
+        // evidence rather than being demoted for cardinality the template
+        // already explained.
+        let split = RouteProfile {
+            match_basis: "template:/conversations/{id}".to_string(),
+            distinct_read_paths: 1,
+            ..folded
+        };
+        let suggestion = classify_clean(&split);
+        assert_eq!(suggestion.disposition, Disposition::CompareCandidate);
+        assert_eq!(
+            suggestion.evidence.match_basis, "template:/conversations/{id}",
+            "the provenance rides with the evidence, so the count is readable"
+        );
     }
 
     // -- R8 opaque path ids ------------------------------------------------
