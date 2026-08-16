@@ -213,26 +213,82 @@ gate** — it exits `0` whenever a page was produced, including a page of nothin
 
 → [CLI → `report`](https://charliek.github.io/limen/reference/cli/#report) · [the HTML status page](https://charliek.github.io/limen/reference/cli/#the-html-status-page) · [runbook §8.3](https://charliek.github.io/limen/runbook/#83-the-shadow-gate-limen-verdict-not-a-reading-of-the-counters)
 
-## 7. Rollout — the pointer
+## 7. Rollout — the ladder, live
 
 Once a route's verdict is `0` and its latency/error budget is green it moves to `percentage_split` and
-rises 0 → 1 → 5 → 25 → 50 → 100, rechecking the budget at each step. limen has the machinery; driving it
-is outside this skill's scope (rollout simulation is a later roadmap phase — do not promise it).
+rises 0 → 1 → 5 → 25 → 50 → 100, pausing at each step to recheck the budget on the traffic now actually
+hitting new. This is tested doctrine, not a pointer to plausible machinery: the [rollout
+simulation](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) ran this exact ladder live
+against two real backends, 2026-08-16.
 
-- Deterministic flag-driven percentage rollout; lowering the flag is the primary rollback lever → [flags & rollout](https://charliek.github.io/limen/guides/flags-and-rollout/#raising-the-rollout)
-- Circuit breaker, `failover_to_legacy`, and timeouts → [resilience & failover](https://charliek.github.io/limen/guides/resilience/#circuit-breaker)
+**The ladder, mechanically:**
+
+```yaml
+rollout:
+  percentage_flag: "migration.get-user.rollout_percentage"
+  default_percentage: 0
+  assignment_key: { header: "x-tenant-id", fallback: "request_random" }
+```
+
+Pin `assignment_key.header` on real traffic — the unkeyed `request_random` fallback draws a fresh key per
+request, which collapses per-key determinism into noise. Raise `percentage_flag` at runtime (no redeploy);
+after each step, recheck the latency/error budget and, for write routes, the read-back drift check. Raising
+the flag only ever *adds* keys to new (exact for a fixed key set, not statistical) — see [flags & rollout →
+raising the rollout](https://charliek.github.io/limen/guides/flags-and-rollout/#raising-the-rollout) and its
+[Tuning](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) section for `stale_ttl_ms` /
+`refresh_interval_ms` trade-offs and a worked `primary_ms` sizing example.
+
+**Read the status page's rollout section**, not just the metrics: `limen report --format html` renders each
+`percentage_split` route's resolved target, observed share with per-side provenance, breaker state, and
+transition counts, plus every `failover_to_legacy` row — see [CLI → the HTML status
+page](https://charliek.github.io/limen/reference/cli/#the-html-status-page). `limen_rollout_resolved_target_percentage{route}`
+is the flag-resolved *target* on its own if you're reading `/metrics` directly — deliberately not the
+effective share, since an open breaker doesn't move it.
+
+**The rollback levers, in order of automaticity:** the circuit breaker opens automatically on a threshold
+breach and needs no human action; lowering the rollout flag is the primary deliberate lever (instant, no
+redeploy, and returns *exactly* the earlier key set — proven by the simulation's rollback drill, not just
+assumed); `legacy_only` is the full stop. See [resilience & failover](https://charliek.github.io/limen/guides/resilience/#circuit-breaker).
+
+**The `failover_safe` decision.** `failover_safe: true` is an idempotency attestation, and it now applies
+under `percentage_split` as well as `failover_to_legacy` — a split-chosen-new request replays to legacy on
+fast failure (5xx, refused/reset connection) client-invisibly, sharing one `primary_ms` budget with the new
+attempt (a timeout has already spent that budget and is **not** replayed). Turning it on isn't free even
+when it never fires — buffered request/response bodies, latency-to-first-byte, a masked new-side 5xx — see
+the cost table in [resilience & failover → the cost of turning `failover_safe`
+on](https://charliek.github.io/limen/guides/resilience/#the-cost-of-turning-failover_safe-on) before flipping
+it on a route mid-rollout.
+
+**What you'll see when things go wrong** (proven live by the simulation's drills, not just fixture-asserted):
+
+- **New backend dies mid-ladder** → the breaker opens on every affected split route
+  (`limen_breaker_transitions_total` counts the closed→open transition); `failover_safe` routes keep
+  serving `200`s via client-invisible replay; non-`failover_safe` routes fail **visibly** (a limen-synthesized
+  `502`/`504`, never a silent replay) — Invariant 4's two arms, independently observable.
+- **Backend recovers** → the breaker walks open→half_open→closed per route, visible in the transition
+  counters before you'd need to compare traffic; the recovered split resumes the exact same key population
+  it had before the kill.
+- **Flag source goes stale** (past `stale_ttl_ms`) → every `percentage_split` route routes to legacy —
+  Invariant 1, fail-safe — and `limen_rollout_resolved_target_percentage` reads `0` with the staleness gauges
+  saying why, until the flag source recovers and the exact prior split returns.
 
 ## Safety invariants — never violate these
 
-1. **Never shadow a write without the explicit opt-in.** Only `GET`/`HEAD` are eligible unless the route
-   lists `comparison.shadow_methods: ["POST"]`; absent it, a write is never sent to `new`.
-2. **Ambiguity defaults to legacy / relay-only.** Unhealthy new upstream, open breaker, stale flags,
-   ambiguous config, unconfirmed candidate — all resolve toward legacy. A route whose source you have not
-   read is `relay_only`.
-3. **Streaming/SSE routes are relay-only for comparison purposes.** `text/event-stream` is skipped by
-   content type before a byte is buffered (`comparison_skipped{reason="event_stream"}`) and a trickling
-   body hits the buffer deadline (`response_buffer_timeout`) — backstops, not a plan. Never enable
-   comparison on a streaming route and read the skips as coverage.
-4. **Never replay a failed in-flight request against legacy** unless the route is explicitly
-   `failover_safe: true`. Routing *subsequent* requests to legacy via the breaker is fine; retrying the
-   one that may already have hit `new` is not.
+Numbered to match the canonical load-bearing invariant list in limen's `CLAUDE.md` — cite these numbers,
+don't recount them; a subset in a different order here previously drifted from that list.
+
+- **Invariant 3: never shadow a write without the explicit opt-in.** Only `GET`/`HEAD` are eligible unless
+  the route lists `comparison.shadow_methods: ["POST"]`; absent it, a write is never sent to `new`.
+- **Invariant 1: ambiguity defaults to legacy / relay-only.** Unhealthy new upstream, open breaker, stale
+  flags, ambiguous config, unconfirmed candidate — all resolve toward legacy. A route whose source you have
+  not read is `relay_only`.
+- **Invariant 6 (bounded buffers): streaming/SSE routes are relay-only for comparison purposes.**
+  `text/event-stream` is skipped by content type before a byte is buffered
+  (`comparison_skipped{reason="event_stream"}`) and a trickling body hits the buffer deadline
+  (`response_buffer_timeout`) — backstops, not a plan. Never enable comparison on a streaming route and read
+  the skips as coverage.
+- **Invariant 4: never replay a failed in-flight request against legacy** unless the route is explicitly
+  `failover_safe: true` — under `percentage_split` as well as `failover_to_legacy` now. Routing *subsequent*
+  requests to legacy via the breaker is fine; retrying the one that may already have hit `new` is not, and
+  even an attested-safe replay is bounded by the one `primary_ms` budget it shares with the new attempt (a
+  timeout has already spent it and is not replayed).

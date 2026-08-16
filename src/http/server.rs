@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::model::Config;
+use crate::config::model::{Config, FailSafeMode};
 use crate::flags::FlagProvider;
 use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
@@ -39,26 +39,40 @@ struct Inner {
     shadow_limiter: ShadowLimiter,
     observer: Arc<dyn ShadowObserver>,
     flags: Arc<dyn FlagProvider>,
+    /// What to do when flags are stale — config's `flags.fail_safe_mode`,
+    /// carried here because the routing decision needs it per request.
+    fail_safe_mode: FailSafeMode,
     request_body_limit: usize,
     /// The observe-mode recorder, present **only** when the `observe:` block
     /// is configured. `Some` is the whole enablement signal, as with the
     /// control plane's canary observer.
     observe: Option<Arc<ObserveRecorder>>,
+    /// `debug.upstream_header` — whether [`proxy::handle`] adds
+    /// `x-limen-upstream` to a relayed client response.
+    upstream_header_enabled: bool,
     shutting_down: AtomicBool,
 }
 
 impl AppState {
     /// Construct application state from its parts. The routing table is shared
     /// (behind an `Arc`) with the control plane, which reads per-route breaker
-    /// state at scrape time; metrics otherwise flow through the global recorder.
+    /// state and the resolved rollout target at scrape time; metrics otherwise
+    /// flow through the global recorder.
+    // One assembled part per argument, all of them already-built values with a
+    // single caller ([`build_state_with_observer`]) — bundling them into a
+    // parameter struct would add a type whose only job is to be destructured
+    // immediately.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         routes: RouteTable,
         client: UpstreamClient,
         shadow_limiter: ShadowLimiter,
         observer: Arc<dyn ShadowObserver>,
         flags: Arc<dyn FlagProvider>,
+        fail_safe_mode: FailSafeMode,
         request_body_limit: usize,
         observe: Option<Arc<ObserveRecorder>>,
+        upstream_header_enabled: bool,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -67,8 +81,10 @@ impl AppState {
                 shadow_limiter,
                 observer,
                 flags,
+                fail_safe_mode,
                 request_body_limit,
                 observe,
+                upstream_header_enabled,
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -104,6 +120,13 @@ impl AppState {
         &self.inner.flags
     }
 
+    /// The fail-safe mode to apply when flags are stale. Read by the routing
+    /// decision *and* by the control plane's target-percentage gauge, which is
+    /// what keeps the two describing the same rollout.
+    pub fn fail_safe_mode(&self) -> FailSafeMode {
+        self.inner.fail_safe_mode
+    }
+
     /// The hard cap on buffered request bodies (e.g. for failover replay).
     pub fn request_body_limit(&self) -> usize {
         self.inner.request_body_limit
@@ -113,6 +136,12 @@ impl AppState {
     /// absent — which is what the proxy's observation seam checks.
     pub fn observe_recorder(&self) -> Option<&Arc<ObserveRecorder>> {
         self.inner.observe.as_ref()
+    }
+
+    /// `debug.upstream_header` — whether [`proxy::handle`] should attribute a
+    /// relayed response with `x-limen-upstream`.
+    pub fn upstream_header_enabled(&self) -> bool {
+        self.inner.upstream_header_enabled
     }
 
     /// Whether shutdown has begun (shadows are not started during shutdown).
@@ -159,6 +188,11 @@ pub fn build_state_with_observer(
     let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
     let flags = crate::flags::build(&config.flags)?;
     let request_body_limit = config.server.request_body_limit_bytes as usize;
+    // Pre-touch the rollout/breaker series here rather than in `serve`, so every
+    // path that builds a proxy renders them from its first scrape — the same
+    // reason `ObserveRecorder::new` registers its per-route counter (absence is
+    // not zero, and a review cannot tell the difference after the fact).
+    prometheus::register_rollout_series(&routes);
     // Built from the *compiled* route table, so the profile's key set is
     // exactly the routes that can match traffic — "never observed" and "no such
     // route" stay distinguishable, and traffic can never add a key. The
@@ -177,8 +211,10 @@ pub fn build_state_with_observer(
         shadow_limiter,
         observer,
         flags,
+        config.flags.fail_safe_mode,
         request_body_limit,
         observe,
+        config.upstream_header_enabled(),
     ))
 }
 
@@ -249,8 +285,12 @@ pub async fn serve_with_shutdown(
         None => None,
     };
 
-    let mut control_state =
-        ControlState::new(state.flags().clone(), state.routes_arc(), metrics_handle);
+    let mut control_state = ControlState::new(
+        state.flags().clone(),
+        state.routes_arc(),
+        metrics_handle,
+        state.fail_safe_mode(),
+    );
     if config.sink_canary_enabled() {
         // Loud on purpose: this exposes an endpoint that writes synthetic
         // mismatch records into the live sink. It exists for campaign
@@ -262,6 +302,16 @@ pub async fn serve_with_shutdown(
         // The *same* observer the shadow path publishes to (metrics + sink
         // fanout), so the canary rides the real pipeline end to end.
         control_state = control_state.with_sink_canary(state.observer());
+    }
+    if config.upstream_header_enabled() {
+        // Loud on purpose, like the sink canary: the header discloses which
+        // upstream served (or, on a failover replay, which one legacy's
+        // response came from) on every relayed response — a rollout-topology
+        // signal a production deployment should not hand to every client.
+        warn!(
+            "debug upstream-attribution header enabled — responses carry x-limen-upstream; \
+             never enable in production"
+        );
     }
     if let Some(recorder) = state.observe_recorder() {
         // Loud on purpose: observation is passive, but the profile it builds

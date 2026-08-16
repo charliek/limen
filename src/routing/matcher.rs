@@ -211,6 +211,41 @@ pub struct CompiledRoute {
 }
 
 impl CompiledRoute {
+    /// The rollout this route resolves a target percentage from, or `None` if it
+    /// has no rollout to report.
+    ///
+    /// The one definition of "this route has a rollout target": the scrape
+    /// handler that sets the gauge and the startup pass that pre-registers it
+    /// ask the same question here, so they cannot come to different answers
+    /// about which routes own a `limen_rollout_resolved_target_percentage`
+    /// series.
+    pub fn rollout_target(&self) -> Option<&RolloutConfig> {
+        match self.mode {
+            RouteMode::PercentageSplit => self.rollout.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Whether a request on this route can ever consult the circuit breaker —
+    /// whether it both *has* one and runs in a mode that reaches `gate_new`
+    /// (see [`crate::routing::decision::decide_primary`]).
+    ///
+    /// Config validation accepts a `circuit_breaker:` block on any mode, so
+    /// "has a breaker" and "uses a breaker" are different questions, and only
+    /// the second may pre-register transition series
+    /// ([`crate::observability::prometheus::register_rollout_series`]). A route
+    /// whose breaker is never asked would otherwise advertise four counters
+    /// that cannot move — which reads on a dashboard exactly like a breaker
+    /// that has never had to.
+    ///
+    /// The mode half is [`RouteMode::gates_new`], which is matched exhaustively
+    /// there so a new mode has to declare which side of `gate_new` it falls on
+    /// — and so the report page's config-side mirror of this predicate cannot
+    /// answer differently.
+    pub fn breaker_consulted(&self) -> bool {
+        self.breaker.is_some() && self.mode.gates_new()
+    }
+
     /// Whether this route matches the given (already-uppercased) method, path,
     /// and query-parameter names.
     fn matches(&self, method: &str, path: &str, query: &QueryNames<'_>) -> bool {
@@ -324,7 +359,7 @@ impl RouteTable {
                 breaker: r
                     .circuit_breaker
                     .enabled
-                    .then(|| Arc::new(CircuitBreaker::new(&r.circuit_breaker))),
+                    .then(|| Arc::new(CircuitBreaker::new(&r.id, &r.circuit_breaker))),
             });
         }
         let any_query_conditions = routes.iter().any(|r| r.query_conditioned);

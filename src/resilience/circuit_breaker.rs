@@ -21,7 +21,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use tracing::info;
+
 use crate::config::model::CircuitBreakerConfig;
+use crate::observability::prometheus;
 
 /// A short, stable state label for metrics/logs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +38,20 @@ pub enum BreakerState {
 }
 
 impl BreakerState {
+    /// Every transition the state machine can make, in lifecycle order. The
+    /// four emission sites below are the only writers, so this is the complete
+    /// label set for `limen_breaker_transitions_total` — which is what lets
+    /// startup pre-register all four at zero
+    /// ([`crate::observability::prometheus::register_rollout_series`]).
+    ///
+    /// A fifth pair here would mean the state machine changed, not the metric.
+    pub const TRANSITIONS: [(BreakerState, BreakerState); 4] = [
+        (BreakerState::Closed, BreakerState::Open),
+        (BreakerState::Open, BreakerState::HalfOpen),
+        (BreakerState::HalfOpen, BreakerState::Closed),
+        (BreakerState::HalfOpen, BreakerState::Open),
+    ];
+
     /// A stable lowercase label.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -78,6 +95,9 @@ struct Inner {
 /// A per-route circuit breaker. Cheaply shareable behind an `Arc`.
 #[derive(Debug)]
 pub struct CircuitBreaker {
+    /// The route this breaker guards — carried so a transition can label its
+    /// own metric and log rather than depending on every caller to remember.
+    route_id: String,
     inner: Mutex<Inner>,
     failure_rate_threshold: f64,
     min_requests: u32,
@@ -86,9 +106,10 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Build a breaker from its route config.
-    pub fn new(config: &CircuitBreakerConfig) -> Self {
+    /// Build a breaker for `route_id` from its route config.
+    pub fn new(route_id: &str, config: &CircuitBreakerConfig) -> Self {
         Self {
+            route_id: route_id.to_string(),
             inner: Mutex::new(Inner {
                 phase: Phase::Closed,
                 generation: 0,
@@ -121,6 +142,7 @@ impl CircuitBreaker {
                     inner.generation += 1;
                     inner.half_open_in_flight = 1;
                     inner.half_open_successes = 0;
+                    self.publish(BreakerState::Open, BreakerState::HalfOpen);
                     Some(Admission {
                         generation: inner.generation,
                     })
@@ -175,6 +197,7 @@ impl CircuitBreaker {
                             until: Instant::now() + self.open_duration,
                         };
                         inner.generation += 1;
+                        self.publish(BreakerState::Closed, BreakerState::Open);
                     }
                     // Start a fresh window either way.
                     inner.total = 0;
@@ -191,6 +214,7 @@ impl CircuitBreaker {
                         inner.total = 0;
                         inner.failures = 0;
                         inner.half_open_successes = 0;
+                        self.publish(BreakerState::HalfOpen, BreakerState::Closed);
                     }
                 } else {
                     inner.phase = Phase::Open {
@@ -198,12 +222,38 @@ impl CircuitBreaker {
                     };
                     inner.generation += 1;
                     inner.half_open_successes = 0;
+                    self.publish(BreakerState::HalfOpen, BreakerState::Open);
                 }
             }
             // A matching-generation record while open cannot occur (entering
             // open bumps the generation), but ignore defensively.
             Phase::Open { .. } => {}
         }
+    }
+
+    /// Publish a phase transition: one counter increment and one `info` line.
+    ///
+    /// **Called with the state mutex held, deliberately.** Publishing after the
+    /// unlock was racy: two threads that transition in a definite order can
+    /// reach the recorder in the opposite one (a half-open success closes the
+    /// breaker, drops the lock, and is overtaken by a thread that admits, fails,
+    /// and reopens), so the counter and the log would tell a story that never
+    /// happened. Transitions are rare by construction — only a state *change*
+    /// publishes, never an ordinary admission or outcome — so serializing this
+    /// telemetry behind the lock it already describes costs a microscopic amount
+    /// of extra hold time and buys causal order.
+    ///
+    /// `info`, not `debug`: a breaker opening is the single most important thing
+    /// that can happen to a rollout, and the counter alone cannot say *when*.
+    fn publish(&self, from: BreakerState, to: BreakerState) {
+        prometheus::record_breaker_transition(&self.route_id, from, to);
+        info!(
+            event = "limen.breaker_transition",
+            route = %self.route_id,
+            from = from.as_str(),
+            to = to.as_str(),
+            "circuit breaker transitioned"
+        );
     }
 
     /// The current state, for metrics/logs. A pure read — it never mutates the
@@ -275,7 +325,7 @@ mod tests {
 
     #[test]
     fn opens_when_failure_rate_exceeds_threshold() {
-        let cb = CircuitBreaker::new(&config(0.5, 4, 30_000, 2));
+        let cb = CircuitBreaker::new("r", &config(0.5, 4, 30_000, 2));
         // 3 failures + 1 success over 4 = 75% > 50% -> opens.
         for _ in 0..3 {
             cb.record(admit(&cb), false);
@@ -287,7 +337,7 @@ mod tests {
 
     #[test]
     fn stays_closed_below_threshold() {
-        let cb = CircuitBreaker::new(&config(0.5, 4, 30_000, 2));
+        let cb = CircuitBreaker::new("r", &config(0.5, 4, 30_000, 2));
         // 1 failure + 3 successes = 25% <= 50% -> stays closed.
         cb.record(admit(&cb), false);
         cb.record(admit(&cb), true);
@@ -299,7 +349,7 @@ mod tests {
 
     #[test]
     fn open_transitions_to_half_open_then_closes_on_success() {
-        let cb = CircuitBreaker::new(&config(0.5, 2, 10, 2));
+        let cb = CircuitBreaker::new("r", &config(0.5, 2, 10, 2));
         cb.record(admit(&cb), false);
         cb.record(admit(&cb), false); // 100% over 2 -> open
         assert_eq!(cb.state(), BreakerState::Open);
@@ -316,7 +366,7 @@ mod tests {
 
     #[test]
     fn half_open_failure_reopens() {
-        let cb = CircuitBreaker::new(&config(0.5, 2, 10, 2));
+        let cb = CircuitBreaker::new("r", &config(0.5, 2, 10, 2));
         cb.record(admit(&cb), false);
         cb.record(admit(&cb), false); // open
         std::thread::sleep(Duration::from_millis(20));
@@ -327,7 +377,7 @@ mod tests {
 
     #[test]
     fn half_open_limits_concurrent_trials() {
-        let cb = CircuitBreaker::new(&config(0.5, 2, 10, 1));
+        let cb = CircuitBreaker::new("r", &config(0.5, 2, 10, 1));
         cb.record(admit(&cb), false);
         cb.record(admit(&cb), false); // open
         std::thread::sleep(Duration::from_millis(20));
@@ -340,7 +390,7 @@ mod tests {
 
     #[test]
     fn release_frees_a_half_open_slot_without_counting_an_outcome() {
-        let cb = CircuitBreaker::new(&config(0.5, 2, 10, 1));
+        let cb = CircuitBreaker::new("r", &config(0.5, 2, 10, 1));
         cb.record(admit(&cb), false);
         cb.record(admit(&cb), false); // open
         std::thread::sleep(Duration::from_millis(20));
@@ -357,7 +407,7 @@ mod tests {
 
     #[test]
     fn release_is_a_noop_while_closed() {
-        let cb = CircuitBreaker::new(&config(0.5, 4, 30_000, 2));
+        let cb = CircuitBreaker::new("r", &config(0.5, 4, 30_000, 2));
         let a = admit(&cb);
         cb.release(a);
         assert_eq!(cb.state(), BreakerState::Closed);
@@ -369,7 +419,7 @@ mod tests {
         // Regression for the phase-mismatch race: an attempt admitted in one
         // episode that settles after the breaker has transitioned must not
         // touch the current window's accounting.
-        let cb = CircuitBreaker::new(&config(0.5, 2, 10, 1));
+        let cb = CircuitBreaker::new("r", &config(0.5, 2, 10, 1));
         // Admitted while closed...
         let stale = cb.allow().expect("closed admits");
         // ...but before it settles, the breaker opens, then half-opens.

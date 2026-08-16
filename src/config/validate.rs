@@ -1445,6 +1445,68 @@ routes:
         assert!(validate(&parse(ok), &base()).is_ok());
     }
 
+    /// Widening the mid-flight replay to `percentage_split` (plan 016) moves the
+    /// proxy's gate, not this validation rule. The *requirement* to set the flag
+    /// exists because `failover_to_legacy` sends every request to new whether or
+    /// not the operator thought about failover; a split route is an explicit,
+    /// per-percentage act already, so the flag stays optional there and means
+    /// only what it always meant — an idempotence attestation. A split route is
+    /// therefore valid with the flag and without it, whatever methods it matches.
+    #[test]
+    fn percentage_split_never_requires_failover_safe() {
+        for failover_safe in [false, true] {
+            let yaml = format!(
+                r#"
+routes:
+  - id: r
+    match: {{ methods: ["POST", "PATCH"], path_prefix: "/" }}
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: percentage_split
+    failover_safe: {failover_safe}
+    rollout:
+      percentage_flag: "f"
+      default_percentage: 0
+      assignment_key: {{ fallback: request_random }}
+"#
+            );
+            assert!(
+                validate(&parse(&yaml), &base()).is_ok(),
+                "percentage_split with failover_safe: {failover_safe} must validate",
+            );
+        }
+    }
+
+    /// The other half of the parity: the rule that *does* bite still bites, and
+    /// still only for `failover_to_legacy`.
+    #[test]
+    fn only_failover_to_legacy_demands_the_attestation() {
+        let post = |mode: &str, rollout: &str| {
+            format!(
+                r#"
+routes:
+  - id: r
+    match: {{ methods: ["POST"], path_prefix: "/" }}
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: {mode}
+{rollout}"#
+            )
+        };
+        let demands = |yaml: &str| {
+            validate(&parse(yaml), &base())
+                .err()
+                .is_some_and(|errs| errs.iter().any(|e| e.location.contains("failover_safe")))
+        };
+        assert!(demands(&post("failover_to_legacy", "")));
+        assert!(!demands(&post(
+            "percentage_split",
+            "    rollout:\n      percentage_flag: \"f\"\n      default_percentage: 0\n      assignment_key: { fallback: request_random }\n"
+        )));
+        assert!(!demands(&post("new_only", "")));
+        assert!(!demands(&post("legacy_only", "")));
+    }
+
     /// The supported opt-in: `POST` on a shadowing route with comparison on.
     #[test]
     fn shadow_methods_post_on_a_shadow_route_is_accepted() {

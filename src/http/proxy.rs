@@ -49,6 +49,23 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// The debug-gated upstream-attribution response header (`debug.upstream_header`,
+/// [`crate::config::model::DebugConfig`]). Only [`handle`] ever sets it — on a
+/// relayed response, when the flag is on — but [`filter_headers`] strips any
+/// inbound value unconditionally, flag on or off: a client must never make it
+/// reach an upstream, and an upstream must never make it reach the client
+/// unfiltered (spoof/leak resistance, spec plan 016 W3).
+const X_LIMEN_UPSTREAM: &str = "x-limen-upstream";
+
+/// The shortest budget worth replaying legacy in. Below this floor a replay
+/// cannot do the job replay exists for: a sub-millisecond attempt is far more
+/// likely to record a fresh legacy *timeout* — one that describes the budget
+/// that was left, not legacy's actual health — than to complete, so it would
+/// misinform the very breaker/steering decisions it is meant to inform. Below
+/// the floor the client gets new's own failure instead, exactly as it would
+/// with nothing left at all.
+const MIN_REPLAY_BUDGET: Duration = Duration::from_millis(10);
+
 /// The data-plane fallback handler: every client request flows through here.
 ///
 /// This thin wrapper owns the cross-cutting concerns — the in-flight gauge, the
@@ -85,19 +102,41 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
             parts.uri.query().map(str::to_string),
         )
     });
-    let decision = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
+    let decision = decision::decide_primary(
+        route,
+        &parts.headers,
+        state.flags().as_ref(),
+        state.fail_safe_mode(),
+    )
+    .await;
 
     // Inner warnings inherit the request id + route via this span.
     let span = info_span!("request", %request_id, route = %route_id);
     // `dispatch` reports the upstream that actually *served* the client, which
     // differs from the chosen primary when a failover route replays to legacy.
     let Dispatched {
-        response,
+        mut response,
         served,
         origin,
     } = dispatch(&state, route, decision, parts, body, &route_id, &request_id)
         .instrument(span)
         .await;
+
+    // `debug.upstream_header`: attribute the upstream whose response is being
+    // relayed — never the one `dispatch` merely attempted. `filter_headers`
+    // has already stripped any inbound `x-limen-upstream` (client-forged on
+    // the request leg, upstream-forged on the response leg) by this point, so
+    // `insert` here can never collide with a spoofed value.
+    if let Some(upstream) = state
+        .upstream_header_enabled()
+        .then(|| relayed_from(served, origin))
+        .flatten()
+    {
+        response.headers_mut().insert(
+            X_LIMEN_UPSTREAM,
+            HeaderValue::from_static(upstream.as_str()),
+        );
+    }
 
     let status = response.status();
     let latency = started.elapsed();
@@ -182,6 +221,27 @@ impl Dispatched {
     }
 }
 
+/// The upstream whose response is being *relayed* to the client, if any —
+/// `None` for every limen-synthesized response.
+///
+/// This is deliberately not `served` alone. `served` names the upstream
+/// `dispatch` *attempted* on every path, including the ones where nothing was
+/// ever relayed: a transport failure or timeout with no replay
+/// (`Dispatched::silent`), a local refusal before any upstream was contacted
+/// (`Dispatched::refused`), and a primary success whose buffered body then
+/// failed mid-read (`primary_succeeded`'s `Buffered::Error` arm, which still
+/// carries the upstream that *answered* in `served` but reports
+/// `ResponseOrigin::UpstreamSilent` because the client got limen's own 502).
+/// `origin == ResponseOrigin::Upstream` is exactly the fact [`Dispatched`]
+/// already tracks for that distinction — including on a failover replay,
+/// where `served` is `Upstream::Legacy` because that is whose response the
+/// client received, not the `Upstream::New` that was tried first. This
+/// function just names the combination for [`handle`], the one caller that
+/// turns it into the `x-limen-upstream` header.
+fn relayed_from(served: Upstream, origin: ResponseOrigin) -> Option<Upstream> {
+    (origin == ResponseOrigin::Upstream).then_some(served)
+}
+
 /// Proxy a matched request to its chosen primary (and, where configured, shadow
 /// or fail over). Returns the client response; the caller records
 /// metrics/logs/observations.
@@ -251,11 +311,21 @@ async fn dispatch(
     // real connections (see `forwarded::apply`).
     forwarded::apply(&mut request_headers, client_addr(&parts.extensions));
 
-    // Failover-safe path: a `failover_to_legacy` route sending to new buffers the
-    // request body so a new-side failure can be replayed against legacy. Handled
-    // before planning a shadow, which `shadow::plan` never produces for this mode
-    // anyway — so the shadow setup below is dead work on this path.
-    if route.mode == RouteMode::FailoverToLegacy && route.failover_safe && upstream == Upstream::New
+    // Failover-safe path: a route that has attested idempotence and is sending
+    // this request to new buffers the request body so a new-side failure can be
+    // replayed against legacy. Both modes that can put new in front of a live
+    // legacy qualify — `failover_to_legacy` always, and `percentage_split` on the
+    // requests its bucket sent to new. `new_only` is excluded by construction:
+    // there is no legacy leg to replay against, so the flag cannot mean anything
+    // there. Handled before planning a shadow, which `shadow::plan` produces only
+    // for `shadow_legacy_primary` — neither mode here ever shadows, so the shadow
+    // setup below is dead work on this path rather than something it skips.
+    if route.failover_safe
+        && upstream == Upstream::New
+        && matches!(
+            route.mode,
+            RouteMode::FailoverToLegacy | RouteMode::PercentageSplit
+        )
     {
         if let Some(legacy_url) = route
             .legacy_upstream
@@ -476,6 +546,17 @@ fn release_breaker(reservation: &Option<BreakerReservation>) {
 /// response whose body errors or times out mid-read: because this path buffers
 /// the (bounded) new response before committing, such a body failure fails over
 /// to legacy rather than streaming a truncated response to the client.
+///
+/// **Both legs share one `primary_ms` budget.** `timeout` is turned into a
+/// single absolute deadline before the new attempt, and the replay gets only
+/// what new left of it — the replay is the second leg of *this* client request,
+/// not a fresh one, and a client must never wait ~2× the deadline its route
+/// declared (`docs/guides/resilience.md`: "one absolute deadline for the whole
+/// primary leg"). The practical consequence is that a new attempt that *times
+/// out* has spent the budget and is not replayed: the client gets the 504.
+/// Failover buys resilience against failures that come back fast — connection
+/// refused, connection reset, a prompt 5xx — which is where nearly all of it
+/// lives, and it cannot buy it by doubling the latency ceiling.
 #[allow(clippy::too_many_arguments)]
 async fn failover_dispatch(
     state: &AppState,
@@ -490,12 +571,23 @@ async fn failover_dispatch(
 ) -> Dispatched {
     // Buffer the request body so it can be replayed. failover_safe is opt-in, so
     // an over-limit body that can't be buffered is rejected rather than sent
-    // un-replayable.
-    let bytes = match axum::body::to_bytes(body, state.request_body_limit()).await {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            // We never reach new on this path, so settle the reserved breaker
-            // slot by releasing it (not recording a failure against new).
+    // un-replayable. Neither refusal below reaches new, so both settle the
+    // reserved breaker slot by *releasing* it — recording a failure would blame
+    // new for a request it never saw, and leaking the slot would wedge a
+    // half-open breaker shut.
+    //
+    // The two refusals are deliberately different statuses, because they are
+    // different faults: a body over the limit is the client asking for more
+    // than this route buffers (413, and the operator can raise the limit),
+    // while a body that errors mid-read is a broken or abandoned upload (400 —
+    // the same `unreadable_body` the streaming path returns). Reporting an
+    // aborted upload as 413 would send an operator hunting a size limit that
+    // was never reached.
+    let bytes = match body::buffer_request_or_stream(body, state.request_body_limit()).await {
+        Buffered::Full(bytes) => bytes,
+        // `TimedOut` cannot arise — this read passes no deadline — but it would
+        // mean what the over-limit arm means: no complete body to replay.
+        Buffered::TooLarge(_) | Buffered::TimedOut(_) => {
             release_breaker(breaker);
             let resp = (
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -504,7 +596,17 @@ async fn failover_dispatch(
                 .into_response();
             return Dispatched::refused(resp, Upstream::New);
         }
+        Buffered::Error => {
+            release_breaker(breaker);
+            return Dispatched::refused(unreadable_body(), Upstream::New);
+        }
     };
+
+    // One absolute budget for the whole exchange, taken after the client's own
+    // upload (which is bounded by the client, not by this route) and before the
+    // first upstream byte — the same discipline `dispatch` applies on the
+    // streaming path.
+    let deadline = tokio::time::Instant::now() + timeout;
 
     let new_result = send_buffered(
         state.client(),
@@ -518,8 +620,9 @@ async fn failover_dispatch(
 
     // A transport-level new failure is an upstream error/timeout (a 5xx is a
     // response, counted by the request metric, not an upstream error).
-    if let Err(error) = &new_result {
-        if error.is_timeout() {
+    let new_timed_out = new_result.as_ref().is_err_and(reqwest::Error::is_timeout);
+    if new_result.is_err() {
+        if new_timed_out {
             prometheus::record_upstream_timeout(route_id, Upstream::New);
         } else {
             prometheus::record_upstream_error(route_id, Upstream::New);
@@ -563,10 +666,46 @@ async fn failover_dispatch(
     }
 
     // New failed (5xx, transport error/timeout, or a body that errored
-    // mid-read) — replay legacy.
+    // mid-read) — replay legacy with whatever is left of the one budget.
     record_breaker(breaker, false);
-    warn!("new upstream failed; failing over to legacy");
-    match send_buffered(state.client(), method, legacy_url, headers, bytes, timeout).await {
+    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    if remaining < MIN_REPLAY_BUDGET {
+        // New spent the whole budget (or all but a sliver of it) before
+        // failing — the usual way to get here is a new attempt that timed
+        // out. There is not enough time left to replay in without breaking
+        // the route's declared deadline — and a replay too small to complete
+        // in would just record a *legacy* timeout that describes the budget
+        // left over, not legacy's health — so the client gets new's failure.
+        // The breaker has already recorded it, so *subsequent* requests are
+        // steered to legacy: the route still converges away from a sick new
+        // upstream, it just does not do so by doubling this client's wait.
+        warn!(
+            timeout_ms = timeout.as_millis(),
+            remaining_ms = remaining.as_millis(),
+            "new upstream failed with the primary budget spent or too small to replay in; not \
+             replaying to legacy"
+        );
+        let resp = if new_timed_out {
+            gateway_timeout()
+        } else {
+            bad_gateway()
+        };
+        return Dispatched::silent(resp, Upstream::New);
+    }
+    warn!(
+        remaining_ms = remaining.as_millis(),
+        "new upstream failed; failing over to legacy"
+    );
+    match send_buffered(
+        state.client(),
+        method,
+        legacy_url,
+        headers,
+        bytes,
+        remaining,
+    )
+    .await
+    {
         Ok(resp) => Dispatched::relayed(relay_response(resp), Upstream::Legacy),
         Err(error) => {
             if error.is_timeout() {
@@ -798,6 +937,11 @@ enum Direction {
 ///   header's token list (RFC 7230 §6.1);
 /// - `transfer-encoding` (a hop-by-hop header) in both directions, since the
 ///   relay re-frames the body;
+/// - `x-limen-upstream` ([`X_LIMEN_UPSTREAM`]) in **both** directions,
+///   unconditionally, whether `debug.upstream_header` is on or off: a client
+///   must never make its own value reach an upstream, and an upstream must
+///   never make its own value reach the client — only [`handle`], after this
+///   filter has already run, is allowed to set it on the client response;
 /// - on the **request** leg, `host` and `content-length` — the upstream client
 ///   sets Host and frames the streamed request body itself;
 /// - on the **request** leg, a client-supplied `X-Limen-Shadow`
@@ -819,6 +963,7 @@ fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
         let n = name.as_str();
         let drop = HOP_BY_HOP.contains(&n)
             || connection_named.iter().any(|t| t == n)
+            || n == X_LIMEN_UPSTREAM
             || (direction == Direction::Request
                 && (n == "host" || n == "content-length" || n == forwarded::X_LIMEN_SHADOW))
             || (direction == Direction::Response

@@ -1162,6 +1162,755 @@ fn an_empty_sink_directory_names_the_canary_as_the_way_out() {
 }
 
 // ---------------------------------------------------------------------------
+// Rollout and resilience
+//
+// The section that has to survive the question a rollout review actually asks:
+// what was this route targeting, what did it serve, and was the breaker or a
+// stale flag provider quietly answering for it? Every test here tries to make
+// the page render a zero it did not read.
+// ---------------------------------------------------------------------------
+
+/// The same route table as [`CONFIG`] plus the two rollout modes: a
+/// `percentage_split` route with a breaker, and a `failover_to_legacy` one.
+const ROLLOUT_CONFIG: &str = r#"
+routes:
+  - id: a
+    match: { methods: ["GET"], path_prefix: "/a" }
+    legacy_upstream: "http://legacy.invalid"
+    new_upstream: "http://new.invalid"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0 }
+  - id: split
+    match: { methods: ["GET"], path_prefix: "/split" }
+    legacy_upstream: "http://legacy.invalid"
+    new_upstream: "http://new.invalid"
+    mode: percentage_split
+    rollout:
+      percentage_flag: "rollout.split.percentage"
+      default_percentage: 10
+      assignment_key: { header: "x-user-id", fallback: request_random }
+    circuit_breaker:
+      enabled: true
+      failure_rate_threshold: 0.5
+      min_requests: 20
+      open_duration_ms: 30000
+      half_open_max_requests: 5
+  - id: failover
+    match: { methods: ["GET"], path_prefix: "/failover" }
+    legacy_upstream: "http://legacy.invalid"
+    new_upstream: "http://new.invalid"
+    mode: failover_to_legacy
+    failover_safe: true
+    circuit_breaker: { enabled: true }
+"#;
+
+/// The four transition series a breaker-consulted route registers at startup.
+fn transitions(route: &str, counts: [u64; 4]) -> String {
+    let [co, oh, hc, ho] = counts;
+    format!(
+        "limen_breaker_transitions_total{{route=\"{route}\",from=\"closed\",to=\"open\"}} {co}\n\
+         limen_breaker_transitions_total{{route=\"{route}\",from=\"open\",to=\"half_open\"}} {oh}\n\
+         limen_breaker_transitions_total{{route=\"{route}\",from=\"half_open\",to=\"closed\"}} \
+         {hc}\n\
+         limen_breaker_transitions_total{{route=\"{route}\",from=\"half_open\",to=\"open\"}} {ho}\n"
+    )
+}
+
+/// A scrape from a limen serving [`ROLLOUT_CONFIG`]: the registered series, the
+/// comparison counters, and every rollout-truth family the control plane
+/// refreshes at scrape time.
+///
+/// The breaker readings are **self-consistent**: a breaker starts closed, so
+/// `split`'s two opens, two half-opens and two closes leave it closed again,
+/// and `failover`'s untouched breaker is closed with four zero counters. A
+/// gauge that disagreed with its own transition history would be an impossible
+/// tuple — which the page now rejects, and which a fixture must not smuggle in
+/// as the shape of a healthy scrape.
+fn rollout_metrics() -> String {
+    format!(
+        "{}\
+limen_rollout_resolved_target_percentage{{route=\"split\"}} 25
+limen_circuit_breaker_state{{route=\"split\",upstream=\"new\"}} 0
+limen_circuit_breaker_state{{route=\"failover\",upstream=\"new\"}} 0
+{}{}\
+limen_flag_provider_stale 0
+limen_flag_provider_staleness_seconds 1.5
+limen_flag_provider_consecutive_failures 0
+limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"new\",status_class=\"2xx\"}} 20
+limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"new\",status_class=\"5xx\"}} 10
+limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"legacy\",status_class=\"2xx\"}} 70
+limen_requests_total{{route=\"failover\",method=\"GET\",upstream=\"new\",status_class=\"2xx\"}} 9
+limen_requests_total{{route=\"failover\",method=\"GET\",upstream=\"legacy\",status_class=\"2xx\"}} 1
+",
+        metrics(),
+        transitions("split", [2, 2, 2, 0]),
+        transitions("failover", [0, 0, 0, 0]),
+    )
+}
+
+/// The canonical workspace with rollout routes and a scrape that covers them.
+fn rollout() -> Workspace {
+    canonical()
+        .with_config(ROLLOUT_CONFIG)
+        .with_metrics(&rollout_metrics())
+}
+
+/// Drop every exposition line for `family` from a scrape.
+fn without_family(text: &str, family: &str) -> String {
+    text.lines()
+        .filter(|l| !l.starts_with(family))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// Drop the lines of `family` that carry `route`.
+fn without_route_series(text: &str, family: &str, route: &str) -> String {
+    text.lines()
+        .filter(|l| !(l.starts_with(family) && l.contains(&format!("route=\"{route}\""))))
+        .map(|l| format!("{l}\n"))
+        .collect()
+}
+
+/// A scrape that is a limen scrape in every respect but the rollout families.
+fn rollout_metrics_without(family: &str) -> String {
+    without_family(&rollout_metrics(), family)
+}
+
+/// Just the rollout section's HTML. Assertions about what this section does —
+/// or does not — say must not be satisfied, or defeated, by another one.
+fn rollout_section(html: &str) -> String {
+    let start = html.find("<h2>5. Rollout").expect("the rollout section");
+    let rest = &html[start..];
+    let end = rest.find("<h2>6.").unwrap_or(rest.len());
+    rest[..end].to_string()
+}
+
+/// One route's row in the rollout truth table — the first row for that id in
+/// the section, which is the truth table's (the "as configured" table renders
+/// after it).
+fn rollout_row_of(html: &str, route: &str) -> String {
+    let needle = format!("title=\"route id: {route}\"");
+    rollout_section(html)
+        .lines()
+        .find(|l| l.starts_with("<tr>") && l.contains(&needle))
+        .unwrap_or_else(|| panic!("no rollout row for {route}"))
+        .to_string()
+}
+
+/// A row that carries no truth at all: one spanning unavailable cell, and none
+/// of the five reading columns.
+fn assert_row_is_unavailable(html: &str, route: &str) {
+    let row = rollout_row_of(html, route);
+    assert!(
+        row.contains("colspan=\"5\"")
+            && row.contains("<span class=\"pill bad\">UNAVAILABLE</span>"),
+        "row for {route} is not the spanning unavailable row: {row}"
+    );
+    // Nothing that could be read as a reading. Scoped to what precedes the
+    // spanning cell: the rejection sentence inside it necessarily quotes the
+    // series, states and values it is refusing, and that prose is the point —
+    // it is the *cells* that must carry no truth.
+    let cells = row.split("colspan=\"5\"").next().expect("the row prefix");
+    for fabricated in [
+        "%",
+        "closed",
+        "half-open",
+        "open",
+        "→",
+        "pill good",
+        "pill warn",
+    ] {
+        assert!(
+            !cells.contains(fabricated),
+            "row for {route} fabricated {fabricated:?} in a cell: {row}"
+        );
+    }
+}
+
+#[test]
+fn the_rollout_section_reports_target_share_breaker_and_transitions() {
+    let ws = rollout();
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    let html = ws.page();
+    let section = rollout_section(&html);
+
+    assert!(html.contains("Rollout &amp; resilience"), "{html}");
+    // The target the rollout asked for, from the gauge — not a config default.
+    assert!(
+        section.contains("25%"),
+        "the resolved target is on the page"
+    );
+    assert!(
+        !rollout_row_of(&html, "split").contains("10%"),
+        "the config default must not be rendered as the resolved target"
+    );
+    // The share actually served, with the counts it was computed from — each
+    // side labelled, so an absent one can never look like a counted zero.
+    assert!(section.contains("30% (new: 30 / legacy: 70)"), "{section}");
+    assert!(section.contains("90% (new: 9 / legacy: 1)"), "{section}");
+    // Breaker state by name, never by gauge number.
+    assert!(section.contains(">closed<"), "{section}");
+    // The four transitions, named as pairs — including the zero: a breaker
+    // that never opened is the answer, and an omitted count is a guess.
+    assert!(
+        section.contains("closed→open 2, open→half-open 2, half-open→closed 2, half-open→open 0"),
+        "{section}"
+    );
+    // The flag provider's own standing, above the table.
+    assert!(section.contains("FRESH"), "{section}");
+    assert!(section.contains("1.5"), "the staleness reading is shown");
+    // The config side of each row.
+    assert!(section.contains("rollout.split.percentage"), "{section}");
+    assert!(section.contains("x-user-id"), "{section}");
+    assert!(section.contains("failover_to_legacy"), "{section}");
+}
+
+#[test]
+fn a_split_route_missing_its_target_series_is_unavailable_never_zero() {
+    let ws = rollout().with_metrics(&without_route_series(
+        &rollout_metrics(),
+        "limen_rollout_resolved_target_percentage",
+        "split",
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "split");
+    assert!(
+        model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("limen_rollout_resolved_target_percentage")),
+        "{}",
+        why(&model)
+    );
+    let html = ws.page();
+    // The other route's row survives intact — one lost series is not the whole
+    // section's problem.
+    assert!(rollout_row_of(&html, "failover").contains("90% (new: 9 / legacy: 1)"));
+    // …and the lost one renders no target at all. Not `0%`, and not the
+    // config's `default_percentage` standing in for the reading.
+    assert_row_is_unavailable(&html, "split");
+}
+
+#[test]
+fn a_duplicated_target_series_rejects_the_row_rather_than_picking_one() {
+    let ws = rollout().with_metrics(&format!(
+        "{}limen_rollout_resolved_target_percentage{{route=\"split\"}} 75\n",
+        rollout_metrics()
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "split");
+    assert!(
+        model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("more than one")),
+        "{}",
+        why(&model)
+    );
+    let html = ws.page();
+    assert_row_is_unavailable(&html, "split");
+    for either in ["25%", "75%"] {
+        assert!(
+            !rollout_section(&html).contains(either),
+            "a rejected row still rendered a target: {either}"
+        );
+    }
+}
+
+/// A partial transition set is not a breaker that made three of four kinds of
+/// move: all four are registered at startup. The row renders as one spanning
+/// unavailable rather than three real counts and a fabricated zero.
+#[test]
+fn a_missing_transition_series_rejects_the_row() {
+    let ws = rollout().with_metrics(&without_family(
+        &rollout_metrics(),
+        "limen_breaker_transitions_total{route=\"split\",from=\"half_open\",to=\"open\"}",
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "limen_breaker_transitions_total");
+    assert!(
+        model.banner.failures.iter().any(|f| f.contains("split")),
+        "{}",
+        why(&model)
+    );
+    let html = ws.page();
+    assert_row_is_unavailable(&html, "split");
+    assert!(
+        !rollout_row_of(&html, "split").contains("closed→open"),
+        "three surviving counts were rendered as the whole history"
+    );
+    // The route that kept all four is untouched.
+    assert!(rollout_row_of(&html, "failover").contains("half-open→open 0"));
+}
+
+/// The page's whole reason for existing, in one cell: a stale flag provider
+/// puts every split route at 0%, and a bare "0%" there reads as a rollout
+/// somebody turned down rather than one that was displaced.
+#[test]
+fn stale_flags_never_render_as_a_clean_zero() {
+    let stale = rollout_metrics()
+        .replace(
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 25",
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 0",
+        )
+        .replace("limen_flag_provider_stale 0", "limen_flag_provider_stale 1")
+        .replace(
+            "limen_flag_provider_staleness_seconds 1.5",
+            "limen_flag_provider_staleness_seconds 900",
+        )
+        .replace(
+            "limen_flag_provider_consecutive_failures 0",
+            "limen_flag_provider_consecutive_failures 12",
+        );
+    let ws = rollout().with_metrics(&stale);
+    let model = ws.model();
+    assert_failure_naming(&model, "stale");
+    let html = ws.page();
+    assert!(html.contains("STALE"), "{html}");
+    assert!(html.contains("fail-safe"), "{html}");
+    assert!(html.contains("12 consecutive"), "{html}");
+    // The joined truth, in the cell itself: never the number on its own.
+    assert!(html.contains("0% — fail-safe (flags stale)"), "{html}");
+    assert!(
+        !html.contains("<td>0%</td>"),
+        "a bare fail-safe zero reached the page"
+    );
+}
+
+/// A stale provider displaces the rollout outright (`fail_safe_mode:
+/// legacy_only`), so a nonzero target beside `stale 1` is a state no limen
+/// produces.
+#[test]
+fn a_nonzero_target_under_stale_flags_is_a_contradiction() {
+    // A *coherent* stale provider — stale past the 30s TTL — so the finding
+    // under test is the target beside it, not the provider tuple.
+    let ws = rollout().with_metrics(
+        &rollout_metrics()
+            .replace("limen_flag_provider_stale 0", "limen_flag_provider_stale 1")
+            .replace(
+                "limen_flag_provider_staleness_seconds 1.5",
+                "limen_flag_provider_staleness_seconds 120",
+            ),
+    );
+    let model = ws.model();
+    assert_failure_naming(&model, "split");
+    assert!(
+        model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("stale") && f.contains("25")),
+        "{}",
+        why(&model)
+    );
+}
+
+/// A scrape from a limen that predates the rollout gauges carries no rollout
+/// truth at all. Rendering that as an empty table would say the rollout was
+/// fine; the page says the scrape cannot answer.
+#[test]
+fn a_scrape_with_no_rollout_families_at_all_is_unavailable() {
+    // `metrics()` is the pre-rollout scrape: registered series and comparison
+    // counters, nothing else.
+    let ws = rollout().with_metrics(&metrics());
+    let model = ws.model();
+    assert_failure_naming(&model, "no rollout truth");
+    assert!(model.evidence.rollout.is_unavailable());
+    let html = ws.page();
+    assert!(html.contains("Rollout &amp; resilience"), "{html}");
+    assert!(rollout_section(&html).contains("UNAVAILABLE"), "{html}");
+}
+
+/// The honest empty: a config with neither rollout mode has no rollout to
+/// report, and that is one line rather than a red section.
+#[test]
+fn a_config_without_rollout_routes_says_so_in_one_line() {
+    let ws = canonical();
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    let html = ws.page();
+    assert!(html.contains("Rollout &amp; resilience"), "{html}");
+    assert!(
+        html.contains("declares no percentage_split or failover_to_legacy route"),
+        "{html}"
+    );
+}
+
+/// The existing contract for a metrics-dependent section, mirrored: no scrape
+/// is an absence of evidence, not a set of zeros.
+#[test]
+fn without_a_metrics_scrape_the_rollout_section_is_not_provided() {
+    let ws = Workspace::new()
+        .with_config(ROLLOUT_CONFIG)
+        .with_verdict(&clean_verdict());
+    let model = ws.model();
+    // Nothing about the rollout may turn a missing optional input into red.
+    assert!(
+        model.banner.failures.is_empty(),
+        "a missing scrape is not a rollout failure: {}",
+        why(&model)
+    );
+    // The variant itself, not just a word on the page: NOT PROVIDED and
+    // UNAVAILABLE are different claims and this is the one that must hold.
+    assert!(
+        matches!(model.evidence.rollout, Section::NotProvided),
+        "{:?}",
+        model.evidence.rollout
+    );
+    let html = ws.page();
+    let section = rollout_section(&html);
+    assert!(html.contains("Rollout &amp; resilience"), "{html}");
+    assert!(section.contains("NOT PROVIDED"), "{section}");
+    assert!(!section.contains("UNAVAILABLE"), "{section}");
+    // The config's rollout settings are not shown either: a table of what the
+    // rollout was *asked* to do reads as a report on what it did.
+    assert!(!section.contains("rollout.split.percentage"), "{section}");
+}
+
+#[test]
+fn impossible_rollout_values_are_refused_row_by_row() {
+    let cases: [(&str, &str, &str); 3] = [
+        (
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 25",
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 250",
+            "250",
+        ),
+        (
+            "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 0",
+            "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 7",
+            "7",
+        ),
+        (
+            "limen_breaker_transitions_total{route=\"split\",from=\"closed\",to=\"open\"} 2",
+            "limen_breaker_transitions_total{route=\"split\",from=\"closed\",to=\"open\"} 1.5",
+            "1.5",
+        ),
+    ];
+    for (from, to, quoted) in cases {
+        let ws = rollout().with_metrics(&rollout_metrics().replace(from, to));
+        let model = ws.model();
+        assert_failure_naming(&model, "split");
+        assert!(
+            model.banner.failures.iter().any(|f| f.contains(quoted)),
+            "no failure quotes {quoted:?}: {}",
+            why(&model)
+        );
+        let html = ws.page();
+        // The invalid row renders no truth cells at all — not the readings
+        // that happened to parse beside the one that did not. (The refused
+        // value appears only inside the rejection sentence, which quotes it.)
+        assert_row_is_unavailable(&html, "split");
+        let row = rollout_row_of(&html, "split");
+        let cells = row.split("colspan=\"5\"").next().expect("the row prefix");
+        assert!(
+            !cells.contains(quoted),
+            "the refused value {quoted:?} was rendered as a reading: {row}"
+        );
+        // The failover row is untouched by the split row's bad value.
+        assert!(rollout_row_of(&html, "failover").contains("90% (new: 9 / legacy: 1)"));
+    }
+}
+
+/// `limen_requests_total` registers on the first request of its kind, so a
+/// route serving 0% to new legitimately carries no `new` series — the same
+/// shape a lost counter takes. Absence stays non-failing (the scrape-level
+/// question is already settled by the required families), but it may never
+/// render as a counted zero: the annotation is what keeps the two apart.
+#[test]
+fn an_absent_request_counter_is_annotated_never_a_bare_share() {
+    // One side absent: the share is still stated, and says which side was
+    // never counted rather than presenting a bare percentage.
+    let one_side = without_family(
+        &rollout_metrics(),
+        "limen_requests_total{route=\"split\",method=\"GET\",upstream=\"new\"",
+    );
+    let ws = rollout().with_metrics(&one_side);
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    let row = rollout_row_of(&ws.page(), "split");
+    assert!(
+        row.contains("0% (new: no series = zero recorded / legacy: 70)"),
+        "a half-known pair rendered without its annotation: {row}"
+    );
+    assert!(
+        !row.contains("NO SHARE"),
+        "a half-known pair took the no-traffic label: {row}"
+    );
+
+    // Both sides absent: no share at all, and the informational label says the
+    // series are missing rather than that the split served nothing to new.
+    let ws = rollout().with_metrics(&without_route_series(
+        &rollout_metrics(),
+        "limen_requests_total",
+        "split",
+    ));
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    let html = ws.page();
+    assert!(
+        rollout_section(&html).contains("25%"),
+        "the target is known"
+    );
+    let row = rollout_row_of(&html, "split");
+    assert!(row.contains("NO SHARE"), "{row}");
+    assert!(
+        row.contains("no series = zero recorded"),
+        "the absent sides are named: {row}"
+    );
+}
+
+/// The flag gauges are refreshed on every scrape of a limen control plane, so
+/// their absence beside live rollout series is a torn or foreign scrape.
+#[test]
+fn absent_flag_gauges_beside_live_rollout_series_are_a_failure() {
+    let ws = rollout().with_metrics(&rollout_metrics_without("limen_flag_provider_stale"));
+    let model = ws.model();
+    assert_failure_naming(&model, "limen_flag_provider_stale");
+}
+
+/// A diverting breaker is not a clean campaign: an open one means the new
+/// upstream was never exercised, a half-open one that it was on probation.
+/// Either way the coverage is not what the config asked for.
+#[test]
+fn a_diverting_breaker_is_never_a_clean_page() {
+    // Self-consistent tuples: `[1, 0, 0, 0]` leaves the breaker open (one entry
+    // into open, no exit); `[1, 1, 0, 0]` leaves it half-open.
+    for (state, counts, word) in [(2, [1, 0, 0, 0], "open"), (1, [1, 1, 0, 0], "half-open")] {
+        let text = rollout_metrics()
+            .replace(
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 0",
+                &format!("limen_circuit_breaker_state{{route=\"split\",upstream=\"new\"}} {state}"),
+            )
+            .replace(
+                &transitions("split", [2, 2, 2, 0]),
+                &transitions("split", counts),
+            );
+        let ws = rollout().with_metrics(&text);
+        let model = ws.model();
+        assert_failure_naming(&model, &format!("breaker {word} on route split"));
+        // The row is still readable — a diverting breaker is a finding, not an
+        // unreadable row.
+        assert!(rollout_row_of(&ws.page(), "split").contains(&format!(">{word}<")));
+    }
+}
+
+/// C-L1 writes this gauge for every route with a breaker on every scrape, so
+/// its absence is a scrape that cannot say whether the breaker was diverting —
+/// which is the one thing that must never default to "closed".
+#[test]
+fn an_absent_breaker_state_rejects_the_row() {
+    let ws = rollout().with_metrics(&without_route_series(
+        &rollout_metrics(),
+        "limen_circuit_breaker_state",
+        "split",
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "limen_circuit_breaker_state");
+    // `assert_row_is_unavailable` already refuses any state word in a cell;
+    // this pins the specific default the absence must never become.
+    assert_row_is_unavailable(&ws.page(), "split");
+}
+
+/// The breaker guards the new upstream and nothing else, so a state series
+/// under another label — or none — is not this breaker's state.
+#[test]
+fn a_breaker_state_under_another_upstream_is_malformed() {
+    for label in ["upstream=\"legacy\"", "upstream=\"\""] {
+        let ws = rollout().with_metrics(&rollout_metrics().replace(
+            "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"}",
+            &format!("limen_circuit_breaker_state{{route=\"split\",{label}}}"),
+        ));
+        let model = ws.model();
+        assert_failure_naming(&model, "the breaker guards the new upstream");
+        assert_row_is_unavailable(&ws.page(), "split");
+    }
+}
+
+/// The gauge and the transition counts are two readings of one breaker taken
+/// microseconds apart, so a one-step difference is the race between them — and
+/// says so, reporting the more diverting of the two rather than picking one.
+#[test]
+fn a_one_step_state_skew_is_reported_not_rejected() {
+    // Counts `[3, 2, 2, 0]` leave the breaker open; the gauge still reads the
+    // closed it was refreshed at, one transition earlier.
+    let ws = rollout().with_metrics(&rollout_metrics().replace(
+        &transitions("split", [2, 2, 2, 0]),
+        &transitions("split", [3, 2, 2, 0]),
+    ));
+    let model = ws.model();
+    let row = rollout_row_of(&ws.page(), "split");
+    assert!(row.contains("STATE/COUNTERS SKEWED"), "{row}");
+    assert!(
+        row.contains(">open<"),
+        "the skew reported the calmer of the two readings: {row}"
+    );
+    // Reported as open, so the diverting-breaker failure applies — a skew is
+    // never a way to a clean page.
+    assert_failure_naming(&model, "breaker open on route split");
+}
+
+/// A tuple no history can produce is not a race, it is a scrape that was
+/// edited, merged, or is not limen's.
+#[test]
+fn an_impossible_transition_tuple_rejects_the_row() {
+    // Two closes against one open: the breaker left the closed state once and
+    // returned to it twice.
+    let ws = rollout().with_metrics(&rollout_metrics().replace(
+        &transitions("split", [2, 2, 2, 0]),
+        &transitions("split", [1, 2, 2, 0]),
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "describe no history a breaker can have");
+    assert_row_is_unavailable(&ws.page(), "split");
+}
+
+/// `Closed` and `HalfOpen` are not connected by any single legal transition —
+/// the state machine only ever reaches `HalfOpen` from `Open` — so a scrape
+/// pairing them is rejected outright. This is not a question of which
+/// reading is "ahead": counts `[3, 3, 2, 0]` are, if anything, numerically
+/// ahead of the `[2, 2, 2, 0]` baseline in every column that moved, and it is
+/// still rejected, because no edge in [`BreakerState::TRANSITIONS`] runs
+/// `closed`→`half_open`.
+#[test]
+fn a_gauge_and_counters_pair_with_no_legal_edge_rejects_the_row() {
+    // Counts leave the breaker half-open; the gauge says closed — and no
+    // legal transition connects `closed` to `half_open` directly.
+    let ws = rollout().with_metrics(&rollout_metrics().replace(
+        &transitions("split", [2, 2, 2, 0]),
+        &transitions("split", [3, 3, 2, 0]),
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "not describing the same breaker");
+    assert_row_is_unavailable(&ws.page(), "split");
+}
+
+/// The other legitimate cause of a one-step skew, running the opposite
+/// direction from [`a_one_step_state_skew_is_reported_not_rejected`]:
+/// `CircuitBreaker::state()` reports `HalfOpen` the instant the open window
+/// elapses, without touching the counter — the counter only bumps inside the
+/// next admitted request. A scrape landing in that gap sees a gauge already
+/// at `half_open` while the transition counts still describe the breaker as
+/// `open`. It is accepted through the same `half_open`→`open` edge that also
+/// covers a failed half-open trial reopening the breaker — the two races are
+/// indistinguishable from one scrape, and both are legal.
+#[test]
+fn a_gauge_ahead_of_a_lazy_half_open_read_is_reported_not_rejected() {
+    // Counts `[3, 2, 2, 0]` leave the breaker open by the transition history;
+    // the gauge already reads half-open, having advanced ahead of it.
+    let ws = rollout().with_metrics(
+        &rollout_metrics()
+            .replace(
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 0",
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 1",
+            )
+            .replace(
+                &transitions("split", [2, 2, 2, 0]),
+                &transitions("split", [3, 2, 2, 0]),
+            ),
+    );
+    let model = ws.model();
+    let row = rollout_row_of(&ws.page(), "split");
+    assert!(row.contains("STATE/COUNTERS SKEWED"), "{row}");
+    assert!(
+        row.contains(">open<"),
+        "the skew reported the more diverting of the two readings: {row}"
+    );
+    // Reported as open, so the diverting-breaker failure applies — a skew is
+    // never a way to a clean page.
+    assert_failure_naming(&model, "breaker open on route split");
+}
+
+/// The three flag gauges come from one `health()` snapshot, so a tuple that
+/// disagrees with itself is corruption — not a provider in an odd state.
+#[test]
+fn an_incoherent_flag_tuple_is_rejected() {
+    let swap = |from: &str, to: &str| rollout_metrics().replace(from, to);
+    let cases = [
+        // Fresh, but no successful refresh has ever happened.
+        (
+            swap(
+                "limen_flag_provider_staleness_seconds 1.5",
+                "limen_flag_provider_staleness_seconds -1",
+            ),
+            "never refreshed",
+        ),
+        // Fresh, but older than this config's 30s stale_ttl_ms.
+        (
+            swap(
+                "limen_flag_provider_staleness_seconds 1.5",
+                "limen_flag_provider_staleness_seconds 45",
+            ),
+            "past this config's stale_ttl_ms",
+        ),
+        // Stale, but well inside the TTL.
+        (
+            swap("limen_flag_provider_stale 0", "limen_flag_provider_stale 1"),
+            "inside this config's stale_ttl_ms",
+        ),
+    ];
+    for (text, needle) in cases {
+        let ws = rollout().with_metrics(&text);
+        let model = ws.model();
+        assert_failure_naming(&model, needle);
+        assert!(
+            rollout_section(&ws.page()).contains("FLAG PROVIDER INCOHERENT"),
+            "the provider block still rendered as a reading"
+        );
+    }
+
+    // …and the legal tuples stay legal, including both sides of the boundary.
+    for (stale, age) in [(0, "30"), (1, "30"), (1, "-1"), (0, "0")] {
+        let text = rollout_metrics()
+            .replace(
+                "limen_flag_provider_stale 0",
+                &format!("limen_flag_provider_stale {stale}"),
+            )
+            .replace(
+                "limen_flag_provider_staleness_seconds 1.5",
+                &format!("limen_flag_provider_staleness_seconds {age}"),
+            );
+        let model = rollout().with_metrics(&text).model();
+        assert!(
+            !model
+                .banner
+                .failures
+                .iter()
+                .any(|f| f.contains("did not come from one health snapshot")
+                    || f.contains("stale_ttl_ms")),
+            "stale={stale} age={age} was called incoherent: {}",
+            why(&model)
+        );
+    }
+}
+
+/// `register_rollout_series` emits exactly the set the config implies, so a
+/// series for a route the config never declared — or one it gives no way to
+/// produce — means the scrape and the config are different deployments.
+#[test]
+fn rollout_series_the_config_cannot_account_for_are_a_failure() {
+    // A route the config has never heard of.
+    let ws = rollout().with_metrics(&format!(
+        "{}limen_rollout_resolved_target_percentage{{route=\"ghost\"}} 5\n",
+        rollout_metrics()
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "route ghost");
+    assert_failure_naming(&model, "different route tables");
+
+    // A configured route that cannot own the series: `a` is shadow-only, so it
+    // resolves no rollout target.
+    let ws = rollout().with_metrics(&format!(
+        "{}limen_rollout_resolved_target_percentage{{route=\"a\"}} 5\n",
+        rollout_metrics()
+    ));
+    let model = ws.model();
+    assert_failure_naming(&model, "no way to produce one");
+}
+
+// ---------------------------------------------------------------------------
 // Escaping
 // ---------------------------------------------------------------------------
 

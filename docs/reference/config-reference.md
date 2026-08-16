@@ -105,7 +105,7 @@ Each route declares exactly one mode and the upstreams it needs.
 | `new_upstream` | url | — | Required unless mode is `legacy_only`. |
 | `mode` | enum | — | `legacy_only` \| `new_only` \| `shadow_legacy_primary` \| `percentage_split` \| `failover_to_legacy`. |
 | `contract` | string | `null` | `path#routeId` reference; conflicts with inline behavioral rules. |
-| `failover_safe` | bool | `false` | Allow replaying a failed in-flight request to legacy (see below). |
+| `failover_safe` | bool | `false` | Attest the route's operations idempotent, allowing Limen to replay a failed in-flight request to legacy. Takes effect on `failover_to_legacy` routes always, and on `percentage_split` routes for whichever requests the split sent to new (see below). |
 | `rollout` | block | `null` | Required for `percentage_split`. |
 | `timeouts.primary_ms` / `shadow_ms` | int | `2000` / `2000` | Must be > 0. |
 | `comparison` | block | disabled | Operational gate + optional inline behavioral rules. |
@@ -246,6 +246,45 @@ rollout:
     fallback: "request_random"   # used when the header is absent
 ```
 
+The percentage a `percentage_split` route resolved to — the same
+stale/flag/default/clamp chain the router itself consults — is exported at
+scrape time as `limen_rollout_resolved_target_percentage{route}`. It's
+deliberately the flag-resolved **target**, not the effective share: an open
+circuit breaker steers traffic away from new without changing this gauge,
+and a stale flag provider resolves it to `0` (with the flag-staleness gauges
+saying why), same as the routing decision itself. See [flags &
+rollout](../guides/flags-and-rollout.md#rollout-target-gauge).
+
+### `circuit_breaker`
+
+```yaml
+circuit_breaker:
+  enabled: true
+  failure_rate_threshold: 0.5   # 0–1; open above this new-side failure rate…
+  min_requests: 20              # …once at least this many requests have been seen
+  open_duration_ms: 30000       # stay open this long before a half-open trial
+  half_open_max_requests: 5     # trial requests admitted while half-open
+```
+
+Per-route, per-(new-)upstream breaker (spec §9.1); disabled unless `enabled`
+is set. Mechanics, state machine, and tuning guidance (choosing these four
+values for a route's traffic volume) live in [resilience &
+failover](../guides/resilience.md#circuit-breaker).
+
+| Field | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Whether the breaker is active for this route. |
+| `failure_rate_threshold` | float | `0.5` | 0–1; failure rate that opens the breaker. Failures are 5xx responses, connection failures, and timeouts. |
+| `min_requests` | int | `20` | Minimum observed requests in the window before `failure_rate_threshold` is consulted. |
+| `open_duration_ms` | int | `30000` | How long the breaker stays open before admitting a half-open trial. |
+| `half_open_max_requests` | int | `5` | Trial requests admitted while half-open; all succeed → closed, any fails → open. |
+
+Every state transition (`closed`↔`open`↔`half_open`) increments
+`limen_breaker_transitions_total{route,from,to}` and logs at `info`, alongside
+the scrape-time-sampled `limen_circuit_breaker_state` gauge — both render in
+[`limen report --format
+html`](cli.md#the-html-status-page)'s Rollout & resilience section.
+
 ### `comparison`
 
 ```yaml
@@ -314,34 +353,77 @@ budget:
 
 ## `failover_safe` and idempotency
 
+`failover_safe: true` is an attestation — the operator is asserting the
+route's operations are idempotent, so retrying a failed in-flight request
+against legacy cannot double a side effect (spec §6.5). It takes effect under
+**two** modes: `failover_to_legacy` (new is primary for every request) and
+`percentage_split` (new is primary for whichever requests the split assigned
+to it) — both put new in front of a live legacy and are therefore eligible
+for replay; `new_only` is excluded by construction, since there is no legacy
+leg to replay against. Both legs of a replay — the new attempt and the legacy
+retry — share **one** `timeouts.primary_ms` budget: a new-side timeout has
+already spent it and is **not** replayed, while a fast failure (5xx,
+connection refused/reset) is. See [resilience &
+failover](../guides/resilience.md#failover_safe-replay-under-failover_to_legacy-and-percentage_split)
+for the full mechanics and the cost of turning it on.
+
 A `failover_to_legacy` route whose methods include a non-idempotent verb (`POST`
 or `PATCH`) **must** set `failover_safe: true`, or validation fails. This forces
 the operator to consciously affirm that retrying a failed in-flight request
-against legacy cannot double a side effect (spec §6.5). Routing *subsequent*
-requests to legacy via the circuit breaker is always safe and never gated.
+against legacy cannot double a side effect. `percentage_split` routes are
+valid with or without the flag either way — validation does not force the
+choice there, since a `percentage_split` route need not carry non-idempotent
+methods to New at all. Routing *subsequent* requests to legacy via the
+circuit breaker is always safe and never gated.
+
+**Upgrade note.** A config that already sets `failover_safe: true` on a
+`percentage_split` route gains replay semantics automatically on upgrade —
+no config change required, and no way to opt back out of it short of
+removing the flag. Audit existing `percentage_split` + `failover_safe: true`
+routes before upgrading if that behavior change would be a surprise.
 
 ## `debug`
 
 Optional. Absent (the normal case) means every debug affordance is off.
 `limen run` logs a loud warning at startup for anything enabled here — these
-switches exist to prove the comparison pipeline bites during a migration
-campaign (see [Prove your lens bites](../guides/prove-your-lens-bites.md)),
-never for production operation.
+switches exist to prove something about a migration campaign from the
+outside (the comparison pipeline biting, per [Prove your lens
+bites](../guides/prove-your-lens-bites.md); or, for `upstream_header`, which
+upstream actually served a given request), never for production operation.
 
 ```yaml
 debug:
   sink_canary: true
+  upstream_header: true
 ```
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `sink_canary` | bool | `false` | Exposes `POST /debug/canary` on the control plane, which injects one synthetic mismatch through the real compare → observer → sink pipeline under the reserved route id `__limen_canary__`. Drives [`limen verdict --canary`](cli.md#verdict). |
+| `upstream_header` | bool | `false` | Adds `x-limen-upstream: legacy\|new` to every **relayed** response, attributing the upstream whose response the client actually received. |
 
-**Never enable in production.** `limen run` emits a `warn`-level log
-(`"debug sink canary enabled — POST /debug/canary injects synthetic
-mismatches into the live pipeline; never enable in production"`) whenever
-`sink_canary` is true, so an accidental production enablement is loud rather
-than silent.
+**`upstream_header` is relay-only attribution, not an attempt log.** The
+header names the upstream whose response was *relayed* — derived from the
+same fact the proxy already tracks, not from which upstream was merely
+attempted — so a `failover_safe` replay that fell back to legacy carries
+`legacy`, and every limen-**synthesized** response (a no-replay `502`/`504`,
+a local `413`/`400` refusal, an unmatched route) carries **no header at
+all**: absence is the honest answer when no upstream actually served the
+response. Inbound `x-limen-upstream` — from a client or from either upstream
+— is **always stripped**, in both directions, whether the flag is on or off,
+before any header set is cloned onto a shadow or replay leg, so a spoofed
+value can never ride any leg of a request and never reach an upstream or a
+client. It exists to make per-request rollout evidence externally
+verifiable — the [rollout simulation](../guides/flags-and-rollout.md#tuning)
+reads this header as its ground truth for which upstream served a given key,
+rather than trusting the routing decision it exists to verify — never for
+production operation.
+
+**Never enable in production.** `limen run` emits a `warn`-level log for
+either field: the `sink_canary` warning above, or (for `upstream_header`) a
+loud startup warning that the attribution header is on. Both exist to prove
+something about a migration campaign from the outside; neither belongs in a
+deployed proxy.
 
 **Why config-gated, not compile-gated.** The obvious alternative —
 `cfg(debug_assertions)` or a Cargo feature — was rejected for a load-bearing
