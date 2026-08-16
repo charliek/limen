@@ -75,7 +75,7 @@ read floor and the wildcard-granularity rule.
 | `0` | Draft emitted on real classifications. |
 | `20` | Nothing usefully profiled: no observations, every route below the read floor, or a sampled profile. |
 | `40` | The profile never quiesced within `--drain-deadline-ms`. |
-| `50` | Required input unavailable: control plane unreachable, running proxy has no `observe:` block, unreadable `--profile`, or a config that does not describe the profiled proxy — including a **stale profile**, where a route's recorded `match_basis` (`prefix:…`/`template:…`) disagrees with what the config now declares (re-profile after templating a route, never reclassify the old capture), and a **consistency refusal**, where a profile's own counters could not have come from the recorder (e.g. more read transport errors than reads) and are therefore corrupt or hand-edited. |
+| `50` | Required input is unavailable: control plane unreachable, running proxy has no `observe:` block, unreadable `--profile`, or a config that does not describe the profiled proxy — including a **stale profile**, where a route's recorded `match_basis` (`prefix:…`/`template:…`) disagrees with what the config now declares (re-profile after templating a route, never reclassify the old capture), and a **consistency refusal**, where a profile's own counters could not have come from the recorder (e.g. more read transport errors than reads) and are therefore corrupt or hand-edited. |
 
 **Exit `20` still writes a draft** — the document goes to stdout either way, so the existence of a file
 proves nothing. `20` means the draft rests on refusals to classify: unadoptable, not absent. **Branch on
@@ -160,7 +160,7 @@ limen verdict -c campaign.config.yaml --canary --format json > verdict.json
 | `20` | Floors unmet, including a config that floors nothing at all. |
 | `30` | Sink integrity: dropped records, unparseable lines, counter routes absent from the config, sink/engine disagreement — or a canary that never landed. |
 | `40` | Drain timeout — the pipeline never quiesced. |
-| `50` | Required input unavailable: control plane unreachable, sink unreadable, a required metric series absent, a refused canary trigger. |
+| `50` | Required input is unavailable: control plane unreachable, sink unreadable, a required metric series absent, a refused canary trigger. |
 
 The **highest code wins** and every check fails closed — an input that could not be read is never scored
 as "0 mismatches". `--offline` skips drain, floors, integrity, and canary; an offline `0` is strictly

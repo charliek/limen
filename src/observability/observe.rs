@@ -309,6 +309,12 @@ pub struct RouteProfile {
     pub length_repeats: u64,
     /// Of those repeats, how many changed length. `> 0` means the route's
     /// successful responses are not stable across identical requests.
+    ///
+    /// A **subset of [`Self::length_repeats`]**, not a bucket beside it: a
+    /// length can only be seen to move on a repeat, and the recorder counts
+    /// that repeat as well. `length_varied <= length_repeats` therefore holds
+    /// of every profile, and a consumer that adds the two together is
+    /// double-counting the same reads.
     pub length_varied: u64,
     /// Successful upstream reads whose response carried no `Content-Length`, so
     /// stability could not be assessed at all.

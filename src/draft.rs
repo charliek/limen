@@ -259,15 +259,27 @@ pub(crate) fn check_profile_consistency(profile: &ObserveProfile) -> Result<(), 
                 route.read_transport_errors, route.reads
             )));
         }
-        let stability = route.length_repeats + route.length_varied + route.length_missing;
+        // `length_varied` counts a SUBSET of `length_repeats` — the recorder
+        // bumps both on a repeat whose length moved — so it is not a third
+        // disjoint bucket to add in. Only the two disjoint ones consume a
+        // successful read each.
+        let accounted = route.length_repeats + route.length_missing;
         let successes = crate::suggest::successful_reads(route);
-        if stability > successes {
+        if accounted > successes {
             return Err(SuggestError::InputUnavailable(format!(
-                "route {id:?}: stability counters ({} repeats + {} varied + {} missing) exceed \
-                 the {} successful reads that could have produced them — stability evidence \
-                 accrues only from 2xx reads, so this profile was not produced by the \
-                 recorder. Re-profile",
-                route.length_repeats, route.length_varied, route.length_missing, successes
+                "route {id:?}: {} repeats + {} reads without a length exceed the {} successful \
+                 reads that could have produced them — stability evidence accrues only from 2xx \
+                 reads, and each such read is counted once, so this profile was not produced by \
+                 the recorder. Re-profile",
+                route.length_repeats, route.length_missing, successes
+            )));
+        }
+        if route.length_varied > route.length_repeats {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: {} varied exceeds {} repeats — a length can only be seen to vary \
+                 on a repeat, and the recorder counts the repeat too, so this profile was not \
+                 produced by it. Re-profile",
+                route.length_varied, route.length_repeats
             )));
         }
     }
@@ -1894,19 +1906,43 @@ routes:
         assert!(message.contains("11 repeats"), "{message}");
         assert!(message.contains("0 successful reads"), "{message}");
         assert!(message.contains("2xx"), "{message}");
+        // Zero successes cannot account for a single repeat, so the shape stays
+        // refused under the corrected arithmetic rather than only under the
+        // over-strict sum it was first written against.
+        assert!(
+            check_profile_consistency(&profile_with(12, &[("5xx", 12)], 12, (1, 0, 0))).is_err()
+        );
         // And it refuses through the front door too, not merely when called
         // directly — this is the check that has to run before classification.
         assert!(check_config_describes_the_profiled_proxy(&hostile_config(), &profile).is_err());
     }
 
     #[test]
-    fn every_stability_counter_is_weighed_against_the_successes() {
-        // The sum, not any one field: three counters each individually under
-        // the success count can still describe more successful reads than the
-        // route ever served.
-        let profile = profile_with(12, &[("2xx", 4), ("4xx", 8)], 0, (2, 1, 2));
-        let err = check_profile_consistency(&profile).expect_err("the sum must be weighed");
-        assert!(err.to_string().contains("4 successful reads"), "{err}");
+    fn the_disjoint_stability_counters_are_weighed_together() {
+        // Repeats and length-less reads are disjoint — a successful read is one
+        // or the other, never both — so each consumes a success and they are
+        // weighed as a pair. Individually under the success count, together
+        // over it.
+        let profile = profile_with(12, &[("2xx", 4), ("4xx", 8)], 0, (3, 0, 2));
+        let err = check_profile_consistency(&profile).expect_err("the pair must be weighed");
+        let message = err.to_string();
+        assert!(message.contains("3 repeats"), "{message}");
+        assert!(message.contains("2 reads without a length"), "{message}");
+        assert!(message.contains("4 successful reads"), "{message}");
+    }
+
+    #[test]
+    fn a_length_that_varied_more_often_than_it_repeated_is_refused() {
+        // The other half of the corrected arithmetic. A length can only be seen
+        // to move on a repeat, and the recorder counts that repeat too, so
+        // `varied > repeats` describes an increment that has no read behind it.
+        let profile = profile_with(12, &[("2xx", 12)], 0, (2, 3, 0));
+        let err = check_profile_consistency(&profile).expect_err("varied cannot outrun repeats");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("3 varied"), "{message}");
+        assert!(message.contains("2 repeats"), "{message}");
     }
 
     #[test]
@@ -1953,17 +1989,50 @@ routes:
 
     #[test]
     fn stability_exactly_accounted_for_by_the_successes_passes() {
-        // The boundary is inclusive: twelve successful reads can account for
-        // twelve counter increments — eleven repeats of one fingerprint plus
-        // one that varied, or any split summing to the successes. Refusing at
-        // equality would refuse the densest legitimate profile there is.
-        let exact = profile_with(12, &[("2xx", 12)], 0, (11, 1, 0));
+        // The boundary is inclusive: twelve successful reads of one fingerprint
+        // are one first sighting and eleven repeats, plus a twelfth read to
+        // reach the ceiling. Refusing at equality would refuse the densest
+        // legitimate profile there is.
+        let exact = profile_with(12, &[("2xx", 12)], 0, (12, 0, 0));
         assert!(check_profile_consistency(&exact).is_ok());
-        let split = profile_with(12, &[("2xx", 8), ("4xx", 4)], 4, (5, 1, 2));
+        // Every repeat also varied — a route whose body changes on every call,
+        // which is R9's whole subject. `varied` rides *on* those same repeats
+        // rather than consuming reads of its own, so this is the shape a real
+        // recorder emits and it must not be read as 22 reads' worth of
+        // evidence. (The over-strict sum this check was first written with
+        // refused exactly this, and slauth's observe-golden run against a live
+        // `pat-list` route hit it: 3 successes behind 2 repeats + 2 varied.)
+        let every_repeat_varied = profile_with(12, &[("2xx", 12)], 0, (11, 11, 0));
+        assert!(check_profile_consistency(&every_repeat_varied).is_ok());
+        let split = profile_with(12, &[("2xx", 8), ("4xx", 4)], 4, (5, 5, 3));
         assert!(check_profile_consistency(&split).is_ok());
         // One past it is not.
-        let over = profile_with(12, &[("2xx", 12)], 0, (11, 1, 1));
+        let over = profile_with(12, &[("2xx", 12)], 0, (12, 0, 1));
         assert!(check_profile_consistency(&over).is_err());
+    }
+
+    #[test]
+    fn the_field_shape_that_caught_the_arithmetic_passes() {
+        // The regression, verbatim from slauth's observe-golden run against its
+        // real `pat-list` route: four reads, three of them successful, two
+        // repeats and both of them varied. The recorder produced this document;
+        // a check that refused it was wrong about the recorder, not the other
+        // way round.
+        let profile = profile_with(4, &[("2xx", 3), ("4xx", 1)], 0, (2, 2, 0));
+        assert!(
+            check_profile_consistency(&profile).is_ok(),
+            "the door must admit a document the recorder actually wrote"
+        );
+        // And it classifies rather than merely parsing. Four reads is below the
+        // default floor, so the golden route's own answer is R3 — the door's
+        // job here was to let the rules speak at all.
+        let outcome = evaluate(&hostile_config(), &profile, &opts());
+        assert_eq!(outcome.suggestions[0].reason, Reason::InsufficientReads);
+        // The same arithmetic above the floor lands on R9, which is what a
+        // route whose body moves on every repeat should be told.
+        let above_the_floor = profile_with(13, &[("2xx", 12), ("4xx", 1)], 0, (2, 2, 0));
+        let outcome = evaluate(&hostile_config(), &above_the_floor, &opts());
+        assert_eq!(outcome.suggestions[0].reason, Reason::BodyVaries);
     }
 
     /// A one-route config whose route matches `path` written as `field`.

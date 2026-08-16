@@ -1546,9 +1546,14 @@ mode: legacy_only
             match_basis: "prefix:/conversations/".to_string(),
             observations: 50,
             reads: 50,
-            // Fifty conversations under a prefix: over R7's ceiling.
-            distinct_read_paths: DEFAULT_MAX_COMPARE_PATHS + 1,
+            // Fifty conversations under a prefix: over R7's ceiling. The status
+            // map is restated at the read count rather than inherited, so the
+            // 41 repeats have 50 successful reads behind them — a fixture
+            // claiming more stability than its successes could produce is a
+            // document the `--profile` door refuses.
+            status_classes: counts(&[("2xx", 50)]),
             length_repeats: 41,
+            distinct_read_paths: DEFAULT_MAX_COMPARE_PATHS + 1,
             ..clean_profile()
         };
         assert_demoted(&folded, Disposition::RelayOnly, Reason::WildcardGranularity);
@@ -1562,10 +1567,13 @@ mode: legacy_only
             distinct_read_paths: 1,
             ..folded
         };
-        let suggestion = classify_clean(&split);
-        assert_eq!(suggestion.disposition, Disposition::CompareCandidate);
+        // Through the shared helper, so the producibility guard runs on this
+        // candidacy claim like every other one: asserting the disposition
+        // directly would have exempted the fixture from the check.
+        assert_candidate(&split);
         assert_eq!(
-            suggestion.evidence.match_basis, "template:/conversations/{id}",
+            classify_clean(&split).evidence.match_basis,
+            "template:/conversations/{id}",
             "the provenance rides with the evidence, so the count is readable"
         );
     }
@@ -2315,9 +2323,11 @@ mode: legacy_only
         // and worse, its all-error shapes would have carried stability counters
         // no success could have produced, which is the exact fail-open the door
         // now refuses. So the status mix comes from a table of producible
-        // (status, read_transport_errors) pairs, and the three stability
-        // counters are each budgeted at a third of that shape's successful
-        // reads, which bounds their sum by the successes for free.
+        // (status, read_transport_errors) pairs, and the stability counters are
+        // composed the way the recorder increments them: a successful read is
+        // either a repeat or a read with no length, never both, while `varied`
+        // rides on the repeats it is a subset of rather than consuming reads of
+        // its own.
         let mut checked = 0;
         let mut candidates = 0;
         let mut candidates_despite_transport_errors = 0;
@@ -2336,19 +2346,23 @@ mode: legacy_only
             (counts(&[("5xx", 12)]), 12),
         ] {
             let successes = status.get("2xx").copied().unwrap_or(0);
-            // A third each, so `repeats + varied + missing <= successes` holds
-            // whatever combination of the three bits is set.
-            let unit = successes / 3;
+            // Half each to the two disjoint counters, so `repeats + missing <=
+            // successes` holds whatever combination of their bits is set.
+            let unit = successes / 2;
             for bits in 0u32..1 << 10 {
                 let head_heavy = (bits >> 9) & 1 == 1;
+                let length_repeats = u64::from((bits >> 4) & 1) * unit;
                 let profile = RouteProfile {
                     status_classes: status.clone(),
                     read_transport_errors,
                     redirect_reads: u64::from(bits & 1),
                     set_cookie_reads: u64::from((bits >> 1) & 1),
                     location_reads: u64::from((bits >> 2) & 1),
-                    length_varied: u64::from((bits >> 3) & 1) * unit,
-                    length_repeats: u64::from((bits >> 4) & 1) * unit,
+                    // A subset of the repeats, so the "every repeat varied"
+                    // shape is swept and "varied without a repeat" — which no
+                    // recorder can produce — is not.
+                    length_varied: u64::from((bits >> 3) & 1) * length_repeats,
+                    length_repeats,
                     fingerprint_overflow: (bits >> 5) & 1 == 1,
                     distinct_read_paths_overflow: (bits >> 6) & 1 == 1,
                     content_types_overflow: (bits >> 7) & 1 == 1,
@@ -2387,15 +2401,21 @@ mode: legacy_only
                 // counters have to be able to account for it. `successes > 0`
                 // alone was satisfiable by a shape claiming eleven repeats
                 // behind one success — true of no recorder, and the fail-open
-                // codex found. So: at least one repeat, and a stability sum the
-                // successful reads could actually have produced.
-                let stability =
-                    profile.length_repeats + profile.length_varied + profile.length_missing;
+                // codex found. So: at least one repeat, and every read the two
+                // disjoint counters describe backed by a successful read.
+                // (`length_varied` is not added in: it counts a subset of the
+                // repeats rather than reads of its own — the arithmetic
+                // slauth's observe-golden run corrected.)
+                let accounted = profile.length_repeats + profile.length_missing;
                 assert!(
-                    stability <= successful_reads(&profile),
-                    "candidacy on more stability evidence ({stability}) than successful reads \
+                    accounted <= successful_reads(&profile),
+                    "candidacy on more stability evidence ({accounted}) than successful reads \
                      ({}) could produce",
                     successful_reads(&profile)
+                );
+                assert!(
+                    profile.length_varied <= profile.length_repeats,
+                    "candidacy on lengths that varied more often than they repeated"
                 );
                 assert_eq!(profile.length_varied, 0, "candidacy with varied lengths");
                 assert!(!profile.fingerprint_overflow, "candidacy past the cap");
