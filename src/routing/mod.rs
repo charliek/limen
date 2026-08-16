@@ -5,7 +5,10 @@
 //! the rollout percentage, and circuit-breaker state (Section 3.4).
 //!
 //! Submodules:
-//! - [`matcher`] — method + longest-prefix matching (Phase 2).
+//! - [`matcher`] — method + path matching, template tier then prefix tier
+//!   (Phase 2).
+//! - [`template`] — `{param}` path templates: parsing, matching, and the
+//!   overlap algebra that keeps a route table unambiguous.
 //! - [`decision`] — mode + rollout + breaker → upstream choice (Phase 2/5/6).
 //! - [`rollout`] — deterministic hashing and bucket assignment (Phase 5).
 //! - [`resolve`] — startup resolution of each route's comparison policy.
@@ -14,7 +17,9 @@ pub mod decision;
 pub mod matcher;
 pub mod resolve;
 pub mod rollout;
+pub mod template;
 
 pub use decision::{decide_primary, primary_upstream, PrimaryDecision, Upstream};
-pub use matcher::{CompiledRoute, RouteComparison, RouteTable};
+pub use matcher::{CompiledRoute, PathMatcher, RouteComparison, RouteTable};
 pub use resolve::resolve_comparisons;
+pub use template::CompiledTemplate;

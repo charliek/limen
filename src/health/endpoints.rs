@@ -360,10 +360,13 @@ mod tests {
     async fn enabled_observe_profile_serves_every_configured_route_zero_filled() {
         use crate::config::model::ObserveConfig;
         use crate::observability::ObserveRecorder;
+        use crate::routing::PathMatcher;
 
+        let alpha = PathMatcher::Prefix("/alpha".to_string());
+        let beta = PathMatcher::Prefix("/beta".to_string());
         let recorder = Arc::new(ObserveRecorder::new(
             ObserveConfig::default(),
-            ["alpha", "beta"],
+            [("alpha", &alpha), ("beta", &beta)],
         ));
         let resp = router(control().with_observe(recorder), "/metrics")
             .oneshot(

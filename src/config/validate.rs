@@ -22,6 +22,8 @@ use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
 use crate::health::endpoints::CONTROL_PLANE_RESERVED_PATHS;
 use crate::observability::observe::{MAX_OBSERVE_BOUND, OBSERVE_PROFILE_PATH};
+use crate::routing::matcher::PathMatcher;
+use crate::routing::template::{self, CompiledTemplate};
 use crate::verdict::{CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// Loads each distinct contract file at most once per `validate()` call. A
@@ -128,6 +130,7 @@ pub fn validate(config: &Config, base_dir: &Path) -> Result<(), Vec<ValidationEr
         validate_route(i, route, base_dir, &mut seen_ids, &mut contracts, &mut errs);
     }
     validate_query_disjointness(config, &mut errs);
+    validate_path_overlaps(config, &mut errs);
 
     // Validate each referenced contract's semantics once (version, service,
     // unique route ids), independent of how many routes point at it.
@@ -297,6 +300,14 @@ fn validate_upstream_url(loc: &str, value: &str, errs: &mut Errors) {
     }
 }
 
+/// Where an error is reported: the route's config position, its id, and the
+/// offending field. One producer, because this string is what an operator reads
+/// out of `limen check` and what the tests match on — the per-route closure
+/// below and the pairwise path checks must not drift apart.
+fn route_loc(index: usize, id: &str, field: &str) -> String {
+    format!("routes[{index}] {id:?}.{field}")
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_route<'a>(
     index: usize,
@@ -306,7 +317,7 @@ fn validate_route<'a>(
     contracts: &mut ContractCache,
     errs: &mut Errors,
 ) {
-    let loc = |field: &str| format!("routes[{index}] {:?}.{field}", route.id);
+    let loc = |field: &str| route_loc(index, &route.id, field);
 
     if route.id.trim().is_empty() {
         errs.push(format!("routes[{index}].id"), "must not be empty");
@@ -351,16 +362,48 @@ fn validate_match(loc: &impl Fn(&str) -> String, route: &RouteConfig, errs: &mut
             errs.push(loc("match.methods"), format!("unknown HTTP method {m:?}"));
         }
     }
-    let prefix = &route.r#match.path_prefix;
-    if prefix.is_empty() {
-        errs.push(loc("match.path_prefix"), "must not be empty");
-    } else if !prefix.starts_with('/') {
-        errs.push(
-            loc("match.path_prefix"),
-            format!("must start with '/' (got {prefix:?})"),
-        );
-    }
+    validate_path_expression(loc, &route.r#match, errs);
     validate_query_conditions(loc, &route.r#match, errs);
+}
+
+/// A match names its paths one way or the other, never both and never neither
+/// (spec §5.2).
+///
+/// Both would leave matching with two answers to the same question. Neither
+/// would be worse than a typo: with the field optional so a template route need
+/// not write it, an omitted `path_prefix` that defaulted to `/` would silently
+/// turn a mistyped route into a catch-all shadowing every path in the service.
+fn validate_path_expression(loc: &impl Fn(&str) -> String, m: &RouteMatch, errs: &mut Errors) {
+    match (&m.path_prefix, &m.path_template) {
+        (Some(prefix), None) => {
+            if prefix.is_empty() {
+                errs.push(loc("match.path_prefix"), "must not be empty");
+            } else if !prefix.starts_with('/') {
+                errs.push(
+                    loc("match.path_prefix"),
+                    format!("must start with '/' (got {prefix:?})"),
+                );
+            }
+        }
+        (None, Some(template)) => {
+            if let Err(e) = CompiledTemplate::parse(template) {
+                errs.push(
+                    loc("match.path_template"),
+                    format!("path template {template:?} is invalid: {e}"),
+                );
+            }
+        }
+        (Some(_), Some(_)) => errs.push(
+            loc("match"),
+            "sets both path_prefix and path_template — a route matches on exactly one of the \
+             two: a prefix (everything beneath it) or a template (one exact shape, with \
+             `{param}` spanning a whole segment)",
+        ),
+        (None, None) => errs.push(
+            loc("match"),
+            "must set exactly one of path_prefix or path_template",
+        ),
+    }
 }
 
 /// Validate a route's own query conditions (spec §5.2): names are non-empty and
@@ -451,21 +494,31 @@ fn validate_query_names(
 /// carry together, a `query_present` / `query_absent` pair over unrelated
 /// names) is an error, even where a cleverer analysis might prove it safe.
 /// Routes on *different* prefixes never need this: longest prefix still decides.
+///
+/// Templated routes are out of scope here and handled by
+/// [`validate_path_overlaps`], which applies this same disjointness rule to two
+/// identical templates — and is stricter in one place: two identical
+/// *unconditioned* prefixes are accepted (config order decides), while two
+/// identical unconditioned templates are refused, there being no prefix length
+/// left to order them by.
 fn validate_query_disjointness(config: &Config, errs: &mut Errors) {
     for (i, a) in config.routes.iter().enumerate() {
+        let Some(prefix_a) = a.r#match.path_prefix.as_deref() else {
+            continue;
+        };
         if !a.r#match.is_query_conditioned() {
             continue;
         }
         for (j, b) in config.routes.iter().enumerate().skip(i + 1) {
-            if !b.r#match.is_query_conditioned()
-                || a.r#match.path_prefix != b.r#match.path_prefix
+            if b.r#match.path_prefix.as_deref() != Some(prefix_a)
+                || !b.r#match.is_query_conditioned()
                 || !methods_overlap(&a.r#match.methods, &b.r#match.methods)
                 || provably_disjoint(&a.r#match, &b.r#match)
             {
                 continue;
             }
             errs.push(
-                format!("routes[{j}] {:?}.match", b.id),
+                route_loc(j, &b.id, "match"),
                 format!(
                     "query conditions overlap route {:?} (routes[{i}]) on path_prefix {:?}: \
                      two query-conditioned routes on the same prefix and method must be \
@@ -473,11 +526,234 @@ fn validate_query_disjointness(config: &Config, errs: &mut Errors) {
                      query_present and the other's query_absent so no request can satisfy \
                      both. Add such a parameter, or give the routes different prefixes or \
                      methods",
-                    a.id, a.r#match.path_prefix
+                    a.id, prefix_a
                 ),
             );
         }
     }
+}
+
+/// Reject any pair of routes whose path expressions would make matching
+/// arbitrary once the template tier is consulted ahead of the prefix tier
+/// (spec §5.2; safety invariant 7 — refuse to start on ambiguity).
+///
+/// Only pairs whose methods overlap are considered; disjoint methods can never
+/// compete. Prefix-vs-prefix pairs are not this function's business (longest
+/// prefix decides, and [`validate_query_disjointness`] handles the equal-prefix
+/// case). What is left is:
+///
+/// - **template vs template** — legal when the two cannot both match one path,
+///   or when one is strictly narrower than the other (the matcher consults the
+///   narrower first). Identical shapes fall back to the equal-prefix rules.
+///   Co-matchable but incomparable (`/a/{x}/c` vs `/a/b/{y}`) is refused: any
+///   order Limen picked would be a coin toss the operator never called.
+/// - **template vs prefix** — legal when they cannot meet, or when every path
+///   the template matches lies under the prefix (a refinement of a catch-all,
+///   which is the reason templates exist). A template that takes *some* of a
+///   prefix route's traffic and leaves the rest is refused, and a template that
+///   overlaps a *query-conditioned* prefix route is refused unless the two are
+///   provably query-disjoint — that conditioned route is usually the one
+///   excepting an unsafe hop, and the template tier would otherwise take the
+///   requests it exists to except.
+fn validate_path_overlaps(config: &Config, errs: &mut Errors) {
+    // The matcher's own view of each route's path, so this pass and matching
+    // cannot disagree about what a match block names. A route whose own match is
+    // already an error — both path fields, neither, or a template that does not
+    // parse — becomes `None` and is skipped: it has been reported once already,
+    // and pairing an expression Limen could not read with a second route would
+    // only produce a consequential complaint about the same typo.
+    let paths: Vec<Option<PathMatcher>> = config
+        .routes
+        .iter()
+        .map(|r| PathMatcher::compile(&r.id, &r.r#match).ok())
+        .collect();
+
+    for (i, a) in config.routes.iter().enumerate() {
+        for (j, b) in config.routes.iter().enumerate().skip(i + 1) {
+            if !methods_overlap(&a.r#match.methods, &b.r#match.methods) {
+                continue;
+            }
+            match (&paths[i], &paths[j]) {
+                (Some(PathMatcher::Template(ta)), Some(PathMatcher::Template(tb))) => {
+                    check_template_pair(i, a, ta, b, tb, route_loc(j, &b.id, "match"), errs)
+                }
+                (Some(PathMatcher::Template(ta)), Some(PathMatcher::Prefix(prefix))) => {
+                    check_template_against_prefix(i, a, ta, j, b, prefix, errs)
+                }
+                (Some(PathMatcher::Prefix(prefix)), Some(PathMatcher::Template(tb))) => {
+                    check_template_against_prefix(j, b, tb, i, a, prefix, errs)
+                }
+                // Prefix vs prefix (longest wins, and `validate_query_disjointness`
+                // has the equal case), or a route already in error.
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Two templated routes. Errors are located on the later of the two and name
+/// both ids — either one can be the one to change.
+fn check_template_pair(
+    i: usize,
+    a: &RouteConfig,
+    ta: &CompiledTemplate,
+    b: &RouteConfig,
+    tb: &CompiledTemplate,
+    location: String,
+    errs: &mut Errors,
+) {
+    if !template::co_matchable(ta, tb) {
+        return;
+    }
+    // Quoted as written, never Debug-printed: the operator has to match the
+    // message against a line in their config file.
+    let (ta_str, tb_str) = (ta.as_str(), tb.as_str());
+    match (template::subsumes(ta, tb), template::subsumes(tb, ta)) {
+        // The same shape, parameter names notwithstanding: nothing about the
+        // path can order them, so the equal-prefix rules decide — with one
+        // difference, below, where those rules have a prefix length to fall
+        // back on and two identical templates have nothing.
+        (true, true) => match (
+            a.r#match.is_query_conditioned(),
+            b.r#match.is_query_conditioned(),
+        ) {
+            (true, true) if !provably_disjoint(&a.r#match, &b.r#match) => errs.push(
+                location,
+                format!(
+                    "query conditions overlap route {:?} (routes[{i}]) on the same path \
+                     template {ta_str:?}: two query-conditioned routes on one shape and \
+                     method must be provably disjoint, i.e. some parameter must appear \
+                     in one route's query_present and the other's query_absent so no \
+                     request can satisfy both",
+                    a.id
+                ),
+            ),
+            // Two identical *unconditioned* templates, unlike two identical
+            // prefixes, are pure duplication: there is no length ordering left
+            // to break the tie, so this is a typo rather than a precedence.
+            (false, false) => errs.push(
+                location,
+                format!(
+                    "path template {tb_str:?} matches exactly the same requests as route {:?} \
+                     (routes[{i}]): parameter names do not narrow a template, so nothing \
+                     distinguishes the two. Give one of them a query condition, a different \
+                     shape, or different methods",
+                    a.id
+                ),
+            ),
+            // Exactly one conditioned, or both and provably disjoint: the
+            // conditioned route wins, as it does at an equal prefix.
+            _ => {}
+        },
+        // One is strictly narrower and is consulted first; matching has one
+        // answer — unless the BROADER route carries a query condition. A
+        // conditioned broad template is a carve-out across its whole shape
+        // (the verifier-hop pattern), and the narrower unconditioned template
+        // would steal exactly the requests the condition was written to
+        // capture. Only provable query-disjointness makes that safe; the
+        // reverse orientation (narrower conditioned, broader as fallback) is
+        // ordinary refinement and needs no check.
+        (true, false) | (false, true) => {
+            let (narrow, broad) = if template::subsumes(ta, tb) {
+                (a, b)
+            } else {
+                (b, a)
+            };
+            if broad.r#match.is_query_conditioned()
+                && !narrow.r#match.is_query_conditioned()
+                && !provably_disjoint(&narrow.r#match, &broad.r#match)
+            {
+                let (narrow_t, broad_t) = if std::ptr::eq(narrow, a) {
+                    (ta_str, tb_str)
+                } else {
+                    (tb_str, ta_str)
+                };
+                errs.push(
+                    location,
+                    format!(
+                        "path template {narrow_t:?} (route {:?}) is narrower than route {:?}'s \
+                         query-conditioned template {broad_t:?} (routes[{i}]) and would win on \
+                         every path it matches, stealing requests the query condition was \
+                         written to capture. Make them provably query-disjoint (mirror the \
+                         condition in query_absent on the narrower route) or narrow the \
+                         conditioned route's shape",
+                        narrow.id, broad.id
+                    ),
+                );
+            }
+        }
+        (false, false) => {
+            let witness = template::witness_path(ta, tb);
+            errs.push(
+                location,
+                format!(
+                    "path template {tb_str:?} overlaps route {:?}'s template {ta_str:?} \
+                     (routes[{i}]) — {witness:?} matches both, and neither template is narrower \
+                     than the other, so which one wins would be an accident of config order. \
+                     Rewrite one of them so it is either disjoint from or strictly narrower than \
+                     the other",
+                    a.id
+                ),
+            )
+        }
+    }
+}
+
+/// A templated route against a prefix route. `t_index`/`p_index` are the two
+/// routes' config positions; the error lands on whichever comes later.
+fn check_template_against_prefix(
+    t_index: usize,
+    t_route: &RouteConfig,
+    t: &CompiledTemplate,
+    p_index: usize,
+    p_route: &RouteConfig,
+    prefix: &str,
+    errs: &mut Errors,
+) {
+    if !template::intersects_prefix(t, prefix) {
+        return;
+    }
+    // As written, not Debug-printed (see `check_template_pair`).
+    let t_str = t.as_str();
+    let (later, later_index) = if t_index > p_index {
+        (t_route, t_index)
+    } else {
+        (p_route, p_index)
+    };
+    let location = route_loc(later_index, &later.id, "match");
+    if p_route.r#match.is_query_conditioned() {
+        if provably_disjoint(&t_route.r#match, &p_route.r#match) {
+            return;
+        }
+        errs.push(
+            location,
+            format!(
+                "path template {t_str:?} (route {:?}, routes[{t_index}]) overlaps the \
+                 query-conditioned route {:?} (routes[{p_index}]) on path_prefix {prefix:?}: \
+                 templates are matched before prefixes, so the template would take the very \
+                 requests that conditioned route exists to except. Make the two provably \
+                 disjoint — some parameter must appear in one route's query_present and the \
+                 other's query_absent — or give them different paths or methods",
+                t_route.id, p_route.id
+            ),
+        );
+        return;
+    }
+    if template::contained_in_prefix(t, prefix) {
+        return;
+    }
+    errs.push(
+        location,
+        format!(
+            "path template {t_str:?} (route {:?}, routes[{t_index}]) overlaps path_prefix \
+             {prefix:?} (route {:?}, routes[{p_index}]) without lying entirely beneath it: \
+             templates are matched before prefixes, so this pair would split that prefix \
+             route's traffic on a boundary neither route states. Rewrite the prefix route as \
+             an all-literal path_template, or change one of the two so every path the template \
+             matches falls under the prefix",
+            t_route.id, p_route.id
+        ),
+    );
 }
 
 /// Whether the two routes' conditions can be *proven* mutually exclusive by the
@@ -1470,6 +1746,258 @@ routes:
         ] {
             assert!(validate(&parse(yaml), &base()).is_ok(), "{yaml}");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Path templates (spec §5.2)
+    // -----------------------------------------------------------------------
+
+    /// Two routes carrying the given inline match blocks. Both legacy-only, so
+    /// nothing but the match can produce an error.
+    fn two_routes(a: &str, b: &str) -> String {
+        format!(
+            r#"
+routes:
+  - id: first
+    match: {a}
+    legacy_upstream: "https://l"
+    mode: legacy_only
+  - id: second
+    match: {b}
+    legacy_upstream: "https://l"
+    mode: legacy_only
+"#
+        )
+    }
+
+    fn assert_accepted(yaml: &str) {
+        assert!(validate(&parse(yaml), &base()).is_ok(), "{yaml}");
+    }
+
+    /// The pair is refused and the message names *both* routes — an operator
+    /// cannot fix an ambiguity while looking at one half of it.
+    fn assert_pair_refused(yaml: &str) {
+        let errs = validate(&parse(yaml), &base()).unwrap_err();
+        assert!(
+            errs.iter()
+                .any(|e| e.location.contains("second") && e.message.contains("\"first\"")),
+            "{yaml}\n{errs:?}"
+        );
+    }
+
+    #[test]
+    fn a_match_names_its_paths_exactly_one_way() {
+        for m in [
+            r#"{ methods: ["GET"], path_prefix: "/a", path_template: "/a/{x}" }"#,
+            r#"{ methods: ["GET"] }"#,
+        ] {
+            let errs = errors(&two_routes(
+                m,
+                r#"{ methods: ["POST"], path_prefix: "/zzz" }"#,
+            ));
+            assert!(
+                errs.iter().any(|e| e.location.ends_with(".match")
+                    && e.message.contains("path_prefix")
+                    && e.message.contains("path_template")),
+                "{m}: {errs:?}"
+            );
+        }
+    }
+
+    /// Every syntax rule surfaces as a load-time error on the field that broke
+    /// it, rather than as a route that quietly matches nothing.
+    #[test]
+    fn an_unparseable_path_template_is_caught() {
+        for template in [
+            "/{a}",         // no literal segment
+            "/{a}/{b}",     // …still none
+            "/",            // the bare root
+            "/a/",          // trailing slash
+            "/a//b",        // empty segment
+            "/v{n}/x",      // parameter that does not span its segment
+            "/a/{id}/{id}", // duplicate name
+            "/a/{1id}",     // not an identifier
+            "a/{id}",       // no leading slash
+        ] {
+            let yaml = two_routes(
+                &format!(r#"{{ methods: ["GET"], path_template: "{template}" }}"#),
+                r#"{ methods: ["POST"], path_prefix: "/zzz" }"#,
+            );
+            let errs = errors(&yaml);
+            assert!(
+                errs.iter().any(|e| e.location.contains("path_template")),
+                "{template:?} should be rejected: {errs:?}"
+            );
+        }
+    }
+
+    /// A template that is strictly narrower than another is legal: the matcher
+    /// consults the narrower first, so there is exactly one answer.
+    #[test]
+    fn a_strictly_narrower_template_is_accepted() {
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            r#"{ methods: ["GET"], path_template: "/conversations/export" }"#,
+        ));
+        // Different segment counts cannot both match one path.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/a/{x}" }"#,
+            r#"{ methods: ["GET"], path_template: "/a/{x}/{y}" }"#,
+        ));
+        // Clashing literals in the same position.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/a/b/{x}" }"#,
+            r#"{ methods: ["GET"], path_template: "/a/c/{x}" }"#,
+        ));
+    }
+
+    /// Falsification (codex review, C1): a narrower UNCONDITIONED template
+    /// must not steal requests from a broader QUERY-CONDITIONED one. The
+    /// narrow shape wins the sort on every path it matches, so without this
+    /// rule `/oauth2/auth?login_verifier=x` would route to the narrow route
+    /// even though the broad route's condition was written to capture it —
+    /// the within-tier twin of the conditioned-prefix protection.
+    #[test]
+    fn a_narrower_template_cannot_steal_a_broader_conditioned_one() {
+        assert_pair_refused(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}", query_present: ["login_verifier"] }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth" }"#,
+        ));
+        // Orientation-independent: the narrow route listed first refuses too.
+        assert_pair_refused(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth" }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}", query_present: ["login_verifier"] }"#,
+        ));
+        // Control: provable query-disjointness makes the same pair legal —
+        // the narrow route can no longer receive the condition's requests.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}", query_present: ["login_verifier"] }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth", query_absent: ["login_verifier"] }"#,
+        ));
+        // Control: the reverse orientation — narrower CONDITIONED over a
+        // broader unconditioned fallback — is ordinary refinement.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}" }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth", query_present: ["login_verifier"] }"#,
+        ));
+    }
+
+    /// Co-matchable but incomparable: each template pins a segment the other
+    /// leaves open, so no order is defensible and Limen refuses to start.
+    #[test]
+    fn incomparable_templates_are_refused() {
+        for (a, b) in [("/a/{x}/c", "/a/b/{y}"), ("/a/{x}/{y}", "/{t}/b/c")] {
+            // The `query_present` on the second route shows that query
+            // conditions do not rescue this shape: the ambiguity is in the
+            // path, and the matcher orders on the path first.
+            assert_pair_refused(&two_routes(
+                &format!(r#"{{ methods: ["GET"], path_template: "{a}" }}"#),
+                &format!(r#"{{ methods: ["GET"], path_template: "{b}", query_present: ["v"] }}"#),
+            ));
+        }
+    }
+
+    /// Identical shapes fall back to the equal-prefix rules verbatim.
+    #[test]
+    fn identical_templates_follow_the_equal_prefix_rules() {
+        // Exactly one conditioned: the conditioned route wins, as at an equal
+        // prefix. Parameter names are not part of the shape.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}" }"#,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{verb}", query_present: ["v"] }"#,
+        ));
+        // Both conditioned and provably disjoint.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}", query_present: ["v"] }"#,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}", query_absent: ["v"] }"#,
+        ));
+        // Both conditioned, not provably disjoint.
+        assert_pair_refused(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}", query_present: ["a"] }"#,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}", query_present: ["b"] }"#,
+        ));
+        // Neither conditioned: nothing distinguishes them at all.
+        assert_pair_refused(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}" }"#,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{verb}" }"#,
+        ));
+    }
+
+    /// Disjoint methods make any path overlap moot.
+    #[test]
+    fn overlapping_paths_on_disjoint_methods_are_accepted() {
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/a/{x}/c" }"#,
+            r#"{ methods: ["POST"], path_template: "/a/b/{y}" }"#,
+        ));
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            r#"{ methods: ["POST"], path_prefix: "/conversations/export" }"#,
+        ));
+    }
+
+    /// A template that lies entirely under a prefix route refines it — the case
+    /// templates exist for — and is accepted from either config position.
+    #[test]
+    fn a_template_contained_in_a_prefix_route_is_accepted() {
+        for (a, b) in [
+            (
+                r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+                r#"{ methods: ["GET"], path_prefix: "/conversations/" }"#,
+            ),
+            (
+                r#"{ methods: ["GET"], path_prefix: "/" }"#,
+                r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            ),
+            // A prefix ending mid-segment still contains every path the
+            // template matches.
+            (
+                r#"{ methods: ["GET"], path_prefix: "/conv" }"#,
+                r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            ),
+            // …and one that cannot meet it at all.
+            (
+                r#"{ methods: ["GET"], path_prefix: "/voices/" }"#,
+                r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            ),
+        ] {
+            assert_accepted(&two_routes(a, b));
+        }
+    }
+
+    /// The prefix is longer than the template's literal head: the template
+    /// would take some of that route's traffic and leave the rest, on a
+    /// boundary neither route states.
+    #[test]
+    fn a_template_that_half_covers_a_prefix_route_is_refused() {
+        let yaml = two_routes(
+            r#"{ methods: ["GET"], path_template: "/conversations/{id}" }"#,
+            r#"{ methods: ["GET"], path_prefix: "/conversations/export" }"#,
+        );
+        assert_pair_refused(&yaml);
+        let errs = errors(&yaml);
+        // The message says what to do about it.
+        assert!(
+            errs.iter()
+                .any(|e| e.message.contains("all-literal path_template")),
+            "{errs:?}"
+        );
+    }
+
+    /// The verifier shape, verbatim: an unconditioned template over a
+    /// conditioned safety route must refuse to start, and the complementary
+    /// `query_absent` is what makes it legal.
+    #[test]
+    fn a_template_over_a_conditioned_prefix_route_needs_a_complementary_condition() {
+        let verifier = r#"{ methods: ["GET"], path_prefix: "/oauth2/auth", query_present: ["login_verifier"] }"#;
+        assert_pair_refused(&two_routes(
+            verifier,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}" }"#,
+        ));
+        assert_accepted(&two_routes(
+            verifier,
+            r#"{ methods: ["GET"], path_template: "/oauth2/{action}", query_absent: ["login_verifier"] }"#,
+        ));
     }
 
     #[test]

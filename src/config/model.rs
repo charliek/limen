@@ -399,15 +399,30 @@ pub struct RouteConfig {
     pub budget: Option<BudgetConfig>,
 }
 
-/// Match predicate: method + path prefix, optionally narrowed by which query
-/// parameters the request carries (longest prefix wins; spec §5.2).
+/// Match predicate: method + one path expression, optionally narrowed by which
+/// query parameters the request carries (spec §5.2).
+///
+/// The path expression is **either** a prefix (everything under it; longest
+/// wins) **or** a template (`/conversations/{id}` — one exact shape). Exactly
+/// one of the two, enforced in [`super::validate`]: a route carrying both would
+/// have no defensible meaning, and one carrying neither matches everything by
+/// accident.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteMatch {
     /// HTTP methods this route matches.
     pub methods: Vec<String>,
-    /// Path prefix this route matches.
-    pub path_prefix: String,
+    /// Path prefix this route matches. Mutually exclusive with
+    /// [`Self::path_template`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_prefix: Option<String>,
+    /// Path template this route matches, e.g. `/conversations/{id}`. Each
+    /// `{param}` spans one whole non-empty segment and the segment count is
+    /// exact, so a template names one shape rather than a subtree. Templates are
+    /// matched before prefixes (see [`crate::routing::matcher`]); mutually
+    /// exclusive with [`Self::path_prefix`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path_template: Option<String>,
     /// Query parameter names that must **all** be present for this route to
     /// match (presence only — values are irrelevant). Empty (the default) =
     /// unconditioned. Exists so a path whose hops are not equally safe to
@@ -429,6 +444,16 @@ impl RouteMatch {
     /// same prefix (spec §5.2).
     pub fn is_query_conditioned(&self) -> bool {
         !self.query_present.is_empty() || !self.query_absent.is_empty()
+    }
+
+    /// The path expression as written, for display. Validation guarantees
+    /// exactly one of the two fields is set; the placeholder exists only so a
+    /// printer cannot be handed a config that never loaded and panic.
+    pub fn path_display(&self) -> &str {
+        self.path_prefix
+            .as_deref()
+            .or(self.path_template.as_deref())
+            .unwrap_or("<no path>")
     }
 }
 
@@ -706,6 +731,74 @@ routes:
         assert_eq!(cfg.routes[1].r#match.query_present, vec!["login_verifier"]);
         assert_eq!(cfg.routes[1].r#match.query_absent, vec!["prompt"]);
         assert!(cfg.routes[1].r#match.is_query_conditioned());
+    }
+
+    #[test]
+    fn a_path_template_parses_and_is_exclusive_with_the_prefix() {
+        let yaml = r#"
+routes:
+  - id: conversation
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#;
+        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        assert_eq!(
+            cfg.routes[0].r#match.path_template.as_deref(),
+            Some("/conversations/{id}")
+        );
+        assert_eq!(cfg.routes[0].r#match.path_prefix, None);
+        assert_eq!(cfg.routes[0].r#match.path_display(), "/conversations/{id}");
+        // Both fields at once still *parses* — it is a semantic error, caught
+        // by `validate`, so the operator gets a message rather than a serde
+        // complaint about a field they did write.
+        let both: Config = serde_yaml::from_str(
+            r#"
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/a", path_template: "/a/{x}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#,
+        )
+        .unwrap();
+        assert!(both.routes[0].r#match.path_prefix.is_some());
+        assert!(both.routes[0].r#match.path_template.is_some());
+    }
+
+    /// Neither path field may serialize as an explicit `null`: `limen
+    /// suggest-routes` round-trips match blocks through this model, and a null
+    /// there would be both noise and a shape the loader would then have to
+    /// accept.
+    #[test]
+    fn an_unset_path_field_is_omitted_from_the_serialized_form() {
+        for (yaml, present, absent) in [
+            (
+                r#"match: { methods: ["GET"], path_template: "/a/{x}" }"#,
+                "path_template",
+                "path_prefix",
+            ),
+            (
+                r#"match: { methods: ["GET"], path_prefix: "/a" }"#,
+                "path_prefix",
+                "path_template",
+            ),
+        ] {
+            let cfg: Config = serde_yaml::from_str(&format!(
+                r#"
+routes:
+  - id: r
+    {yaml}
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#
+            ))
+            .unwrap();
+            let out = serde_yaml::to_string(&cfg).unwrap();
+            assert!(out.contains(present), "{out}");
+            assert!(!out.contains(absent), "{out}");
+            assert!(!out.contains("null"), "{out}");
+        }
     }
 
     #[test]

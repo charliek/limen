@@ -48,7 +48,8 @@ use tokio::time::Instant;
 use crate::config::model::{ComparisonConfig, Config, RouteConfig, RouteMode};
 use crate::observability::observe::{ObserveProfile, RouteProfile, OBSERVE_PROFILE_PATH};
 use crate::observability::prometheus::IN_FLIGHT;
-use crate::suggest::{self, Disposition, Reason, SuggestThresholds, Suggestion};
+use crate::routing::matcher::{basis_normalizes_paths, PathMatcher};
+use crate::suggest::{self, Disposition, Evidence, Reason, SuggestThresholds, Suggestion};
 use crate::verdict::Scrape;
 
 /// Exit code: a draft was emitted.
@@ -196,8 +197,9 @@ pub async fn run_suggest_routes(
     Ok(evaluate(config, &profile, opts))
 }
 
-/// The config supplies the route table; the profile supplies the sample rate.
-/// This is where the two are made to agree.
+/// The config supplies the route table; the profile supplies the sample rate
+/// and the matcher each route was profiled under. This is where the two are
+/// made to agree.
 ///
 /// The rate is not read from the config at all (see
 /// [`ObserveProfile::sample_rate`]), but the config still has to be *the
@@ -213,6 +215,7 @@ fn check_config_describes_the_profiled_proxy(
     config: &Config,
     profile: &ObserveProfile,
 ) -> Result<(), SuggestError> {
+    check_profile_consistency(profile)?;
     let Some(observe) = config.observe.as_ref() else {
         return Err(SuggestError::InputUnavailable(format!(
             "the configuration declares no `observe:` block, so it is not the configuration this \
@@ -232,6 +235,119 @@ fn check_config_describes_the_profiled_proxy(
              table cannot be trusted to describe the traffic",
             profile.sample_rate, observe.sample_rate
         )));
+    }
+    check_match_bases(config, profile)
+}
+
+/// Refuse a profile whose counters could not have come from the recorder
+/// (codex review, C3). The recorder only accrues stability evidence from
+/// upstream `2xx` reads, and only counts read transport errors among reads —
+/// so a document violating either arithmetic is corrupt or hand-edited, and
+/// classifying it would decide off numbers with no recorded meaning. The live
+/// path satisfies both by construction; this guards the `--profile` door.
+///
+/// `pub(crate)` so the classifier's structural sweep can prove that every shape
+/// it enumerates is one this door would admit: a sweep asserting invariants over
+/// documents the command refuses is a sweep of shapes nobody can send.
+pub(crate) fn check_profile_consistency(profile: &ObserveProfile) -> Result<(), SuggestError> {
+    for (id, route) in &profile.routes {
+        if route.read_transport_errors > route.reads {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: read_transport_errors ({}) exceeds reads ({}) — the recorder \
+                 counts read transport errors among reads, so this profile was not produced \
+                 by it. Re-profile",
+                route.read_transport_errors, route.reads
+            )));
+        }
+        // `length_varied` counts a SUBSET of `length_repeats` — the recorder
+        // bumps both on a repeat whose length moved — so it is not a third
+        // disjoint bucket to add in. Only the two disjoint ones consume a
+        // successful read each.
+        let accounted = route.length_repeats + route.length_missing;
+        let successes = crate::suggest::successful_reads(route);
+        if accounted > successes {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: {} repeats + {} reads without a length exceed the {} successful \
+                 reads that could have produced them — stability evidence accrues only from 2xx \
+                 reads, and each such read is counted once, so this profile was not produced by \
+                 the recorder. Re-profile",
+                route.length_repeats, route.length_missing, successes
+            )));
+        }
+        if route.length_varied > route.length_repeats {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: {} varied exceeds {} repeats — a length can only be seen to vary \
+                 on a repeat, and the recorder counts the repeat too, so this profile was not \
+                 produced by it. Re-profile",
+                route.length_varied, route.length_repeats
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Refuse a profile whose routes were matched by a different expression than
+/// this config declares.
+///
+/// The same argument as the sample rate, one level down. `distinct_read_paths`
+/// counts *paths* under a `path_prefix` route and *shapes* under a
+/// `path_template` one, so R7 and R8 read the identical number to opposite
+/// conclusions depending on a fact the number itself does not carry. A profile
+/// recorded before a route was templated therefore classifies as if the
+/// operator had never split it — silently, and in the unsafe direction: the
+/// per-id path spread that R7/R8 exist to catch reads as one tidy endpoint. It
+/// is not a discrepancy to average over but the wrong input, so the run stops.
+///
+/// Checked per route and only where both sides have one: a config route the
+/// profile never carried is classified against a zero-filled profile (landing
+/// on `no-observations`), and a profile id this config does not define is
+/// already reported as a warning by [`evaluate`].
+fn check_match_bases(config: &Config, profile: &ObserveProfile) -> Result<(), SuggestError> {
+    // A profile that shares NO route id with the configuration is some other
+    // proxy's profile; skipping every per-route comparison must not read as
+    // agreement (absence is never evidence). Partial overlap stays legal —
+    // routes added or removed between capture and this run are a normal
+    // workflow, and each unmatched side is handled on its own terms.
+    let any_shared = config
+        .routes
+        .iter()
+        .any(|r| profile.routes.contains_key(&r.id));
+    if !config.routes.is_empty() && !profile.routes.is_empty() && !any_shared {
+        return Err(SuggestError::InputUnavailable(format!(
+            "the profile's routes ({}) share no id with this configuration's routes — this is \
+             not a profile of the configured proxy, so none of its counts describe these \
+             routes. Point --profile/-c at a matching pair",
+            profile
+                .routes
+                .keys()
+                .map(|k| format!("{k:?}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    for route in &config.routes {
+        let Some(observed) = profile.routes.get(&route.id) else {
+            continue;
+        };
+        // Compiled through the same code the proxy compiled its table with, so
+        // the two bases cannot disagree over spelling — only over substance.
+        let configured = PathMatcher::compile(&route.id, &route.r#match)
+            .map_err(|e| {
+                SuggestError::InputUnavailable(format!(
+                    "route {:?} has no usable match expression: {e}",
+                    route.id
+                ))
+            })?
+            .basis();
+        if configured != observed.match_basis {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {:?} was profiled as {:?} but this configuration declares {:?} — the \
+                 profile's path counts were recorded against a matcher this config no longer \
+                 uses, so they do not mean what the classifier would read them as. Re-profile \
+                 against this configuration",
+                route.id, observed.match_basis, configured
+            )));
+        }
     }
     Ok(())
 }
@@ -852,6 +968,11 @@ fn headline(suggestion: &Suggestion) -> String {
             "{} distinct paths across {} reads — ids or tokens are in the path",
             e.distinct_read_paths, e.reads
         ),
+        Reason::NoSuccessEvidence => format!(
+            "no read ever succeeded ({}) — the only bodies observed were failures, so nothing \
+             here describes what the route serves",
+            status_mix(e)
+        ),
         Reason::BodyVaries => format!(
             "{} repeated request(s) came back at a different Content-Length",
             e.length_varied
@@ -878,23 +999,11 @@ fn headline(suggestion: &Suggestion) -> String {
     }
 }
 
-/// The evidence items, in the order a reader wants them.
-fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
-    let e = &suggestion.evidence;
-    let mut items = vec![
-        format!("{} reads / {} writes", e.reads, e.writes),
-        format!(
-            "{}{} path{}",
-            e.distinct_read_paths,
-            if e.distinct_read_paths_overflow {
-                "+"
-            } else {
-                ""
-            },
-            if e.distinct_read_paths == 1 { "" } else { "s" }
-        ),
-    ];
-    items.push(if e.status_classes.is_empty() {
+/// The read status mix, as the evidence line renders it — and as R8a's headline
+/// quotes it, since "no read ever succeeded" is a claim about this map and a
+/// reader should not have to scan down to the evidence to see which failures.
+fn status_mix(e: &Evidence) -> String {
+    if e.status_classes.is_empty() {
         "no read status recorded".to_string()
     } else if e.status_classes.len() == 1 {
         format!(
@@ -907,7 +1016,34 @@ fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
             .map(|(class, n)| format!("{class}×{n}"))
             .collect::<Vec<_>>()
             .join(" ")
-    });
+    }
+}
+
+/// The evidence items, in the order a reader wants them.
+fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
+    let e = &suggestion.evidence;
+    // Said out loud, because "1 path" on a route serving thousands of ids is
+    // otherwise the most misreadable number on the page: the template folded
+    // them, and the path-spread rules had nothing left to see.
+    let normalized = if basis_normalizes_paths(&e.match_basis) {
+        " (template-normalized)"
+    } else {
+        ""
+    };
+    let mut items = vec![
+        format!("{} reads / {} writes", e.reads, e.writes),
+        format!(
+            "{}{} path{}{normalized}",
+            e.distinct_read_paths,
+            if e.distinct_read_paths_overflow {
+                "+"
+            } else {
+                ""
+            },
+            if e.distinct_read_paths == 1 { "" } else { "s" },
+        ),
+    ];
+    items.push(status_mix(e));
     items.push(if e.content_types.is_empty() {
         "no content-type recorded".to_string()
     } else {
@@ -945,7 +1081,17 @@ fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
         },
     );
     if e.transport_errors > 0 {
-        items.push(format!("{} transport errors", e.transport_errors));
+        // Both numbers when they differ: R8a's carve-out is read-scoped, so a
+        // reader checking why a route with transport errors still demoted (or
+        // still did not) needs to see which of the two the rule looked at.
+        items.push(if e.read_transport_errors == e.transport_errors {
+            format!("{} transport errors", e.transport_errors)
+        } else {
+            format!(
+                "{} transport errors ({} on reads)",
+                e.transport_errors, e.read_transport_errors
+            )
+        });
     }
     if !e.one_time_token_names_configured.is_empty() {
         items.push(format!(
@@ -1358,6 +1504,44 @@ routes:
         assert!(!contains_null(&parsed), "{draft}");
     }
 
+    /// A templated route survives the draft verbatim: the match block is
+    /// carried forward, so the emitted document must name the template and must
+    /// not have grown a `path_prefix:` key (null or otherwise) on its way
+    /// through the model.
+    #[test]
+    fn a_templated_route_round_trips_through_the_draft() {
+        let config = matched_config("path_template", "/conversations/{id}");
+        let draft = draft_of(
+            &config,
+            &candidate_profile("conversation"),
+            &DraftOptions {
+                new_upstream: Some("http://new.internal".to_string()),
+                adopt: true,
+                ..DraftOptions::default()
+            },
+        );
+        let parsed = assert_valid(&draft);
+        assert_eq!(
+            parsed.routes[0].r#match.path_template.as_deref(),
+            Some("/conversations/{id}")
+        );
+        assert_eq!(parsed.routes[0].r#match.path_prefix, None);
+        // Not merely absent from the parse — absent from the text an operator
+        // reads. Comment lines are excluded: the draft's prose mentions the
+        // field by name.
+        let emitted: String = draft
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("path_template: /conversations/{id}"),
+            "{draft}"
+        );
+        assert!(!emitted.contains("path_prefix"), "{draft}");
+        assert!(!emitted.contains("null"), "{draft}");
+    }
+
     #[test]
     fn a_route_with_no_new_upstream_is_drafted_legacy_only() {
         let config = config_from(
@@ -1570,6 +1754,48 @@ routes:
     }
 
     #[test]
+    fn an_all_error_route_names_its_status_mix_in_the_headline() {
+        // R8a's claim is about the status map, so the map is quoted where the
+        // claim is made: a reader must not have to reconcile "no read ever
+        // succeeded" against an evidence line further down to see which
+        // failures the route served.
+        let config = hostile_config();
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.status_classes = BTreeMap::from([("4xx".to_string(), 30), ("5xx".to_string(), 4)]);
+        // No successes, therefore no stability evidence — the shape a
+        // success-qualified recorder emits, and the only one this command's own
+        // door would let through to be rendered.
+        route.length_repeats = 0;
+        assert!(check_profile_consistency(&profile).is_ok());
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(
+            draft.contains("SUGGESTED: relay_only (no-success-evidence)"),
+            "{draft}"
+        );
+        assert!(draft.contains("no read ever succeeded"), "{draft}");
+        assert!(draft.contains("4xx×30 5xx×4"), "{draft}");
+    }
+
+    #[test]
+    fn transport_errors_are_reported_read_scoped_when_the_two_counts_differ() {
+        // The number R8a's carve-out actually consulted, beside the one a
+        // reader would otherwise assume it consulted.
+        let config = hostile_config();
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.writes = 20;
+        route.observations = 54;
+        route.transport_errors = 20;
+        route.read_transport_errors = 0;
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(
+            draft.contains("20 transport errors (0 on reads)"),
+            "{draft}"
+        );
+    }
+
+    #[test]
     fn the_confirm_caveat_rides_on_narrowed_as_well_as_candidate() {
         let config = hostile_config();
         let mut profile = candidate_profile("pat-validate");
@@ -1636,6 +1862,307 @@ routes:
         assert!(
             check_config_describes_the_profiled_proxy(&hostile_config(), &empty_profile()).is_ok()
         );
+    }
+
+    /// A profile whose one route carries exactly the counters given, on top of
+    /// the candidate-shaped baseline. The consistency check reads four fields,
+    /// so the fixtures state all four rather than inheriting any of them.
+    fn profile_with(
+        reads: u64,
+        status: &[(&str, u64)],
+        read_transport_errors: u64,
+        stability: (u64, u64, u64),
+    ) -> ObserveProfile {
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.observations = reads;
+        route.reads = reads;
+        route.status_classes = status
+            .iter()
+            .map(|(class, n)| ((*class).to_string(), *n))
+            .collect();
+        route.read_transport_errors = read_transport_errors;
+        route.length_repeats = stability.0;
+        route.length_varied = stability.1;
+        route.length_missing = stability.2;
+        profile
+    }
+
+    #[test]
+    fn stability_counters_that_no_success_could_have_produced_are_refused() {
+        // Codex's shape: every read answered 5xx and every read was withheld by
+        // transport, yet the document claims eleven stable repeats. Under a
+        // success-qualified recorder those eleven cannot exist — and left to
+        // classify, the shape used the carve-out to slip past R8a and reached
+        // compare_candidate on repeats of a body no upstream ever sent. The
+        // arithmetic is the tell, so the door reads the arithmetic.
+        let profile = profile_with(12, &[("5xx", 12)], 12, (11, 0, 0));
+        let err = check_profile_consistency(&profile).expect_err("corrupt counters must refuse");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        // The operator has to be able to act on this: which route, which
+        // numbers, and which arithmetic they violated.
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("11 repeats"), "{message}");
+        assert!(message.contains("0 successful reads"), "{message}");
+        assert!(message.contains("2xx"), "{message}");
+        // Zero successes cannot account for a single repeat, so the shape stays
+        // refused under the corrected arithmetic rather than only under the
+        // over-strict sum it was first written against.
+        assert!(
+            check_profile_consistency(&profile_with(12, &[("5xx", 12)], 12, (1, 0, 0))).is_err()
+        );
+        // And it refuses through the front door too, not merely when called
+        // directly — this is the check that has to run before classification.
+        assert!(check_config_describes_the_profiled_proxy(&hostile_config(), &profile).is_err());
+    }
+
+    #[test]
+    fn the_disjoint_stability_counters_are_weighed_together() {
+        // Repeats and length-less reads are disjoint — a successful read is one
+        // or the other, never both — so each consumes a success and they are
+        // weighed as a pair. Individually under the success count, together
+        // over it.
+        let profile = profile_with(12, &[("2xx", 4), ("4xx", 8)], 0, (3, 0, 2));
+        let err = check_profile_consistency(&profile).expect_err("the pair must be weighed");
+        let message = err.to_string();
+        assert!(message.contains("3 repeats"), "{message}");
+        assert!(message.contains("2 reads without a length"), "{message}");
+        assert!(message.contains("4 successful reads"), "{message}");
+    }
+
+    #[test]
+    fn a_length_that_varied_more_often_than_it_repeated_is_refused() {
+        // The other half of the corrected arithmetic. A length can only be seen
+        // to move on a repeat, and the recorder counts that repeat too, so
+        // `varied > repeats` describes an increment that has no read behind it.
+        let profile = profile_with(12, &[("2xx", 12)], 0, (2, 3, 0));
+        let err = check_profile_consistency(&profile).expect_err("varied cannot outrun repeats");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("3 varied"), "{message}");
+        assert!(message.contains("2 repeats"), "{message}");
+    }
+
+    #[test]
+    fn more_read_transport_errors_than_reads_is_refused() {
+        // The read-scoped counter is a subset of the reads by construction, so
+        // a document where it exceeds them is one the recorder cannot have
+        // written — and the excess points the wrong way: it would arm R8a's
+        // carve-out on a route whose reads were answered.
+        let profile = profile_with(6, &[("4xx", 6)], 7, (0, 0, 0));
+        let err = check_profile_consistency(&profile).expect_err("an impossible subset refuses");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("read_transport_errors (7)"), "{message}");
+        assert!(message.contains("reads (6)"), "{message}");
+    }
+
+    #[test]
+    fn a_profile_the_recorder_could_have_written_passes() {
+        // The control the refusals need. Three shapes a real run produces: a
+        // clean candidate, a route whose reads all failed at the upstream (the
+        // R8a shape, whose stability counters are consequently zero), and one
+        // whose reads were withheld by transport.
+        for (name, profile) in [
+            (
+                "a stable candidate",
+                profile_with(12, &[("2xx", 12)], 0, (11, 0, 0)),
+            ),
+            (
+                "errors only, and therefore no stability evidence",
+                profile_with(12, &[("4xx", 12)], 0, (0, 0, 0)),
+            ),
+            (
+                "every read withheld by transport",
+                profile_with(12, &[("5xx", 12)], 12, (0, 0, 0)),
+            ),
+        ] {
+            assert!(
+                check_profile_consistency(&profile).is_ok(),
+                "{name} must classify"
+            );
+        }
+    }
+
+    #[test]
+    fn stability_exactly_accounted_for_by_the_successes_passes() {
+        // The boundary is inclusive: twelve successful reads of one fingerprint
+        // are one first sighting and eleven repeats, plus a twelfth read to
+        // reach the ceiling. Refusing at equality would refuse the densest
+        // legitimate profile there is.
+        let exact = profile_with(12, &[("2xx", 12)], 0, (12, 0, 0));
+        assert!(check_profile_consistency(&exact).is_ok());
+        // Every repeat also varied — a route whose body changes on every call,
+        // which is R9's whole subject. `varied` rides *on* those same repeats
+        // rather than consuming reads of its own, so this is the shape a real
+        // recorder emits and it must not be read as 22 reads' worth of
+        // evidence. (The over-strict sum this check was first written with
+        // refused exactly this, and slauth's observe-golden run against a live
+        // `pat-list` route hit it: 3 successes behind 2 repeats + 2 varied.)
+        let every_repeat_varied = profile_with(12, &[("2xx", 12)], 0, (11, 11, 0));
+        assert!(check_profile_consistency(&every_repeat_varied).is_ok());
+        let split = profile_with(12, &[("2xx", 8), ("4xx", 4)], 4, (5, 5, 3));
+        assert!(check_profile_consistency(&split).is_ok());
+        // One past it is not.
+        let over = profile_with(12, &[("2xx", 12)], 0, (12, 0, 1));
+        assert!(check_profile_consistency(&over).is_err());
+    }
+
+    #[test]
+    fn the_field_shape_that_caught_the_arithmetic_passes() {
+        // The regression, verbatim from slauth's observe-golden run against its
+        // real `pat-list` route: four reads, three of them successful, two
+        // repeats and both of them varied. The recorder produced this document;
+        // a check that refused it was wrong about the recorder, not the other
+        // way round.
+        let profile = profile_with(4, &[("2xx", 3), ("4xx", 1)], 0, (2, 2, 0));
+        assert!(
+            check_profile_consistency(&profile).is_ok(),
+            "the door must admit a document the recorder actually wrote"
+        );
+        // And it classifies rather than merely parsing. Four reads is below the
+        // default floor, so the golden route's own answer is R3 — the door's
+        // job here was to let the rules speak at all.
+        let outcome = evaluate(&hostile_config(), &profile, &opts());
+        assert_eq!(outcome.suggestions[0].reason, Reason::InsufficientReads);
+        // The same arithmetic above the floor lands on R9, which is what a
+        // route whose body moves on every repeat should be told.
+        let above_the_floor = profile_with(13, &[("2xx", 12), ("4xx", 1)], 0, (2, 2, 0));
+        let outcome = evaluate(&hostile_config(), &above_the_floor, &opts());
+        assert_eq!(outcome.suggestions[0].reason, Reason::BodyVaries);
+    }
+
+    /// A one-route config whose route matches `path` written as `field`.
+    fn matched_config(field: &str, path: &str) -> Config {
+        config_from(&format!(
+            r#"
+observe: {{}}
+routes:
+  - id: conversation
+    match: {{ methods: ["GET"], {field}: "{path}" }}
+    legacy_upstream: "http://legacy.internal"
+    mode: legacy_only
+"#
+        ))
+    }
+
+    /// `candidate_profile`, recorded under a named matcher — the provenance the
+    /// stale-profile check reads.
+    fn candidate_profile_matched(route_id: &str, basis: &str) -> ObserveProfile {
+        let mut profile = candidate_profile(route_id);
+        profile.routes.get_mut(route_id).expect("route").match_basis = basis.to_string();
+        profile
+    }
+
+    /// The three ways a route's matcher can move under a profile that has
+    /// already been recorded. Each is refused, because the profile's path
+    /// counts were taken against a matcher that is no longer in force and the
+    /// classifier would read them as if it were.
+    #[test]
+    fn a_profile_recorded_under_a_different_matcher_is_input_unavailable() {
+        for (field, path, recorded) in [
+            // A route that was templated after the profile was taken: the
+            // recorded per-id path spread would read as one tidy endpoint.
+            (
+                "path_template",
+                "/conversations/{id}",
+                "prefix:/conversations/",
+            ),
+            // …and the reverse: a count of one shape read as a count of one
+            // path, which is the same mistake pointing the other way.
+            (
+                "path_prefix",
+                "/conversations/",
+                "template:/conversations/{id}",
+            ),
+            // The template itself moved. `{id}` and `{id}/messages` are
+            // different operations, and their profiles are not interchangeable.
+            (
+                "path_template",
+                "/conversations/{id}",
+                "template:/conversations/{id}/messages",
+            ),
+        ] {
+            let config = matched_config(field, path);
+            let profile = candidate_profile_matched("conversation", recorded);
+            let err = check_config_describes_the_profiled_proxy(&config, &profile)
+                .expect_err("a profile recorded under another matcher must be refused");
+            assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+            let message = err.to_string();
+            // Named in full: the operator has to be able to tell which of the
+            // two ran ahead of the other.
+            assert!(message.contains("conversation"), "{message}");
+            assert!(message.contains(recorded), "{message}");
+            assert!(message.contains(path), "{message}");
+        }
+    }
+
+    #[test]
+    fn a_profile_recorded_under_the_configured_matcher_passes() {
+        // The control the three refusals above need: the check is not simply
+        // refusing every templated route.
+        for (field, path, recorded) in [
+            (
+                "path_template",
+                "/conversations/{id}",
+                "template:/conversations/{id}",
+            ),
+            ("path_prefix", "/conversations/", "prefix:/conversations/"),
+        ] {
+            let config = matched_config(field, path);
+            let profile = candidate_profile_matched("conversation", recorded);
+            assert!(
+                check_config_describes_the_profiled_proxy(&config, &profile).is_ok(),
+                "{recorded} must classify against {field} {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_route_the_profile_never_carried_is_not_a_basis_mismatch() {
+        // It is classified against a zero-filled profile and lands on
+        // `no-observations`. Refusing the whole run because a route saw no
+        // traffic would make the command unusable on any config with a quiet
+        // route in it.
+        let config = matched_config("path_template", "/conversations/{id}");
+        assert!(check_config_describes_the_profiled_proxy(&config, &empty_profile()).is_ok());
+    }
+
+    #[test]
+    fn a_profile_sharing_no_route_id_with_the_config_is_refused() {
+        // codex review (C2): with a fully disjoint id set every per-route
+        // basis comparison is skipped, and zero comparisons must not read as
+        // agreement — this is some other proxy's profile. Partial overlap
+        // stays legal (see the quiet-route test above).
+        let config = matched_config("path_template", "/conversations/{id}");
+        let profile = candidate_profile_matched("some-other-service", "prefix:/api/");
+        let err = check_config_describes_the_profiled_proxy(&config, &profile)
+            .expect_err("disjoint ids must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("share no id"), "{msg}");
+        assert!(msg.contains("some-other-service"), "{msg}");
+    }
+
+    #[test]
+    fn a_templated_routes_path_count_is_labelled_as_normalized() {
+        // "1 path" on a route that served thousands of conversations is true
+        // and, unlabelled, deeply misleading — the template folded them, which
+        // is also why the path-spread rules stayed quiet.
+        let config = matched_config("path_template", "/conversations/{id}");
+        let profile = candidate_profile_matched("conversation", "template:/conversations/{id}");
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(draft.contains("1 path (template-normalized)"), "{draft}");
+
+        // A prefix route's count is not relabelled: there it really is a count
+        // of distinct paths.
+        let config = matched_config("path_prefix", "/conversations/");
+        let profile = candidate_profile_matched("conversation", "prefix:/conversations/");
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(draft.contains("1 path"), "{draft}");
+        assert!(!draft.contains("template-normalized"), "{draft}");
     }
 
     #[test]

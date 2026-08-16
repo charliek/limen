@@ -423,6 +423,106 @@ async fn sampling_at_zero_observes_nothing() {
     assert_eq!(route["reads"], 0);
 }
 
+/// The traffic shape the field run produced: reads spread over eight
+/// conversations, four of which also had their messages listed. Twelve distinct
+/// concrete paths, two operations.
+async fn drive_conversation_traffic(data: &Router) {
+    for n in 0..8 {
+        assert_eq!(get(data, &format!("/conversations/c{n}")).await.0, 200);
+    }
+    for n in 0..4 {
+        assert_eq!(
+            get(data, &format!("/conversations/c{n}/messages")).await.0,
+            200
+        );
+    }
+}
+
+#[tokio::test]
+async fn one_prefix_route_folds_every_conversation_into_one_profile() {
+    // The control, and today's behavior unchanged: under a prefix the recorder
+    // counts concrete paths, because under a prefix that count is the only
+    // evidence available that the route is a subtree rather than an endpoint.
+    let legacy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&legacy)
+        .await;
+    let cfg = config_from_yaml(&format!(
+        r#"
+observe: {{}}
+routes:
+  - id: folded-conversations
+    match: {{ methods: ["GET"], path_prefix: "/conversations/" }}
+    legacy_upstream: "{legacy}"
+    mode: legacy_only
+"#,
+        legacy = legacy.uri()
+    ));
+    let (data, control) = planes(&cfg);
+    drive_conversation_traffic(&data).await;
+
+    let route = &profile(&control).await["routes"]["folded-conversations"];
+    assert_eq!(route["reads"], 12);
+    // Twelve ids and message lists in one number, which is what makes the
+    // classifier read this route as a wildcard proxy rather than an endpoint.
+    assert_eq!(route["distinct_read_paths"], 12);
+    assert_eq!(route["match_basis"], "prefix:/conversations/");
+}
+
+#[tokio::test]
+async fn two_templated_routes_split_the_same_traffic_per_operation() {
+    // The after: the identical traffic, with the operator naming the two shapes
+    // it actually contains. Each route reports its own reads and exactly one
+    // distinct path — the template absorbed the ids, which is what it is for.
+    let legacy = MockServer::start().await;
+    Mock::given(method("GET"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&legacy)
+        .await;
+    let cfg = config_from_yaml(&format!(
+        r#"
+observe: {{}}
+routes:
+  - id: split-conversation
+    match: {{ methods: ["GET"], path_template: "/conversations/{{id}}" }}
+    legacy_upstream: "{legacy}"
+    mode: legacy_only
+  - id: split-messages
+    match: {{ methods: ["GET"], path_template: "/conversations/{{id}}/messages" }}
+    legacy_upstream: "{legacy}"
+    mode: legacy_only
+"#,
+        legacy = legacy.uri()
+    ));
+    let (data, control) = planes(&cfg);
+    drive_conversation_traffic(&data).await;
+
+    let document = profile(&control).await;
+    let conversation = &document["routes"]["split-conversation"];
+    assert_eq!(conversation["reads"], 8);
+    assert_eq!(conversation["distinct_read_paths"], 1);
+    assert_eq!(conversation["match_basis"], "template:/conversations/{id}");
+
+    let messages = &document["routes"]["split-messages"];
+    assert_eq!(messages["reads"], 4);
+    assert_eq!(messages["distinct_read_paths"], 1);
+    assert_eq!(
+        messages["match_basis"],
+        "template:/conversations/{id}/messages"
+    );
+
+    // Normalization stops at the path count: eight *different* conversations
+    // are not eight repeats of one request, so nothing here manufactures the
+    // stability evidence candidacy rests on.
+    assert_eq!(conversation["length_repeats"], 0);
+    assert_eq!(conversation["length_varied"], 0);
+
+    // And still no path on the wire, templated or not.
+    let rendered = document.to_string();
+    assert!(!rendered.contains("/conversations/c0"), "{rendered}");
+}
+
 #[tokio::test]
 async fn the_observation_counter_is_zero_registered_per_route() {
     let legacy = MockServer::start().await;

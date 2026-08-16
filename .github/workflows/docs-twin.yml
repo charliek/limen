@@ -1,0 +1,116 @@
+# Shared-docs twin check (refinement phase 05, gap-list item 4): four docs
+# are committed byte-identically in both Limen and Pharos — each repo's own
+# spec (whose upstream is that repo), plus runbook.md and prfaq.md (upstream:
+# limen, per each repo's CLAUDE.md). A same-repo hash can't catch the twin
+# going stale on the *other* side, so this job fetches the sibling repo's
+# main-branch copy of each doc and byte-compares it against ours.
+#
+# This file is itself byte-identical in both repos (the docs.yml/docs-pr.yml
+# precedent), which is why the sibling is derived from the repository name
+# rather than hardcoded. It is DELIBERATELY its own workflow, not a job in
+# ci.yml: it must never join the ci-success aggregator that branch rulesets
+# gate on. Non-required by design — a red run during the normal
+# trailing-sync window (one repo's copy updated, the other's sync PR not yet
+# merged) is expected and informative, not a merge blocker.
+#
+# Unlike the lockstep-twin fixture job there is NO bootstrap tolerance: all
+# four docs already exist in both repos, so a 404 means deletion or renaming
+# on the sibling and must fail loudly, never pass as "not present yet".
+name: docs-twin
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/limen_spec.md"
+      - "docs/pharos_spec.md"
+      - "docs/runbook.md"
+      - "docs/prfaq.md"
+      - ".github/workflows/docs-twin.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "docs/limen_spec.md"
+      - "docs/pharos_spec.md"
+      - "docs/runbook.md"
+      - "docs/prfaq.md"
+      - ".github/workflows/docs-twin.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: docs-twin-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-twin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Compare the four shared docs against the sibling repo's main
+        env:
+          # Prefer a PAT with cross-repo read access if one is configured;
+          # the default GITHUB_TOKEN is scoped to this repo only and cannot
+          # be assumed to read another private repo.
+          GH_TOKEN: ${{ secrets.LOCKSTEP_TOKEN || secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          owner="${REPO%/*}"
+          case "${REPO##*/}" in
+            limen)  sibling="${owner}/pharos" ;;
+            pharos) sibling="${owner}/limen" ;;
+            *)
+              echo "::error::docs-twin only knows the limen/pharos pair; running in ${REPO}."
+              exit 1
+              ;;
+          esac
+
+          # Probe the sibling repo before the per-file loop so an access
+          # problem (missing/underscoped token, repo gone private) fails
+          # here, distinctly, rather than as four confusing per-file errors.
+          repo_err="$(mktemp)"
+          if ! gh api "repos/${sibling}" > /dev/null 2> "$repo_err"; then
+            echo "::error::Could not read ${sibling}: access denied (or the repo does not exist / is not visible to this token). The default GITHUB_TOKEN cannot read another private repo. Add a PAT with read access to ${sibling} as the 'LOCKSTEP_TOKEN' repo secret."
+            cat "$repo_err"
+            rm -f "$repo_err"
+            exit 1
+          fi
+          rm -f "$repo_err"
+
+          fail=0
+          for f in limen_spec.md pharos_spec.md runbook.md prfaq.md; do
+            path="docs/${f}"
+            tmp="$(mktemp)"
+
+            status=0
+            gh api \
+              -H "Accept: application/vnd.github.raw" \
+              "repos/${sibling}/contents/${path}?ref=main" \
+              > "$tmp" 2> "${tmp}.err" || status=$?
+
+            if [ "$status" -ne 0 ]; then
+              # All four docs exist in both repos; a 404 here is deletion or
+              # renaming on the sibling, not a bootstrap window.
+              echo "::error::Could not fetch ${sibling} ${path} (deleted, renamed, or API failure):"
+              cat "${tmp}.err"
+              fail=1
+              rm -f "$tmp" "${tmp}.err"
+              continue
+            fi
+            rm -f "${tmp}.err"
+
+            if ! cmp -s "$path" "$tmp"; then
+              echo "::error::Shared-doc drift: ${REPO} ${path} differs from ${sibling} ${path} on main. Fix the doc in its upstream repo (each spec lives in its own repo; runbook.md and prfaq.md live in limen) and re-sync the copy — see both repos' CLAUDE.md."
+              diff -u "$path" "$tmp" || true
+              fail=1
+            else
+              echo "OK: ${path} matches ${sibling}"
+            fi
+            rm -f "$tmp"
+          done
+
+          exit "$fail"

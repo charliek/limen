@@ -15,6 +15,24 @@
 //!   are distinguishable without a metrics round-trip. Traffic never adds a
 //!   key — an unknown route id is dropped rather than inserted, so the map's
 //!   key set is exactly the config's.
+//! - **A count is only as meaningful as the matcher that produced it.** A
+//!   templated route (`/conversations/{id}`) folds every id into one shape for
+//!   the distinct-read-path count — absorbing that cardinality is what the
+//!   template is for, and re-counting the ids underneath it would report the
+//!   number the operator wrote the template to stop reporting. So each route
+//!   records the matcher it was profiled under ([`RouteProfile::match_basis`]),
+//!   and `limen suggest-routes` refuses a profile whose basis its config
+//!   contradicts. The *stability* fingerprint is deliberately exempt and stays
+//!   on the raw concrete path: two different resources must never register as
+//!   one request repeating.
+//! - **Only successes vouch.** The stability map admits upstream reads whose
+//!   status class is [`prometheus::SUCCESS_STATUS_CLASS`] and nothing else,
+//!   because a fixed-length 404 page repeating is not evidence about the body
+//!   the operation returns when it works. Every *danger* counter stays
+//!   all-reads:
+//!   an error response can still condemn a route (it lands in
+//!   [`RouteProfile::status_classes`], where the classifier's R8a reads it),
+//!   it just cannot vouch for one.
 //! - **No wall clock, canonical order.** [`ObserveProfile`] is `BTreeMap`
 //!   -ordered throughout and carries no timestamp, uptime, or counter that
 //!   advances without traffic, so two scrapes of an idle proxy are
@@ -61,6 +79,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::model::ObserveConfig;
 use crate::http::shadow;
 use crate::observability::prometheus;
+use crate::routing::PathMatcher;
 
 /// Control-plane path the observe profile is served from.
 ///
@@ -193,6 +212,24 @@ pub struct ObserveProfile {
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RouteProfile {
+    /// The matcher this route was profiled under, verbatim: `prefix:/devices`
+    /// or `template:/conversations/{id}` (see
+    /// [`crate::routing::PathMatcher::basis`]).
+    ///
+    /// **The sample-rate precedent applied to the matcher.** It travels with
+    /// the document because the proxy that recorded it is the only party that
+    /// knows it: under a template, `distinct_read_paths` counts *shapes* and
+    /// under a prefix it counts *paths*, so the same number means two different
+    /// things and the classifier's wildcard/opaque-path rules read it
+    /// differently. A tool that re-derived the basis from whatever config it
+    /// was handed would silently reinterpret a profile recorded before the
+    /// route was templated; `limen suggest-routes` compares the two instead and
+    /// refuses the run when they disagree.
+    ///
+    /// Required on the wire like every field here — a profile from a binary
+    /// that predates this field must fail to parse rather than default to a
+    /// basis nobody recorded.
+    pub match_basis: String,
     /// Responses served on this route (after sampling), successes and failures
     /// alike, so this reconciles against `limen_requests_total`.
     pub observations: u64,
@@ -204,7 +241,23 @@ pub struct RouteProfile {
     /// ([`ResponseOrigin::UpstreamSilent`]), so limen synthesized the status.
     /// Reported by `dispatch` rather than inferred from the response, which
     /// cannot tell a relayed 502 from a synthesized one.
+    ///
+    /// **All observations, reads and writes alike** — the one counter here that
+    /// is not read-scoped, because a silent upstream is a fact about the
+    /// upstream rather than about the route's reads. See
+    /// [`Self::read_transport_errors`] for the read-scoped half.
     pub transport_errors: u64,
+    /// The read-scoped subset of [`Self::transport_errors`]: reads where the
+    /// upstream never answered.
+    ///
+    /// Recorded separately because the whole-route counter cannot answer the
+    /// question a read rule needs to ask. The classifier's R8a carve-out is
+    /// "did *every read* fail to reach an upstream" — withheld evidence only
+    /// withholds — and a route whose writes are timing out while its reads are
+    /// answering 404 has a `transport_errors` larger than its `reads` without a
+    /// single read having been withheld. Compared against `reads`, the
+    /// unscoped counter would silently disarm the rule on exactly that route.
+    pub read_transport_errors: u64,
     /// Request method → count, bounded by [`KNOWN_METHODS`].
     pub methods: BTreeMap<String, u64>,
     /// Distinct query-parameter **names** seen on reads. Names only — a value
@@ -215,6 +268,12 @@ pub struct RouteProfile {
     /// than [`MAX_QUERY_PAIRS_SCANNED`] pairs, so this set is a floor.
     pub query_names_overflow: bool,
     /// How many distinct paths this route's reads hit. A count, never a path.
+    ///
+    /// Counted over [`crate::routing::PathMatcher::observed_path`], so a
+    /// templated route reports the number of distinct *shapes* it matched —
+    /// which is always `1`, since a template names exactly one. Read it
+    /// together with [`Self::match_basis`], which says which of the two
+    /// questions this number answers.
     pub distinct_read_paths: u64,
     /// A new path arrived past `observe.max_path_shapes`, so the count above
     /// is a floor rather than the truth.
@@ -233,14 +292,32 @@ pub struct RouteProfile {
     pub redirect_reads: u64,
     /// Upstream read responses carrying a `Location` header.
     pub location_reads: u64,
-    /// Reads whose request fingerprint had been seen before *and* whose
-    /// upstream response carried a `Content-Length` both times.
+    /// Successful reads whose request fingerprint had been seen before *and*
+    /// whose upstream response carried a `Content-Length` both times.
+    ///
+    /// **Success-qualified**, like the two fields below: only upstream reads
+    /// whose status class is [`prometheus::SUCCESS_STATUS_CLASS`] enter the
+    /// stability map at all. An error response says nothing about how the
+    /// operation's normal body behaves — a 404 page is a fixed length on every
+    /// route that has one, so counting it manufactures exactly the affirmative
+    /// evidence candidacy rests on out of a route that has never once
+    /// succeeded. Errors stay fully
+    /// visible to every *danger* signal ([`Self::status_classes`], the redirect
+    /// and cookie counters, the query names, the distinct-path count), which is
+    /// the asymmetry the module is built on: an error can condemn a route, it
+    /// cannot vouch for one.
     pub length_repeats: u64,
     /// Of those repeats, how many changed length. `> 0` means the route's
-    /// responses are not stable across identical requests.
+    /// successful responses are not stable across identical requests.
+    ///
+    /// A **subset of [`Self::length_repeats`]**, not a bucket beside it: a
+    /// length can only be seen to move on a repeat, and the recorder counts
+    /// that repeat as well. `length_varied <= length_repeats` therefore holds
+    /// of every profile, and a consumer that adds the two together is
+    /// double-counting the same reads.
     pub length_varied: u64,
-    /// Upstream reads whose response carried no `Content-Length`, so stability
-    /// could not be assessed at all.
+    /// Successful upstream reads whose response carried no `Content-Length`, so
+    /// stability could not be assessed at all.
     pub length_missing: u64,
     /// A new fingerprint arrived past `observe.max_fingerprints` and was
     /// dropped.
@@ -322,6 +399,14 @@ struct Derived<'a> {
 /// up, this type is the isolated place to shard it.
 pub struct ObserveRecorder {
     config: ObserveConfig,
+    /// Each configured route's compiled path expression, immutable from
+    /// construction and therefore readable **outside** the lock — which is
+    /// where it has to be read, since normalizing a path is part of the
+    /// pre-lock derivation and the lock protects only the counters. Its key set
+    /// is `routes`' key set by construction (both are built from one pass over
+    /// the same descriptors), so a lookup here answers the same question a
+    /// lookup there would.
+    matchers: BTreeMap<String, PathMatcher>,
     /// Randomly keyed, built once and reused for every path and fingerprint
     /// hash.
     ///
@@ -340,22 +425,36 @@ pub struct ObserveRecorder {
 }
 
 impl ObserveRecorder {
-    /// Build a recorder over exactly the configured route ids, each zero-filled.
+    /// Build a recorder over exactly the configured routes, each zero-filled
+    /// but already carrying the matcher it will be profiled under.
+    ///
+    /// Takes `(id, matcher)` descriptors rather than bare ids because the
+    /// matcher answers two questions the recorder cannot answer without it:
+    /// what [`RouteProfile::match_basis`] should say, and what a read's
+    /// distinct-path key is. Taking both from one descriptor is what makes the
+    /// recorded basis and the normalization it describes impossible to
+    /// desynchronize.
     ///
     /// Zero-registers the observe counter here rather than at startup because
     /// this is the one place that knows both that observation is on *and* the
     /// configured route id set — the same reasoning as
     /// [`prometheus::register_verdict_series`], applied to a per-route series.
-    pub fn new<'a>(config: ObserveConfig, route_ids: impl IntoIterator<Item = &'a str>) -> Self {
-        let routes: BTreeMap<String, RouteState> = route_ids
-            .into_iter()
-            .map(|id| (id.to_string(), RouteState::default()))
-            .collect();
-        prometheus::register_observe_series(routes.keys().map(String::as_str));
+    pub fn new<'a>(
+        config: ObserveConfig,
+        routes: impl IntoIterator<Item = (&'a str, &'a PathMatcher)>,
+    ) -> Self {
+        let mut matchers = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        for (id, matcher) in routes {
+            states.insert(id.to_string(), RouteState::new(matcher.basis()));
+            matchers.insert(id.to_string(), matcher.clone());
+        }
+        prometheus::register_observe_series(states.keys().map(String::as_str));
         Self {
             config,
+            matchers,
             hasher: RandomState::new(),
-            routes: Mutex::new(routes),
+            routes: Mutex::new(states),
         }
     }
 
@@ -367,8 +466,13 @@ impl ObserveRecorder {
         if !shadow::sampled(self.config.sample_rate) {
             return;
         }
+        // An unconfigured route id is dropped here rather than after the
+        // derivation, which is the same answer the locked map would give.
+        let Some(matcher) = self.matchers.get(route_id) else {
+            return;
+        };
         // Everything client-sized happens here, outside the lock.
-        let derived = self.derive(&obs);
+        let derived = self.derive(&obs, matcher);
         {
             // Recovering from poisoning rather than propagating it: a panic
             // while holding this lock must not turn every subsequent request
@@ -397,7 +501,7 @@ impl ObserveRecorder {
         }
     }
 
-    fn derive<'a>(&self, obs: &Observation<'a>) -> Derived<'a> {
+    fn derive<'a>(&self, obs: &Observation<'a>, matcher: &PathMatcher) -> Derived<'a> {
         let is_read = shadow::method_is_read(obs.method);
         // Only an upstream response says anything about what the route serves;
         // limen's own error pages have a status the client saw (honest) but a
@@ -416,7 +520,17 @@ impl ObserveRecorder {
             is_read,
             origin: obs.origin,
             status_class: prometheus::status_class(obs.status.as_u16()),
-            path_key: self.hasher.hash_one(obs.path),
+            // Normalized: on a templated route every concrete id keys to the
+            // template, so the count answers "how many shapes" rather than
+            // "how many ids".
+            path_key: self.hasher.hash_one(matcher.observed_path(obs.path)),
+            // **Raw**, and deliberately not normalized. The fingerprint asks
+            // whether the *same request* repeated, and under a template every
+            // resource on the route would otherwise share one key — turning
+            // `/conversations/a` followed by `/conversations/b` into a repeat,
+            // and their two unrelated body sizes into either false stability or
+            // a false `length_varied`. Normalizing here would corrupt the one
+            // affirmative signal candidacy rests on.
             fingerprint: self.hasher.hash_one((
                 obs.method.as_str(),
                 obs.path,
@@ -440,9 +554,10 @@ impl ObserveRecorder {
 #[derive(Debug, Default)]
 struct RouteState {
     profile: RouteProfile,
-    /// Hashes of the distinct read paths seen. Hashes, not paths: the profile
-    /// promises never to emit a path, and storing only a hash makes that a
-    /// property of the type rather than of the serializer.
+    /// Hashes of the distinct read paths seen, normalized by the route's
+    /// matcher (see [`crate::routing::PathMatcher::observed_path`]). Hashes,
+    /// not paths: the profile promises never to emit a path, and storing only a
+    /// hash makes that a property of the type rather than of the serializer.
     read_paths: HashSet<u64>,
     /// Fingerprint → the `Content-Length` last seen for it. Keyed by hash for
     /// the same reason, and because a key built from the raw query names would
@@ -451,6 +566,17 @@ struct RouteState {
 }
 
 impl RouteState {
+    /// A zero-filled route that already knows what it was profiled under.
+    fn new(match_basis: String) -> Self {
+        Self {
+            profile: RouteProfile {
+                match_basis,
+                ..RouteProfile::default()
+            },
+            ..Self::default()
+        }
+    }
+
     /// Merge one pre-derived observation. Everything here is a bounded map
     /// update — see [`Derived`] for why nothing is computed at this point.
     fn merge(&mut self, config: &ObserveConfig, d: &Derived<'_>) {
@@ -499,6 +625,7 @@ impl RouteState {
             // route out of a dead upstream — the unsafe direction.
             ResponseOrigin::UpstreamSilent => {
                 p.transport_errors += 1;
+                p.read_transport_errors += 1;
                 return;
             }
             ResponseOrigin::Refused => return,
@@ -523,13 +650,32 @@ impl RouteState {
             p.location_reads += 1;
         }
 
-        self.record_stability(config, d);
+        // Success-qualified: only a 2xx read says anything about the body the
+        // operation normally returns. An error body is a different document
+        // produced by a different code path — usually a fixed-length error page
+        // — so admitting one manufactures stability out of a route that has
+        // never succeeded, which is the same failure mode the `UpstreamSilent`
+        // arm above refuses for limen's own 502. The error is not discarded: it
+        // is already in `status_classes` above, where R8a reads it and demotes
+        // the route outright.
+        //
+        // `Refused` and `UpstreamSilent` have already returned, so nothing limen
+        // synthesized can reach this call however it was statused — the origin
+        // check does not depend on synthesized responses happening to be
+        // non-2xx.
+        if d.status_class == prometheus::SUCCESS_STATUS_CLASS {
+            self.record_stability(config, d);
+        }
     }
 
     /// The one stability signal available without touching a body:
     /// `Content-Length` variance across repeats of the same request
     /// fingerprint — `(method, path hash, sorted query-parameter names)`, never
     /// a value, never a header.
+    ///
+    /// Called only for a **successful upstream read** (see the caller): the map
+    /// is the affirmative half of the evidence, and only a response the route
+    /// actually produced on its success path belongs in it.
     ///
     /// Its limits are real and documented rather than papered over: two
     /// requests with different credentials share a fingerprint (a false
@@ -661,8 +807,26 @@ fn content_type_essence(headers: &HeaderMap) -> Option<String> {
 mod tests {
     use super::*;
 
+    use crate::routing::CompiledTemplate;
+
+    /// The prefix route every test below records against unless it is about
+    /// templates.
+    fn prefix(path: &str) -> PathMatcher {
+        PathMatcher::Prefix(path.to_string())
+    }
+
+    fn template(path: &str) -> PathMatcher {
+        PathMatcher::Template(CompiledTemplate::parse(path).expect("a template"))
+    }
+
     fn recorder(config: ObserveConfig) -> ObserveRecorder {
-        ObserveRecorder::new(config, ["r"])
+        ObserveRecorder::new(config, [("r", &prefix("/"))])
+    }
+
+    /// A one-route recorder whose route matches `path` as a template rather
+    /// than as a prefix.
+    fn templated_recorder(path: &str) -> ObserveRecorder {
+        ObserveRecorder::new(ObserveConfig::default(), [("r", &template(path))])
     }
 
     fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
@@ -743,13 +907,22 @@ mod tests {
 
     #[test]
     fn every_configured_route_is_present_and_zero_filled() {
-        let rec = ObserveRecorder::new(ObserveConfig::default(), ["a", "b"]);
+        let rec = ObserveRecorder::new(
+            ObserveConfig::default(),
+            [("a", &prefix("/a")), ("b", &template("/b/{id}"))],
+        );
         let profile = rec.profile();
         assert_eq!(profile.routes.len(), 2);
         // Zero-filled, not merely present: a route nobody hit must be
-        // distinguishable from one that does not exist.
-        assert_eq!(profile.routes["a"], RouteProfile::default());
-        assert_eq!(profile.routes["b"], RouteProfile::default());
+        // distinguishable from one that does not exist. The one thing a
+        // zero-filled route does carry is its match basis — a stale profile is
+        // detectable even for a route no traffic ever reached.
+        let zero = |basis: &str| RouteProfile {
+            match_basis: basis.to_string(),
+            ..RouteProfile::default()
+        };
+        assert_eq!(profile.routes["a"], zero("prefix:/a"));
+        assert_eq!(profile.routes["b"], zero("template:/b/{id}"));
     }
 
     #[test]
@@ -941,13 +1114,103 @@ mod tests {
     }
 
     #[test]
+    fn a_templated_route_counts_shapes_rather_than_ids() {
+        // The feature in one assertion: a template names one operation, so
+        // eight conversations are one distinct read path, not eight. Absorbing
+        // that cardinality is the point — the classifier's wildcard and
+        // opaque-path rules are then asking about the *operation*.
+        let rec = templated_recorder("/conversations/{id}");
+        let empty = HeaderMap::new();
+        for n in 0..8 {
+            observe_read(&rec, &format!("/conversations/c{n}"), None, 200, &empty);
+        }
+        let p = profile(&rec);
+        assert_eq!(p.reads, 8);
+        assert_eq!(p.distinct_read_paths, 1);
+        assert!(!p.distinct_read_paths_overflow);
+
+        // The control: the same traffic under a prefix route still counts every
+        // id, because under a prefix that count is the only evidence the route
+        // is a subtree rather than an endpoint.
+        let rec = recorder(ObserveConfig::default());
+        for n in 0..8 {
+            observe_read(&rec, &format!("/conversations/c{n}"), None, 200, &empty);
+        }
+        assert_eq!(profile(&rec).distinct_read_paths, 8);
+    }
+
+    #[test]
+    fn a_templated_route_repeats_only_on_the_same_concrete_path() {
+        // Normalization stops at the distinct-path key. The fingerprint asks a
+        // different question — did *this request* repeat — and normalizing it
+        // would make every resource on the route look like a repeat of every
+        // other.
+        let rec = templated_recorder("/conversations/{id}");
+        let hdrs = headers(&[("content-length", "42")]);
+        for _ in 0..3 {
+            observe_read(&rec, "/conversations/a", None, 200, &hdrs);
+        }
+        let p = profile(&rec);
+        assert_eq!(p.length_repeats, 2, "the same resource, fetched again");
+        assert_eq!(p.length_varied, 0);
+    }
+
+    #[test]
+    fn two_resources_of_equal_length_are_not_a_repeat() {
+        // The false-stability direction: two different conversations that
+        // happen to be the same size must not read as one stable request.
+        let rec = templated_recorder("/conversations/{id}");
+        let hdrs = headers(&[("content-length", "42")]);
+        observe_read(&rec, "/conversations/a", None, 200, &hdrs);
+        observe_read(&rec, "/conversations/b", None, 200, &hdrs);
+        let p = profile(&rec);
+        assert_eq!(p.distinct_read_paths, 1, "one shape");
+        assert_eq!(p.length_repeats, 0, "two resources, no repeat");
+        assert_eq!(p.length_varied, 0);
+    }
+
+    #[test]
+    fn two_resources_of_different_lengths_do_not_vary() {
+        // The false-demotion direction, and the one that would have been easy
+        // to ship: a normalized fingerprint would call two differently-sized
+        // conversations a route whose responses are unstable.
+        let rec = templated_recorder("/conversations/{id}");
+        let len = |bytes| headers(&[("content-length", bytes)]);
+        observe_read(&rec, "/conversations/a", None, 200, &len("42"));
+        observe_read(&rec, "/conversations/b", None, 200, &len("9001"));
+        let p = profile(&rec);
+        assert_eq!(p.length_repeats, 0);
+        assert_eq!(p.length_varied, 0, "different resources, not variance");
+    }
+
+    #[test]
+    fn every_route_records_the_matcher_it_was_profiled_under() {
+        let rec = ObserveRecorder::new(
+            ObserveConfig::default(),
+            [
+                ("p", &prefix("/devices")),
+                ("t", &template("/conversations/{id}")),
+            ],
+        );
+        let document = rec.profile();
+        assert_eq!(document.routes["p"].match_basis, "prefix:/devices");
+        assert_eq!(
+            document.routes["t"].match_basis,
+            "template:/conversations/{id}"
+        );
+        // It survives serialization, which is where `suggest-routes` reads it.
+        let json = serde_json::to_string(&document).unwrap();
+        assert!(json.contains(r#""match_basis":"template:/conversations/{id}""#));
+    }
+
+    #[test]
     fn path_hashing_is_keyed_per_recorder() {
         // Not a collision test — collisions cannot be *observed* from outside.
         // What is observable, and what the fixed-key hasher lacked, is that the
         // mapping differs per process, so no attacker-chosen path pair is
         // reliably a collision on any given deployment.
-        let a = ObserveRecorder::new(ObserveConfig::default(), ["r"]);
-        let b = ObserveRecorder::new(ObserveConfig::default(), ["r"]);
+        let a = recorder(ObserveConfig::default());
+        let b = recorder(ObserveConfig::default());
         assert_ne!(
             a.hasher.hash_one("/same/path"),
             b.hasher.hash_one("/same/path"),
@@ -1119,6 +1382,117 @@ mod tests {
     }
 
     #[test]
+    fn only_successful_reads_enter_the_stability_map() {
+        // The field shape this qualification exists for: an images route whose
+        // every read 404s at one path, answered by a fixed-length error page.
+        // Counting those repeats would hand the classifier the one affirmative
+        // signal candidacy rests on, observed on a body no client is ever
+        // served — so the map stays empty and the failures survive only in the
+        // status classes, where the classifier's R8a reads them.
+        let rec = recorder(ObserveConfig::default());
+        let hdrs = headers(&[("content-type", "text/html"), ("content-length", "1024")]);
+        for _ in 0..5 {
+            observe_read(&rec, "/images/missing.png", None, 404, &hdrs);
+        }
+        observe_read(&rec, "/images/found.png", None, 200, &hdrs);
+        let p = profile(&rec);
+        assert_eq!(p.reads, 6);
+        assert_eq!(p.status_classes["4xx"], 5, "the failures stay visible");
+        assert_eq!(p.status_classes["2xx"], 1);
+        assert_eq!(
+            p.length_repeats, 0,
+            "five repeats of a 404 page are not evidence about the route"
+        );
+        assert_eq!(p.length_varied, 0);
+        assert_eq!(p.length_missing, 0);
+        // The error responses are still described everywhere a *danger* rule
+        // looks: the content type, the path count, and the status mix above.
+        assert_eq!(p.distinct_read_paths, 2);
+        assert!(p.content_types.contains("text/html"));
+    }
+
+    #[test]
+    fn an_error_response_neither_repeats_nor_varies() {
+        // Both directions asserted together: the error is not admitted as a
+        // stable repeat, and it does not poison a genuine one either. A 200 of
+        // one size and a 500 of another at the same fingerprint would otherwise
+        // read as a route whose body varies — a false demotion, but still an
+        // error being allowed to speak about the success path.
+        let rec = recorder(ObserveConfig::default());
+        let len = |bytes| headers(&[("content-length", bytes)]);
+        observe_read(&rec, "/a", None, 200, &len("42"));
+        observe_read(&rec, "/a", None, 500, &len("9001"));
+        observe_read(&rec, "/a", None, 200, &len("42"));
+        let p = profile(&rec);
+        assert_eq!(p.length_repeats, 1, "the two 200s, and only those");
+        assert_eq!(p.length_varied, 0);
+        assert_eq!(p.length_missing, 0);
+    }
+
+    #[test]
+    fn an_error_read_without_a_content_length_is_not_a_hole_in_the_evidence() {
+        // `length_missing` is R11's signal that the *success* evidence has a
+        // gap. A 404 with no length is not a gap in it; the route's failure is
+        // R8a's to report.
+        let rec = recorder(ObserveConfig::default());
+        observe_read(&rec, "/a", None, 404, &HeaderMap::new());
+        let p = profile(&rec);
+        assert_eq!(p.length_missing, 0);
+        assert_eq!(p.status_classes["4xx"], 1);
+    }
+
+    #[test]
+    fn a_read_transport_error_is_counted_on_both_scopes_and_a_write_only_on_one() {
+        // The classifier's R8a carve-out asks whether every *read* was withheld
+        // by transport, so the read-scoped count is recorded alongside the
+        // whole-route one. A route whose writes are timing out while its reads
+        // are answered must not look like a route nobody has heard from.
+        let rec = recorder(ObserveConfig::default());
+        observe_synthesized(
+            &rec,
+            &Method::GET,
+            "/a",
+            None,
+            502,
+            ResponseOrigin::UpstreamSilent,
+        );
+        for _ in 0..3 {
+            observe_synthesized(
+                &rec,
+                &Method::POST,
+                "/a",
+                None,
+                504,
+                ResponseOrigin::UpstreamSilent,
+            );
+        }
+        observe_read(&rec, "/a", None, 404, &headers(&[("content-length", "9")]));
+        let p = profile(&rec);
+        assert_eq!(p.reads, 2);
+        assert_eq!(p.writes, 3);
+        assert_eq!(p.transport_errors, 4, "reads and writes alike");
+        assert_eq!(p.read_transport_errors, 1, "one of the two reads");
+    }
+
+    #[test]
+    fn a_locally_refused_read_never_reaches_the_stability_map() {
+        // Belt and braces on the origin check: `Refused` returns before the
+        // status class is consulted, so even a 2xx limen produced itself — a
+        // shape no refusal path emits today — could not describe the route.
+        let rec = recorder(ObserveConfig::default());
+        for _ in 0..3 {
+            observe_synthesized(&rec, &Method::GET, "/a", None, 200, ResponseOrigin::Refused);
+        }
+        let p = profile(&rec);
+        assert_eq!(p.reads, 3);
+        assert_eq!(p.status_classes["2xx"], 3, "the client did see a 200");
+        assert_eq!(p.length_repeats, 0, "but limen wrote it, not the route");
+        assert_eq!(p.length_missing, 0);
+        assert_eq!(p.transport_errors, 0);
+        assert_eq!(p.read_transport_errors, 0);
+    }
+
+    #[test]
     fn exceeding_max_fingerprints_flags_overflow() {
         // The load-bearing case: past the cap a new fingerprint must announce
         // itself, or variance beyond it goes unrecorded and the demotion the
@@ -1219,7 +1593,14 @@ mod tests {
                 observe_read(rec, "/a", None, 200, &HeaderMap::new());
             }
         }
-        assert_eq!(profile(&off), RouteProfile::default());
+        assert_eq!(
+            profile(&off),
+            RouteProfile {
+                match_basis: "prefix:/".to_string(),
+                ..RouteProfile::default()
+            },
+            "sampled out, but still enumerated with its basis"
+        );
         assert_eq!(profile(&on).observations, 5);
     }
 
@@ -1240,7 +1621,11 @@ mod tests {
 
     #[test]
     fn the_profile_document_is_canonically_ordered() {
-        let rec = ObserveRecorder::new(ObserveConfig::default(), ["z", "a", "m", "r"]);
+        let root = prefix("/");
+        let rec = ObserveRecorder::new(
+            ObserveConfig::default(),
+            [("z", &root), ("a", &root), ("m", &root), ("r", &root)],
+        );
         // Insert every map/set out of order, so a non-`BTree` container would
         // render in insertion order and fail.
         for (method, status, query, content_type) in [
@@ -1318,6 +1703,44 @@ mod tests {
         assert!(serde_json::from_str::<ObserveProfile>(partial).is_err());
         let no_rate = r#"{"routes":{}}"#;
         assert!(serde_json::from_str::<ObserveProfile>(no_rate).is_err());
+    }
+
+    #[test]
+    fn a_profile_without_a_match_basis_does_not_deserialize() {
+        // A profile written by a binary that predates the field is exactly the
+        // stale profile the field exists to catch, so it must fail at the parse
+        // rather than default to a basis nobody recorded. Built by rendering a
+        // real profile and deleting the key, so the fixture cannot rot into
+        // one that was never a profile.
+        let rec = recorder(ObserveConfig::default());
+        observe_read(&rec, "/a", None, 200, &HeaderMap::new());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec.profile()).unwrap()).unwrap();
+        assert!(serde_json::from_value::<ObserveProfile>(document.clone()).is_ok());
+        document["routes"]["r"]
+            .as_object_mut()
+            .unwrap()
+            .remove("match_basis");
+        assert!(serde_json::from_value::<ObserveProfile>(document).is_err());
+    }
+
+    #[test]
+    fn a_profile_without_read_transport_errors_does_not_deserialize() {
+        // The `match_basis` contract applied to the second field a classifier
+        // rule reads directly: a profile from a binary that predates it would
+        // zero-fill, and a zero there is the value that ARMS R8a's carve-out —
+        // it would read "no read was withheld" about a profile that never said.
+        // Same construction as the basis test, for the same anti-rot reason.
+        let rec = recorder(ObserveConfig::default());
+        observe_read(&rec, "/a", None, 200, &HeaderMap::new());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec.profile()).unwrap()).unwrap();
+        assert!(serde_json::from_value::<ObserveProfile>(document.clone()).is_ok());
+        document["routes"]["r"]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_transport_errors");
+        assert!(serde_json::from_value::<ObserveProfile>(document).is_err());
     }
 
     #[test]
