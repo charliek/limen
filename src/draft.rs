@@ -1358,6 +1358,53 @@ routes:
         assert!(!contains_null(&parsed), "{draft}");
     }
 
+    /// A templated route survives the draft verbatim: the match block is
+    /// carried forward, so the emitted document must name the template and must
+    /// not have grown a `path_prefix:` key (null or otherwise) on its way
+    /// through the model.
+    #[test]
+    fn a_templated_route_round_trips_through_the_draft() {
+        let config = config_from(
+            r#"
+observe: {}
+routes:
+  - id: conversation
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    legacy_upstream: "http://legacy.internal"
+    mode: legacy_only
+"#,
+        );
+        let draft = draft_of(
+            &config,
+            &candidate_profile("conversation"),
+            &DraftOptions {
+                new_upstream: Some("http://new.internal".to_string()),
+                adopt: true,
+                ..DraftOptions::default()
+            },
+        );
+        let parsed = assert_valid(&draft);
+        assert_eq!(
+            parsed.routes[0].r#match.path_template.as_deref(),
+            Some("/conversations/{id}")
+        );
+        assert_eq!(parsed.routes[0].r#match.path_prefix, None);
+        // Not merely absent from the parse — absent from the text an operator
+        // reads. Comment lines are excluded: the draft's prose mentions the
+        // field by name.
+        let emitted: String = draft
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            emitted.contains("path_template: /conversations/{id}"),
+            "{draft}"
+        );
+        assert!(!emitted.contains("path_prefix"), "{draft}");
+        assert!(!emitted.contains("null"), "{draft}");
+    }
+
     #[test]
     fn a_route_with_no_new_upstream_is_drafted_legacy_only() {
         let config = config_from(

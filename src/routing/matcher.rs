@@ -1,14 +1,27 @@
-//! Route matching: method + longest-path-prefix, optionally narrowed by the
+//! Route matching: method + path expression, optionally narrowed by the
 //! request's query parameters (spec §5.2).
 //!
 //! Config routes are compiled once at startup into a [`RouteTable`] with their
-//! upstream URLs parsed. Matching is by HTTP method membership, path prefix, and
-//! (where a route declares them) query-parameter presence conditions; among
-//! matching routes the **longest prefix wins**, a query-conditioned route beats
-//! an unconditioned one at an equal prefix, and config order is the final stable
-//! tiebreak. Two conditioned routes that could both match one request are
-//! rejected at load time ([`crate::config::validate`]), so this ordering always
-//! has exactly one answer.
+//! upstream URLs parsed and their path expressions compiled. Matching is by HTTP
+//! method membership, path, and (where a route declares them) query-parameter
+//! presence conditions.
+//!
+//! Paths are matched in **two tiers**: every [`path_template`] route first, then
+//! every [`path_prefix`] route. A template names one exact shape, a prefix names
+//! a subtree, so the specific must be consulted before the general or a
+//! catch-all would swallow the refinement written to escape it. Within the
+//! template tier the fewest parameters win (the more literal template is the
+//! narrower one); within the prefix tier the longest prefix wins. In both tiers
+//! a query-conditioned route beats an unconditioned one at an equal key, and
+//! config order is the final stable tiebreak. Every pair of routes that could
+//! make this ordering arbitrary — two co-matchable templates where neither is
+//! narrower, a template half-overlapping a prefix, two conditioned routes that a
+//! single request could satisfy — is rejected at load time
+//! ([`crate::config::validate`]), so this ordering always has exactly one
+//! answer.
+//!
+//! [`path_template`]: crate::config::model::RouteMatch::path_template
+//! [`path_prefix`]: crate::config::model::RouteMatch::path_prefix
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -16,9 +29,10 @@ use std::sync::Arc;
 use thiserror::Error;
 use url::Url;
 
-use crate::config::model::{Config, RolloutConfig, RouteMode, TimeoutsConfig};
+use crate::config::model::{Config, RolloutConfig, RouteMatch, RouteMode, TimeoutsConfig};
 use crate::contract::model::ComparisonRules;
 use crate::resilience::CircuitBreaker;
+use crate::routing::template::{CompiledTemplate, TemplateParseError};
 
 /// Failure compiling a route into the route table.
 #[derive(Debug, Error)]
@@ -32,6 +46,23 @@ pub enum RouteBuildError {
         url: String,
         /// The parse error.
         source: url::ParseError,
+    },
+    /// A path template did not parse (should not happen post-validation).
+    #[error("route {id:?}: invalid path template {template:?}: {source}")]
+    BadTemplate {
+        /// The route id.
+        id: String,
+        /// The offending template string.
+        template: String,
+        /// The parse error.
+        source: TemplateParseError,
+    },
+    /// The match set both path fields or neither (should not happen
+    /// post-validation).
+    #[error("route {id:?}: match must set exactly one of path_prefix or path_template")]
+    AmbiguousPathMatch {
+        /// The route id.
+        id: String,
     },
     /// The resolved-comparison list did not match the route count.
     #[error("internal error: {0} comparisons for {1} routes")]
@@ -57,6 +88,43 @@ pub struct RouteComparison {
     pub rules: ComparisonRules,
 }
 
+/// A route's compiled path expression. An enum rather than two optional fields
+/// so "both" and "neither" are unrepresentable past `RouteTable::build` — the
+/// matcher can then never face a route it has no way to test.
+#[derive(Debug, Clone)]
+pub enum PathMatcher {
+    /// Everything under this prefix.
+    Prefix(String),
+    /// Exactly this shape.
+    Template(CompiledTemplate),
+}
+
+impl PathMatcher {
+    fn matches(&self, path: &str) -> bool {
+        match self {
+            Self::Prefix(prefix) => path.starts_with(prefix.as_str()),
+            Self::Template(template) => template.matches_path(path),
+        }
+    }
+
+    /// Compile a config match's path expression. Also the config validator's
+    /// view of a route's path (`crate::config::validate`), so the overlap pass
+    /// and the matcher cannot disagree about what a match block names.
+    pub(crate) fn compile(id: &str, m: &RouteMatch) -> Result<Self, RouteBuildError> {
+        match (&m.path_prefix, &m.path_template) {
+            (Some(prefix), None) => Ok(Self::Prefix(prefix.clone())),
+            (None, Some(template)) => CompiledTemplate::parse(template)
+                .map(Self::Template)
+                .map_err(|source| RouteBuildError::BadTemplate {
+                    id: id.to_string(),
+                    template: template.clone(),
+                    source,
+                }),
+            _ => Err(RouteBuildError::AmbiguousPathMatch { id: id.to_string() }),
+        }
+    }
+}
+
 /// A route compiled for matching and proxying.
 #[derive(Debug, Clone)]
 pub struct CompiledRoute {
@@ -64,8 +132,8 @@ pub struct CompiledRoute {
     pub id: String,
     /// Uppercased HTTP methods this route matches.
     pub methods: Vec<String>,
-    /// Path prefix this route matches.
-    pub path_prefix: String,
+    /// The path expression this route matches.
+    pub path: PathMatcher,
     /// Query parameter names that must all be present (empty = unconditioned).
     pub query_present: Vec<String>,
     /// Query parameter names of which none may be present (empty =
@@ -100,8 +168,26 @@ impl CompiledRoute {
     /// and query-parameter names.
     fn matches(&self, method: &str, path: &str, query: &QueryNames<'_>) -> bool {
         self.methods.iter().any(|m| m == method)
-            && path.starts_with(&self.path_prefix)
+            && self.path.matches(path)
             && self.query_conditions_hold(query)
+    }
+
+    /// Ordering key: template tier before prefix tier, then specificity within
+    /// the tier, then a query-conditioned route before an unconditioned one.
+    /// `sort_by_key` is stable, so config order remains the final tiebreak.
+    fn sort_key(&self) -> (u8, usize, bool) {
+        match &self.path {
+            // Fewer parameters = more literal segments = narrower. Load-time
+            // validation guarantees that of any two templates a single request
+            // could match, one is strictly narrower than the other (or the two
+            // are the same shape, which the query-condition key then orders) —
+            // and the narrower one always has strictly fewer parameters. So this
+            // is a total order over exactly the routes that compete.
+            PathMatcher::Template(t) => (0, t.param_count(), !self.query_conditioned),
+            // Longest prefix first, written as a descending length so one key
+            // type covers both tiers.
+            PathMatcher::Prefix(p) => (1, usize::MAX - p.len(), !self.query_conditioned),
+        }
     }
 
     /// Presence only — `?prompt=` counts exactly like `?prompt=login`.
@@ -142,7 +228,8 @@ impl<'a> QueryNames<'a> {
     }
 }
 
-/// The compiled routing table, ordered longest-prefix-first.
+/// The compiled routing table, ordered most-specific-first: the template tier
+/// (fewest parameters first) ahead of the prefix tier (longest prefix first).
 #[derive(Debug, Clone, Default)]
 pub struct RouteTable {
     routes: Vec<CompiledRoute>,
@@ -176,7 +263,7 @@ impl RouteTable {
                     .iter()
                     .map(|m| m.to_ascii_uppercase())
                     .collect(),
-                path_prefix: r.r#match.path_prefix.clone(),
+                path: PathMatcher::compile(&r.id, &r.r#match)?,
                 query_present: r.r#match.query_present.clone(),
                 query_absent: r.r#match.query_absent.clone(),
                 query_conditioned: r.r#match.is_query_conditioned(),
@@ -194,13 +281,11 @@ impl RouteTable {
             });
         }
         let any_query_conditions = routes.iter().any(|r| r.query_conditioned);
-        // Longest prefix first, then query-conditioned before unconditioned so a
-        // narrower route on the same prefix is consulted first (spec §5.2);
-        // `sort_by_key` is stable, so routes with equal keys keep their config
-        // order as a deterministic final tiebreak. Two equal-length prefixes that
-        // both match a path are necessarily the same prefix, so ordering by
-        // length groups exactly the routes that compete.
-        routes.sort_by_key(|r| (std::cmp::Reverse(r.path_prefix.len()), !r.query_conditioned));
+        // Most specific first (see `sort_key`, and the tier rules in this
+        // module's header). Two equal-length prefixes that both match a path are
+        // necessarily the same prefix, so ordering by length groups exactly the
+        // prefix routes that compete.
+        routes.sort_by_key(CompiledRoute::sort_key);
         Ok(Self {
             routes,
             any_query_conditions,
@@ -466,6 +551,247 @@ routes:
             "literal"
         );
         assert!(t.match_route("GET", "/x", Some("a=1&%62=2")).is_none());
+    }
+
+    /// The reason templates exist: one path under a prefix behaves differently
+    /// from its siblings, and no prefix can say so. The all-literal template is
+    /// the narrower of the two (no parameters) and is consulted first.
+    #[test]
+    fn an_all_literal_template_beats_a_parameterized_one() {
+        let yaml = r#"
+routes:
+  - id: by-id
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: export
+    match: { methods: ["GET"], path_template: "/conversations/export" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#;
+        let t = table(yaml);
+        assert_eq!(
+            t.match_route("GET", "/conversations/export", None)
+                .unwrap()
+                .id,
+            "export"
+        );
+        assert_eq!(
+            t.match_route("GET", "/conversations/123", None).unwrap().id,
+            "by-id"
+        );
+    }
+
+    /// Config order is the last tiebreak, never the first: the specific route
+    /// wins from either position in the file.
+    #[test]
+    fn swapping_config_order_does_not_change_the_winner() {
+        let route = |id: &str, path: &str| {
+            format!(
+                "  - id: {id}\n    match: {{ methods: [\"GET\"], path_template: \"{path}\" }}\n    \
+                 legacy_upstream: \"https://legacy.internal\"\n    mode: legacy_only\n"
+            )
+        };
+        let export = route("export", "/conversations/export");
+        let by_id = route("by-id", "/conversations/{id}");
+        for yaml in [
+            format!("routes:\n{export}{by_id}"),
+            format!("routes:\n{by_id}{export}"),
+        ] {
+            let t = table(&yaml);
+            assert_eq!(
+                t.match_route("GET", "/conversations/export", None)
+                    .unwrap()
+                    .id,
+                "export",
+                "{yaml}"
+            );
+        }
+    }
+
+    const TEMPLATE_AND_CATCH_ALL: &str = r#"
+routes:
+  - id: conversations-all
+    match: { methods: ["GET"], path_prefix: "/conversations/" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: conversation
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: root
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#;
+
+    /// The whole tier rule in one table: the template refines the prefix that
+    /// contains it, and the prefix still catches everything the template's
+    /// exact shape does not.
+    #[test]
+    fn a_template_beats_the_prefix_that_contains_it() {
+        let t = table(TEMPLATE_AND_CATCH_ALL);
+        assert_eq!(
+            t.match_route("GET", "/conversations/123", None).unwrap().id,
+            "conversation"
+        );
+        // Deeper than the template's shape: back to the prefix tier.
+        assert_eq!(
+            t.match_route("GET", "/conversations/1/2/3", None)
+                .unwrap()
+                .id,
+            "conversations-all"
+        );
+        // Shallower, and outside both.
+        assert_eq!(
+            t.match_route("GET", "/conversations/", None).unwrap().id,
+            "conversations-all"
+        );
+        assert_eq!(t.match_route("GET", "/voices/1", None).unwrap().id, "root");
+    }
+
+    /// A request whose path carries an empty segment or a trailing slash never
+    /// matches a template — it falls to the prefix tier, which is where a path
+    /// Limen cannot name belongs.
+    #[test]
+    fn a_path_a_template_cannot_name_falls_to_the_prefix_tier() {
+        let t = table(TEMPLATE_AND_CATCH_ALL);
+        assert_eq!(
+            t.match_route("GET", "/conversations//preview", None)
+                .unwrap()
+                .id,
+            "conversations-all"
+        );
+        assert_eq!(
+            t.match_route("GET", "/conversations/123/", None)
+                .unwrap()
+                .id,
+            "conversations-all"
+        );
+    }
+
+    /// No percent-decoding on the template side: `%2F` is one character of one
+    /// segment, so it cannot smuggle a request into a deeper shape.
+    #[test]
+    fn template_matching_does_not_percent_decode_the_path() {
+        let t = table(TEMPLATE_AND_CATCH_ALL);
+        assert_eq!(
+            t.match_route("GET", "/conversations/1%2F2", None)
+                .unwrap()
+                .id,
+            "conversation"
+        );
+        assert_eq!(
+            t.match_route("GET", "/conversations/1%2F2/3", None)
+                .unwrap()
+                .id,
+            "conversations-all"
+        );
+    }
+
+    /// The field case again (spec §5.2), now with a template on one side: the
+    /// conditioned prefix route keeps the verifier hops it was written to
+    /// except, and the template takes everything else on its shape.
+    #[test]
+    fn a_conditioned_prefix_route_survives_a_complementary_template() {
+        let t = table(
+            r#"
+routes:
+  - id: oauth-verifier
+    match:
+      methods: ["GET"]
+      path_prefix: "/oauth2/auth"
+      query_present: ["login_verifier"]
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: oauth-action
+    match:
+      methods: ["GET"]
+      path_template: "/oauth2/{action}"
+      query_absent: ["login_verifier"]
+    legacy_upstream: "https://legacy.internal"
+    new_upstream: "https://new.internal"
+    mode: shadow_legacy_primary
+"#,
+        );
+        // The template is consulted first but its query condition fails, so the
+        // request falls through to the conditioned prefix route.
+        assert_eq!(
+            t.match_route("GET", "/oauth2/auth", Some("login_verifier=tok"))
+                .unwrap()
+                .id,
+            "oauth-verifier"
+        );
+        assert_eq!(
+            t.match_route("GET", "/oauth2/auth", Some("client_id=app"))
+                .unwrap()
+                .id,
+            "oauth-action"
+        );
+        assert_eq!(
+            t.match_route("GET", "/oauth2/token", None).unwrap().id,
+            "oauth-action"
+        );
+    }
+
+    /// Two routes on the same shape: the conditioned one is consulted first,
+    /// exactly as at an equal `path_prefix`.
+    #[test]
+    fn a_conditioned_template_beats_an_unconditioned_one_on_the_same_shape() {
+        let t = table(
+            r#"
+routes:
+  - id: plain
+    match: { methods: ["GET"], path_template: "/oauth2/{action}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: verifier
+    match:
+      methods: ["GET"]
+      path_template: "/oauth2/{action}"
+      query_present: ["login_verifier"]
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#,
+        );
+        assert_eq!(
+            t.match_route("GET", "/oauth2/auth", Some("login_verifier=tok"))
+                .unwrap()
+                .id,
+            "verifier"
+        );
+        assert_eq!(
+            t.match_route("GET", "/oauth2/auth", None).unwrap().id,
+            "plain"
+        );
+    }
+
+    /// Templates of different segment counts are disjoint by construction, so
+    /// both can sit in the table and each takes its own shape.
+    #[test]
+    fn templates_of_different_lengths_do_not_compete() {
+        let t = table(
+            r#"
+routes:
+  - id: one
+    match: { methods: ["GET"], path_template: "/a/{x}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+  - id: two
+    match: { methods: ["GET"], path_template: "/a/{x}/{y}" }
+    legacy_upstream: "https://legacy.internal"
+    mode: legacy_only
+"#,
+        );
+        assert_eq!(t.match_route("GET", "/a/1", None).unwrap().id, "one");
+        assert_eq!(t.match_route("GET", "/a/1/2", None).unwrap().id, "two");
+        assert!(t.match_route("GET", "/a", None).is_none());
+    }
+
+    #[test]
+    fn a_template_route_still_matches_on_method() {
+        let t = table(TEMPLATE_AND_CATCH_ALL);
+        assert!(t.match_route("POST", "/conversations/1", None).is_none());
     }
 
     #[test]

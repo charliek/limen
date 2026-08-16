@@ -344,7 +344,7 @@ fn print_routes(loaded: &LoadedConfig) {
             (None, false) => "none".to_string(),
         };
         println!("{}", route.id);
-        println!("  match:      {methods}  {}", route.r#match.path_prefix);
+        println!("  match:      {methods}  {}", route.r#match.path_display());
         // Only shown when the route conditions on the query — an unconditioned
         // route (the default) needs no line.
         if !route.r#match.query_present.is_empty() {

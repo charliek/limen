@@ -517,7 +517,7 @@ fn relay_rule(
     // remainder: comparing it silently shadows every path nobody has looked at,
     // including the writes-in-GET-clothing this whole rule table exists to
     // catch. Traffic cannot tell you this; the route table can.
-    if route.r#match.path_prefix == CATCH_ALL_PREFIX {
+    if route.r#match.path_prefix.as_deref() == Some(CATCH_ALL_PREFIX) {
         return Some(Reason::CatchAll);
     }
     // R2/R3 — absence is not evidence. An unobserved route is not "clean", and
