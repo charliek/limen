@@ -15,9 +15,11 @@ use std::sync::OnceLock;
 use metrics::{counter, gauge, histogram};
 use metrics_exporter_prometheus::{Matcher, PrometheusBuilder, PrometheusHandle};
 
+use crate::config::model::FailSafeMode;
 use crate::observability::{ShadowFailure, SkipReason};
 use crate::resilience::BreakerState;
-use crate::routing::Upstream;
+use crate::routing::rollout::ResolvedPercentage;
+use crate::routing::{RouteTable, Upstream};
 
 // --- Metric names ---------------------------------------------------------
 
@@ -55,6 +57,18 @@ pub const DIFF_SINK_DROPPED_TOTAL: &str = "limen_diff_sink_dropped_total";
 pub const OBSERVE_OBSERVATIONS_TOTAL: &str = "limen_observe_observations_total";
 /// Circuit-breaker state by route/upstream (0 closed, 1 half-open, 2 open).
 pub const CIRCUIT_BREAKER_STATE: &str = "limen_circuit_breaker_state";
+/// Circuit-breaker phase transitions, by route and from/to state. A counter
+/// beside the state gauge: the gauge says where a breaker is, only the counter
+/// says how much it has been flapping to get there.
+pub const BREAKER_TRANSITIONS_TOTAL: &str = "limen_breaker_transitions_total";
+/// The rollout percentage a `percentage_split` route currently *targets* at the
+/// new upstream, by route.
+///
+/// Deliberately "resolved target", not "effective": an open breaker steers
+/// traffic away from new without changing what the rollout asks for, and the
+/// share actually served is [`REQUESTS_TOTAL`]'s job. Conflating the two would
+/// make a breaker episode look like somebody turned the rollout down.
+pub const ROLLOUT_RESOLVED_TARGET_PERCENTAGE: &str = "limen_rollout_resolved_target_percentage";
 /// Whether the flag provider is stale (1) or fresh (0).
 pub const FLAG_PROVIDER_STALE: &str = "limen_flag_provider_stale";
 /// Age of the last successful flag refresh, in seconds.
@@ -342,6 +356,79 @@ pub fn set_breaker_state(route_id: &str, state: BreakerState) {
         "upstream" => Upstream::New.as_str(),
     )
     .set(value);
+}
+
+/// Count one circuit-breaker phase transition. Only the four pairs in
+/// [`BreakerState::TRANSITIONS`] are ever emitted.
+pub fn record_breaker_transition(route_id: &str, from: BreakerState, to: BreakerState) {
+    counter!(
+        BREAKER_TRANSITIONS_TOTAL,
+        "route" => route_id.to_string(),
+        "from" => from.as_str(),
+        "to" => to.as_str(),
+    )
+    .increment(1);
+}
+
+/// Set a route's resolved rollout target from the *same* resolution the router
+/// used ([`crate::routing::rollout::resolve_percentage`]).
+pub fn set_rollout_target_percentage(route_id: &str, resolved: ResolvedPercentage) {
+    let value = match resolved {
+        ResolvedPercentage::Percentage(percentage) => percentage,
+        // A fail-safe displaces the rollout outright, so nothing is targeted at
+        // new. *Why* is the flag-staleness gauges' answer to give, not this
+        // one's — matched by mode so a future mode that still targets new
+        // cannot be silently reported as zero.
+        ResolvedPercentage::FailSafe(FailSafeMode::LegacyOnly) => 0.0,
+    };
+    gauge!(
+        ROLLOUT_RESOLVED_TARGET_PERCENTAGE,
+        "route" => route_id.to_string(),
+    )
+    .set(value);
+}
+
+/// Touch every rollout-truth series a route can produce — its target gauge and
+/// all four breaker transitions — so they render from the first scrape.
+///
+/// Same absence≠zero reasoning as [`register_verdict_series`], and the same
+/// consequence if it is skipped: "this breaker never opened" is the answer a
+/// rollout review needs, and an absent series says "this binary cannot tell
+/// you" in a shape that reads identically on a dashboard.
+///
+/// The rule is **registered set == emittable set**, in both directions. A route
+/// gets the target gauge exactly when it has a
+/// [`rollout_target`](crate::routing::CompiledRoute::rollout_target), and the
+/// four transition counters exactly when its breaker is
+/// [consulted](crate::routing::CompiledRoute::breaker_consulted) — having a
+/// breaker is not enough, since a `legacy_only` route may configure one that no
+/// request will ever ask. Registering a series nothing can emit would be the
+/// same lie as omitting one that something can, told the other way round.
+///
+/// Taking the compiled table rather than a list of ids is what lets both
+/// questions be asked of the same accessors the scrape handler uses, so
+/// pre-registration and the live values cannot cover different route sets.
+pub fn register_rollout_series(routes: &RouteTable) {
+    for route in routes.iter() {
+        if route.rollout_target().is_some() {
+            gauge!(
+                ROLLOUT_RESOLVED_TARGET_PERCENTAGE,
+                "route" => route.id.clone(),
+            )
+            .set(0.0);
+        }
+        if route.breaker_consulted() {
+            for (from, to) in BreakerState::TRANSITIONS {
+                counter!(
+                    BREAKER_TRANSITIONS_TOTAL,
+                    "route" => route.id.clone(),
+                    "from" => from.as_str(),
+                    "to" => to.as_str(),
+                )
+                .increment(0);
+            }
+        }
+    }
 }
 
 /// Set the flag-provider health gauges from a health snapshot.

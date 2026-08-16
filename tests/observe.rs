@@ -42,7 +42,12 @@ fn planes(cfg: &Config) -> (Router, Router) {
     let handle = limen::observability::prometheus::install();
     let state = build_state(cfg, Path::new(".")).expect("build state");
     let data = data_plane_router(state.clone());
-    let mut control = ControlState::new(state.flags().clone(), state.routes_arc(), handle);
+    let mut control = ControlState::new(
+        state.flags().clone(),
+        state.routes_arc(),
+        handle,
+        state.fail_safe_mode(),
+    );
     if let Some(recorder) = state.observe_recorder() {
         control = control.with_observe(recorder.clone());
     }

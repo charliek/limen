@@ -54,7 +54,12 @@ routes:
     let state = build_state(&cfg, Path::new(".")).expect("build state");
     let data = data_plane_router(state.clone());
     let control = control_plane_router(
-        ControlState::new(state.flags().clone(), state.routes_arc(), handle),
+        ControlState::new(
+            state.flags().clone(),
+            state.routes_arc(),
+            handle,
+            state.fail_safe_mode(),
+        ),
         "/metrics",
     );
 
@@ -167,7 +172,12 @@ routes:
     let state = build_state(&cfg, Path::new(".")).expect("build state");
     let data = data_plane_router(state.clone());
     let control = control_plane_router(
-        ControlState::new(state.flags().clone(), state.routes_arc(), handle),
+        ControlState::new(
+            state.flags().clone(),
+            state.routes_arc(),
+            handle,
+            state.fail_safe_mode(),
+        ),
         "/metrics",
     );
 

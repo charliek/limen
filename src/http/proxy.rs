@@ -85,7 +85,13 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
             parts.uri.query().map(str::to_string),
         )
     });
-    let decision = decision::decide_primary(route, &parts.headers, state.flags().as_ref()).await;
+    let decision = decision::decide_primary(
+        route,
+        &parts.headers,
+        state.flags().as_ref(),
+        state.fail_safe_mode(),
+    )
+    .await;
 
     // Inner warnings inherit the request id + route via this span.
     let span = info_span!("request", %request_id, route = %route_id);

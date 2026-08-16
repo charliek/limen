@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tracing::{info, warn};
 
-use crate::config::model::Config;
+use crate::config::model::{Config, FailSafeMode};
 use crate::flags::FlagProvider;
 use crate::health::endpoints::{self as health_endpoints, ControlState};
 use crate::http::client::UpstreamClient;
@@ -39,6 +39,9 @@ struct Inner {
     shadow_limiter: ShadowLimiter,
     observer: Arc<dyn ShadowObserver>,
     flags: Arc<dyn FlagProvider>,
+    /// What to do when flags are stale — config's `flags.fail_safe_mode`,
+    /// carried here because the routing decision needs it per request.
+    fail_safe_mode: FailSafeMode,
     request_body_limit: usize,
     /// The observe-mode recorder, present **only** when the `observe:` block
     /// is configured. `Some` is the whole enablement signal, as with the
@@ -50,13 +53,20 @@ struct Inner {
 impl AppState {
     /// Construct application state from its parts. The routing table is shared
     /// (behind an `Arc`) with the control plane, which reads per-route breaker
-    /// state at scrape time; metrics otherwise flow through the global recorder.
+    /// state and the resolved rollout target at scrape time; metrics otherwise
+    /// flow through the global recorder.
+    // One assembled part per argument, all of them already-built values with a
+    // single caller ([`build_state_with_observer`]) — bundling them into a
+    // parameter struct would add a type whose only job is to be destructured
+    // immediately.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         routes: RouteTable,
         client: UpstreamClient,
         shadow_limiter: ShadowLimiter,
         observer: Arc<dyn ShadowObserver>,
         flags: Arc<dyn FlagProvider>,
+        fail_safe_mode: FailSafeMode,
         request_body_limit: usize,
         observe: Option<Arc<ObserveRecorder>>,
     ) -> Self {
@@ -67,6 +77,7 @@ impl AppState {
                 shadow_limiter,
                 observer,
                 flags,
+                fail_safe_mode,
                 request_body_limit,
                 observe,
                 shutting_down: AtomicBool::new(false),
@@ -102,6 +113,13 @@ impl AppState {
     /// The feature-flag provider.
     pub fn flags(&self) -> &Arc<dyn FlagProvider> {
         &self.inner.flags
+    }
+
+    /// The fail-safe mode to apply when flags are stale. Read by the routing
+    /// decision *and* by the control plane's target-percentage gauge, which is
+    /// what keeps the two describing the same rollout.
+    pub fn fail_safe_mode(&self) -> FailSafeMode {
+        self.inner.fail_safe_mode
     }
 
     /// The hard cap on buffered request bodies (e.g. for failover replay).
@@ -159,6 +177,11 @@ pub fn build_state_with_observer(
     let shadow_limiter = ShadowLimiter::new(config.server.shadow_concurrency_limit);
     let flags = crate::flags::build(&config.flags)?;
     let request_body_limit = config.server.request_body_limit_bytes as usize;
+    // Pre-touch the rollout/breaker series here rather than in `serve`, so every
+    // path that builds a proxy renders them from its first scrape — the same
+    // reason `ObserveRecorder::new` registers its per-route counter (absence is
+    // not zero, and a review cannot tell the difference after the fact).
+    prometheus::register_rollout_series(&routes);
     // Built from the *compiled* route table, so the profile's key set is
     // exactly the routes that can match traffic — "never observed" and "no such
     // route" stay distinguishable, and traffic can never add a key. The
@@ -177,6 +200,7 @@ pub fn build_state_with_observer(
         shadow_limiter,
         observer,
         flags,
+        config.flags.fail_safe_mode,
         request_body_limit,
         observe,
     ))
@@ -249,8 +273,12 @@ pub async fn serve_with_shutdown(
         None => None,
     };
 
-    let mut control_state =
-        ControlState::new(state.flags().clone(), state.routes_arc(), metrics_handle);
+    let mut control_state = ControlState::new(
+        state.flags().clone(),
+        state.routes_arc(),
+        metrics_handle,
+        state.fail_safe_mode(),
+    );
     if config.sink_canary_enabled() {
         // Loud on purpose: this exposes an endpoint that writes synthetic
         // mismatch records into the live sink. It exists for campaign

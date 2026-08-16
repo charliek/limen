@@ -16,13 +16,14 @@ use tracing::error;
 
 use crate::compare::diff::DiffLimits;
 use crate::compare::{self, Captured};
+use crate::config::model::FailSafeMode;
 use crate::contract::model::ComparisonRules;
 use crate::flags::FlagProvider;
 use crate::health::readiness;
 use crate::observability::observe::OBSERVE_PROFILE_PATH;
 use crate::observability::request_id;
 use crate::observability::{prometheus, ObserveRecorder, ShadowMeta, ShadowObserver};
-use crate::routing::RouteTable;
+use crate::routing::{rollout, RouteTable};
 use crate::verdict::CANARY_ROUTE_ID;
 
 /// `/health/live` — see [`live`].
@@ -55,6 +56,11 @@ pub struct ControlState {
     flags: Arc<dyn FlagProvider>,
     routes: Arc<RouteTable>,
     metrics: PrometheusHandle,
+    /// The fail-safe mode the data plane routes by. Held so the scrape-time
+    /// rollout gauge resolves through exactly the inputs `decide_primary` uses
+    /// — a control plane guessing this could report a rollout the router is
+    /// not performing.
+    fail_safe_mode: FailSafeMode,
     /// The data plane's shadow observer, present **only** when
     /// `debug.sink_canary` is enabled. `Some` is the whole enablement signal:
     /// with the block off the control plane cannot reach the pipeline at all,
@@ -69,18 +75,20 @@ pub struct ControlState {
 }
 
 impl ControlState {
-    /// Assemble control-plane state from the flag provider, routing table, and
-    /// the Prometheus render handle. The debug canary is off unless
-    /// [`ControlState::with_sink_canary`] adds it.
+    /// Assemble control-plane state from the flag provider, routing table, the
+    /// Prometheus render handle, and the data plane's fail-safe mode. The debug
+    /// canary is off unless [`ControlState::with_sink_canary`] adds it.
     pub fn new(
         flags: Arc<dyn FlagProvider>,
         routes: Arc<RouteTable>,
         metrics: PrometheusHandle,
+        fail_safe_mode: FailSafeMode,
     ) -> Self {
         Self {
             flags,
             routes,
             metrics,
+            fail_safe_mode,
             canary_observer: None,
             observe: None,
         }
@@ -121,13 +129,25 @@ async fn ready(State(control): State<ControlState>) -> impl IntoResponse {
     (status, format!("{}\n", state.label()))
 }
 
-/// `/metrics` — Prometheus exposition. Point-in-time gauges (breaker state, flag
-/// health) are refreshed at scrape time so they reflect the moment of the
-/// scrape rather than a stale periodic sample.
+/// `/metrics` — Prometheus exposition. Point-in-time gauges (breaker state, the
+/// resolved rollout target, flag health) are refreshed at scrape time so they
+/// reflect the moment of the scrape rather than a stale periodic sample.
 async fn metrics(State(control): State<ControlState>) -> impl IntoResponse {
     for route in control.routes.iter() {
         if let Some(breaker) = &route.breaker {
             prometheus::set_breaker_state(&route.id, breaker.state());
+        }
+        // Resolved through the *router's* function, not a copy of its logic:
+        // the gauge and the routing decision are two readings of one
+        // resolution, so they cannot drift apart.
+        if let Some(rollout) = route.rollout_target() {
+            let resolved = rollout::resolve_percentage(
+                rollout,
+                control.flags.as_ref(),
+                control.fail_safe_mode,
+            )
+            .await;
+            prometheus::set_rollout_target_percentage(&route.id, resolved);
         }
     }
     let health = control.flags.health();
@@ -282,6 +302,7 @@ mod tests {
             Arc::new(StaleFlags),
             Arc::new(RouteTable::default()),
             PrometheusBuilder::new().build_recorder().handle(),
+            FailSafeMode::LegacyOnly,
         )
     }
 

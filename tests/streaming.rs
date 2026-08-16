@@ -108,7 +108,12 @@ fn planes(cfg: &Config, capture: &Capture) -> (Router, Router) {
     ]));
     let state = build_state_with_observer(cfg, Path::new("."), observer).expect("build state");
     let data = data_plane_router(state.clone());
-    let control = ControlState::new(state.flags().clone(), state.routes_arc(), handle);
+    let control = ControlState::new(
+        state.flags().clone(),
+        state.routes_arc(),
+        handle,
+        state.fail_safe_mode(),
+    );
     (data, control_plane_router(control, "/metrics"))
 }
 

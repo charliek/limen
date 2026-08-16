@@ -17,11 +17,11 @@
 
 use axum::http::HeaderMap;
 
-use crate::config::model::RouteMode;
+use crate::config::model::{FailSafeMode, RouteMode};
 use crate::flags::FlagProvider;
 use crate::resilience::BreakerReservation;
 use crate::routing::matcher::CompiledRoute;
-use crate::routing::rollout;
+use crate::routing::rollout::{self, ResolvedPercentage};
 
 /// Which upstream a request is sent to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -86,9 +86,10 @@ pub async fn decide_primary(
     route: &CompiledRoute,
     headers: &HeaderMap,
     flags: &dyn FlagProvider,
+    fail_safe_mode: FailSafeMode,
 ) -> PrimaryDecision {
     match route.mode {
-        RouteMode::PercentageSplit => percentage_split(route, headers, flags).await,
+        RouteMode::PercentageSplit => percentage_split(route, headers, flags, fail_safe_mode).await,
         RouteMode::FailoverToLegacy => gate_new(route),
         other => to_legacy(primary_upstream(other)),
     }
@@ -133,23 +134,24 @@ async fn percentage_split(
     route: &CompiledRoute,
     headers: &HeaderMap,
     flags: &dyn FlagProvider,
+    fail_safe_mode: FailSafeMode,
 ) -> PrimaryDecision {
-    // Fail safe: stale flags apply the fail-safe mode (legacy_only is the only
-    // mode today) regardless of percentage.
-    if flags.health().stale {
-        return to_legacy(Upstream::Legacy);
-    }
     // A percentage_split route always has rollout config (validated); absent it,
     // fail safe to legacy.
     let Some(rollout) = &route.rollout else {
         return to_legacy(Upstream::Legacy);
     };
-    let percentage = flags
-        .get(&rollout.percentage_flag)
-        .await
-        .and_then(|v| v.as_f64())
-        .unwrap_or(rollout.default_percentage)
-        .clamp(0.0, 100.0);
+    // The same resolution `/metrics` reports as the target percentage — see
+    // `rollout::resolve_percentage` for why there is only one of these.
+    let percentage = match rollout::resolve_percentage(rollout, flags, fail_safe_mode).await {
+        ResolvedPercentage::Percentage(percentage) => percentage,
+        // Matched by mode, not by wildcard: a fail-safe mode this router does
+        // not yet know how to honor must fail to compile here rather than
+        // quietly inherit legacy's meaning.
+        ResolvedPercentage::FailSafe(FailSafeMode::LegacyOnly) => {
+            return to_legacy(Upstream::Legacy)
+        }
+    };
     let key = rollout::assignment_key(
         rollout.assignment_key.header.as_deref(),
         rollout.assignment_key.fallback,
@@ -257,13 +259,13 @@ routes:
             percentage: Some(0.0),
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &all_new)
+            decide_primary(route, &headers("t"), &all_new, FailSafeMode::LegacyOnly)
                 .await
                 .upstream,
             Upstream::New
         );
         assert_eq!(
-            decide_primary(route, &headers("t"), &none_new)
+            decide_primary(route, &headers("t"), &none_new, FailSafeMode::LegacyOnly)
                 .await
                 .upstream,
             Upstream::Legacy
@@ -278,14 +280,24 @@ routes:
             stale: false,
             percentage: Some(50.0),
         };
-        let first = decide_primary(route, &headers("tenant-42"), &flags)
-            .await
-            .upstream;
+        let first = decide_primary(
+            route,
+            &headers("tenant-42"),
+            &flags,
+            FailSafeMode::LegacyOnly,
+        )
+        .await
+        .upstream;
         for _ in 0..10 {
             assert_eq!(
-                decide_primary(route, &headers("tenant-42"), &flags)
-                    .await
-                    .upstream,
+                decide_primary(
+                    route,
+                    &headers("tenant-42"),
+                    &flags,
+                    FailSafeMode::LegacyOnly
+                )
+                .await
+                .upstream,
                 first
             );
         }
@@ -301,7 +313,9 @@ routes:
             percentage: Some(100.0),
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &stale).await.upstream,
+            decide_primary(route, &headers("t"), &stale, FailSafeMode::LegacyOnly)
+                .await
+                .upstream,
             Upstream::Legacy
         );
     }
@@ -316,7 +330,7 @@ routes:
             percentage: None,
         };
         assert_eq!(
-            decide_primary(route, &headers("t"), &no_value)
+            decide_primary(route, &headers("t"), &no_value, FailSafeMode::LegacyOnly)
                 .await
                 .upstream,
             Upstream::Legacy
