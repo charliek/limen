@@ -44,6 +44,11 @@ concurrency:
 jobs:
   docs-twin:
     runs-on: ubuntu-latest
+    # The job only ever reads: this repo's checkout and the sibling's docs via
+    # the API. Pinned read-only here so the GITHUB_TOKEN fallback stays
+    # least-privilege whatever the repo's default workflow permissions are.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v6
         with:

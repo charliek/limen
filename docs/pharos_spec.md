@@ -66,7 +66,7 @@ Migrations that do **not** share a datastore (separate stores requiring synchron
 
 ### 2.2 Core use cases
 
-1. **Local comparison during development.** `npm run ftest -- run --scenario users.get-user-success` calls both services, compares, prints readable pass/fail with diffs.
+1. **Local comparison during development.** `bun run ftest -- run --scenario users.get-user-success` calls both services, compares, prints readable pass/fail with diffs.
 2. **CI compatibility gate.** A PR modifying the new service triggers the suite against deployed/containerized endpoints; required-scenario failures fail the build.
 3. **Legacy recording workflow.** An engineer captures a real legacy interaction and converts it to a scenario; dynamic values (IDs, timestamps, tokens, request IDs, env URLs) become variables or normalization rules.
 4. **Replay against new service.** Recorded legacy interactions are replayed against the new service and compared to the recorded response (or a fresh legacy response, depending on mode).
@@ -1050,9 +1050,9 @@ Exit `1` when any required scenario fails; exit `0` when all selected required s
 Each phase ends with passing harness tests and a runnable CLI. Build incrementally and run tests after each major component.
 
 ### Phase 0 — Scaffold
-- TypeScript + Vitest project; module skeleton (Section 3.5); npm scripts; CI (typecheck + test + lint); README stub; license.
+- TypeScript + Vitest project; module skeleton (Section 3.5); package scripts; CI (typecheck + test + lint); README stub; license.
 - CLI shell with `run`, `validate`, `record`, `check-contract`.
-- **Done when:** `npm run test` (empty) passes; typecheck and lint pass in CI.
+- **Done when:** `bun run test` (empty) passes; typecheck and lint pass in CI.
 
 ### Phase 1 — Scenario + contract loading and validation
 - Zod schemas for scenarios and the contract; discovery via `fast-glob`; `validate` and `check-contract`; reference resolution and merge; JSONPath-subset enforcement; the contract-vs-inline conflict rule.
@@ -1147,7 +1147,7 @@ Plus an example scenario demonstrating **ignored dynamic response fields** (may 
 
 ### 16.1 MVP acceptance criteria
 
-**Project scaffold:** TypeScript + Vitest; clear npm scripts for validation, execution, and harness tests; example scenarios; README.
+**Project scaffold:** TypeScript + Vitest; clear bun scripts for validation, execution, and harness tests; example scenarios; README.
 
 **Scenario loading & validation:** loads YAML (and JSON) from `scenario_dir`; validates required fields; rejects unknown/invalid enum values; reports errors with file path **and** field path; selects by ID and tag.
 
