@@ -18,7 +18,8 @@
 
 use std::net::IpAddr;
 
-use axum::http::{HeaderMap, HeaderValue};
+use axum::http::HeaderMap;
+use stridelabs_http::proxy::{apply_forwarded, ForwardedPolicy, XffPolicy, XfpPolicy};
 
 /// Chain of client addresses this request has passed through (RFC 7239-adjacent
 /// de-facto convention). Limen appends its own view of the client's address to
@@ -32,16 +33,6 @@ pub const X_FORWARDED_FOR: &str = "x-forwarded-for";
 /// upstream of Limen (e.g. a TLS-terminating load balancer) and is
 /// authoritative — Limen never overwrites it.
 pub const X_FORWARDED_PROTO: &str = "x-forwarded-proto";
-
-/// The scheme Limen reports on `X-Forwarded-Proto` when the client didn't
-/// already supply one. This is the scheme of Limen's *own* data-plane
-/// listener, which is always plain HTTP today — Limen has no listener-TLS
-/// config to source anything else from (TLS termination, if any, happens in
-/// front of Limen; `upstream_tls` config governs calls *to* upstreams, not
-/// this listener). If a listener-scheme config field is ever added, this
-/// constant becomes that field's default and `apply` takes the resolved value
-/// instead.
-const LIMEN_LISTENER_SCHEME: &str = "http";
 
 /// Marks a request as Limen's fire-and-forget shadow copy to the new
 /// upstream. Never present on the primary request that serves the client.
@@ -65,38 +56,52 @@ pub const X_LIMEN_SHADOW: &str = "x-limen-shadow";
 /// value; `X-Forwarded-Proto` is unaffected (it never depends on the client
 /// address).
 pub fn apply(headers: &mut HeaderMap, client_addr: Option<IpAddr>) {
-    if let Some(addr) = client_addr {
-        // A client (or an intermediary ahead of Limen) may have sent
-        // `X-Forwarded-For` as more than one header line (`HeaderMap` keeps
-        // every line under one name); `get` alone would only see the first
-        // and `insert` would then discard the rest. Collect every existing
-        // line first so no hop in the chain is lost, then replace them all
-        // with one combined line (`insert` removes every prior line for the
-        // name) — one field-line output is standard XFF practice and keeps
-        // the header simple to append to again downstream.
-        let mut chain: Vec<String> = headers
-            .get_all(X_FORWARDED_FOR)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .filter(|v| !v.is_empty())
-            .map(str::to_owned)
-            .collect();
-        chain.push(addr.to_string());
-        let combined = chain.join(", ");
-        if let Ok(value) = HeaderValue::from_str(&combined) {
-            headers.insert(X_FORWARDED_FOR, value);
-        }
-    }
-    if !headers.contains_key(X_FORWARDED_PROTO) {
-        headers.insert(
-            X_FORWARDED_PROTO,
-            HeaderValue::from_static(LIMEN_LISTENER_SCHEME),
-        );
-    }
+    apply_forwarded(headers, client_addr, &LIMEN_LEG);
 }
+
+/// The one forwarding policy Limen has: there is a single data-plane leg, and
+/// the primary, failover-replay and shadow requests are all built from headers
+/// [`apply`] ran on once.
+///
+/// [`XffPolicy::Append`] *is* Limen's append semantics — the crate's variant was
+/// extracted from this file verbatim, down to the parts one would not choose
+/// fresh (multi-line-aware, written back as one combined line; omitted only when
+/// there is no peer *and* nothing already there, so an existing chain is never
+/// erased; empty and non-ASCII existing lines silently dropped; the peer
+/// rendered bare, so an IPv6 client carries no brackets).
+///
+/// [`XfpPolicy::PreserveTrustedOrSet`], not `Override`: an existing
+/// `X-Forwarded-Proto` came from a proxy ahead of Limen (e.g. a
+/// TLS-terminating load balancer) and is authoritative, so Limen never replaces
+/// it — it only fills the gap.
+///
+/// **The scheme is a hardcoded `"http"`, and that is a limitation rather than a
+/// simplification.** It is the scheme of Limen's *own* data-plane listener,
+/// which is always plain HTTP today because Limen has no listener-TLS config to
+/// source anything else from (TLS termination, if any, happens in front of
+/// Limen; `upstream_tls` governs calls *to* upstreams, not this listener).
+/// Taking the scheme as a parameter — which is what the shared crate does —
+/// moved this constant out of the function that used to hold it and into the
+/// call site, but did not resolve it: there is still no configured value to
+/// pass. If a listener-scheme config field is ever added, this constant becomes
+/// that field's default and the resolved value is threaded here instead.
+const LIMEN_LEG: ForwardedPolicy = ForwardedPolicy {
+    xff: XffPolicy::Append,
+    xfp: XfpPolicy::PreserveTrustedOrSet(LIMEN_LISTENER_SCHEME),
+    // Empty, and not the place for `X-Limen-Shadow`: that header marks the
+    // shadow copy only, and `shadow::plan` sets it after this has already run
+    // on the headers both requests are built from.
+    overrides: &[],
+};
+
+/// See [`LIMEN_LEG`] — the scheme Limen states when the client did not already
+/// supply one.
+const LIMEN_LISTENER_SCHEME: &str = "http";
 
 #[cfg(test)]
 mod tests {
+    use axum::http::HeaderValue;
+
     use super::*;
 
     #[test]

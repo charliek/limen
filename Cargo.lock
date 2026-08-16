@@ -1055,6 +1055,7 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_yaml",
+ "stridelabs-http",
  "tempfile",
  "thiserror",
  "time",
@@ -1938,6 +1939,26 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
+
+[[package]]
+name = "stridelabs-http"
+version = "0.4.0"
+source = "git+https://github.com/charliek/stridelabs-rust.git?tag=v0.4.0#649b81d9f599e7659ade345cedc143a403076e2a"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures",
+ "http",
+ "reqwest",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "url",
+]
 
 [[package]]
 name = "strsim"

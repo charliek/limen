@@ -38,6 +38,22 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
 ] }
 
+# Shared StrideLabs HTTP primitives. The `proxy` feature is where limen's own
+# mechanical layer went when it was extracted upstream — header filtering,
+# upstream-URL construction, bounded body buffering, `X-Forwarded-*` synthesis,
+# the pooled upstream client — so limen now consumes what it exported instead
+# of maintaining a second copy. Everything limen layers *on top* of that
+# (the `x-limen-*` strips, the config-shaped client build, the listener scheme)
+# stays here, in thin wrappers over these calls.
+#
+# Pinned to a tag, not a branch — but the committed Cargo.lock rev is the
+# actual supply-chain pin (a tag is a mutable ref; the lock is not). The tag
+# names the intent, the lock enforces it, and bumping either is a deliberate
+# edit reviewed here.
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", default-features = false, features = [
+    "proxy",
+] }
+
 # Config / contract serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -17,13 +17,13 @@ use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, Method};
 use bytes::Bytes;
+use stridelabs_http::proxy::{buffer_or_stream, Buffered};
 use tracing::{info_span, Instrument};
 use url::Url;
 
 use crate::compare::{self, diff::DiffLimits, Captured};
 use crate::config::model::RouteMode;
 use crate::contract::model::ComparisonRules;
-use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
 use crate::http::forwarded::X_LIMEN_SHADOW;
 use crate::observability::{prometheus, ShadowFailure, ShadowMeta, ShadowObserver, SkipReason};
@@ -217,7 +217,7 @@ async fn run(
 
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
-    let body = match body::buffer_or_stream(resp, shadow.max_body_bytes).await {
+    let body = match buffer_or_stream(resp, shadow.max_body_bytes).await {
         Buffered::Full(body) => body,
         Buffered::TooLarge(_) => {
             return observer.comparison_skipped(&meta, SkipReason::ResponseTooLarge);
@@ -232,6 +232,11 @@ async fn run(
         // Includes the total timeout firing mid-body: the stream errors and the
         // permit is released here.
         Buffered::Error => return observer.shadow_failed(&meta, ShadowFailure::Error),
+        // `Buffered` is `#[non_exhaustive]`; unreachable today. Reported as a
+        // shadow failure rather than a comparison skip: a skip claims the
+        // shadow ran and the bytes were merely not comparable, which an
+        // unrecognized outcome is not evidence of.
+        _ => return observer.shadow_failed(&meta, ShadowFailure::Error),
     };
 
     let new = Captured {
