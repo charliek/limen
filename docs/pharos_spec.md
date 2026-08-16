@@ -1147,7 +1147,7 @@ Plus an example scenario demonstrating **ignored dynamic response fields** (may 
 
 ### 16.1 MVP acceptance criteria
 
-**Project scaffold:** TypeScript + Vitest; clear bun scripts for validation, execution, and harness tests; example scenarios; README.
+**Project scaffold:** TypeScript + Vitest; clear bun scripts for validation (`bun run validate`), execution, and harness tests; example scenarios; README.
 
 **Scenario loading & validation:** loads YAML (and JSON) from `scenario_dir`; validates required fields; rejects unknown/invalid enum values; reports errors with file path **and** field path; selects by ID and tag.
 
