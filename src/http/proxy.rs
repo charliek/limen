@@ -20,13 +20,16 @@ use axum::http::request::Parts;
 use axum::http::{HeaderMap, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use stridelabs_http::proxy::{
+    buffer_or_stream, buffer_or_stream_within, buffer_request_or_stream, build_upstream_url,
+    request_has_body, response_from_parts, Buffered, Direction,
+};
 use tracing::{info, info_span, warn, Instrument};
 use url::Url;
 
 use super::server::AppState;
 use crate::compare::Captured;
 use crate::config::model::RouteMode;
-use crate::http::body::{self, Buffered};
 use crate::http::client::UpstreamClient;
 use crate::http::forwarded;
 use crate::http::shadow::{self, ShadowRequest};
@@ -35,19 +38,6 @@ use crate::observability::{prometheus, Observation, ResponseOrigin, SkipReason};
 use crate::resilience::{BreakerReservation, ShadowPermit};
 use crate::routing::decision::PrimaryDecision;
 use crate::routing::{decision, CompiledRoute, Upstream};
-
-/// Hop-by-hop headers (RFC 7230 §6.1) that must not be forwarded across a proxy.
-/// Compared lowercased, which is how `HeaderName::as_str` renders them.
-const HOP_BY_HOP: &[&str] = &[
-    "connection",
-    "keep-alive",
-    "proxy-authenticate",
-    "proxy-authorization",
-    "te",
-    "trailer",
-    "transfer-encoding",
-    "upgrade",
-];
 
 /// The debug-gated upstream-attribution response header (`debug.upstream_header`,
 /// [`crate::config::model::DebugConfig`]). Only [`handle`] ever sets it — on a
@@ -473,7 +463,7 @@ async fn prepare_request_body(
         return Some((streamed(body), None));
     }
 
-    match body::buffer_request_or_stream(body, shadow.max_body_bytes).await {
+    match buffer_request_or_stream(body, shadow.max_body_bytes).await {
         Buffered::Full(bytes) => {
             shadow.body = Some(bytes.clone());
             Some((reqwest::Body::from(bytes), Some(shadow)))
@@ -493,6 +483,15 @@ async fn prepare_request_body(
             Some((streamed(rest), None))
         }
         Buffered::Error => None,
+        // `Buffered` is `#[non_exhaustive]`, so a wildcard is mandatory. A
+        // variant this build has never heard of is by definition a bounded read
+        // that ended some way limen cannot reason about — treated as `Error`,
+        // which refuses the request, rather than as a shadow-skip that would
+        // serve the client on an outcome nobody checked. Every named arm above
+        // is written for a variant the crate can return (`TimedOut` only from
+        // the deadline entry point, which this leg does not use); this wildcard
+        // alone is unreachable today.
+        _ => None,
     }
 }
 
@@ -583,7 +582,7 @@ async fn failover_dispatch(
     // the same `unreadable_body` the streaming path returns). Reporting an
     // aborted upload as 413 would send an operator hunting a size limit that
     // was never reached.
-    let bytes = match body::buffer_request_or_stream(body, state.request_body_limit()).await {
+    let bytes = match buffer_request_or_stream(body, state.request_body_limit()).await {
         Buffered::Full(bytes) => bytes,
         // `TimedOut` cannot arise — this read passes no deadline — but it would
         // mean what the over-limit arm means: no complete body to replay.
@@ -597,6 +596,13 @@ async fn failover_dispatch(
             return Dispatched::refused(resp, Upstream::New);
         }
         Buffered::Error => {
+            release_breaker(breaker);
+            return Dispatched::refused(unreadable_body(), Upstream::New);
+        }
+        // `Buffered` is `#[non_exhaustive]`; unreachable today. Folded into the
+        // unreadable-body refusal rather than the 413, since an unknown outcome
+        // is precisely not evidence that a size limit was reached.
+        _ => {
             release_breaker(breaker);
             return Dispatched::refused(unreadable_body(), Upstream::New);
         }
@@ -636,7 +642,7 @@ async fn failover_dispatch(
         if !resp.status().is_server_error() {
             let status = resp.status();
             let resp_headers = filter_headers(resp.headers(), Direction::Response);
-            match body::buffer_or_stream(resp, state.request_body_limit()).await {
+            match buffer_or_stream(resp, state.request_body_limit()).await {
                 Buffered::Full(buffered) => {
                     record_breaker(breaker, true);
                     return Dispatched::relayed(
@@ -661,6 +667,12 @@ async fn failover_dispatch(
                 // Body errored mid-read (including the total timeout firing):
                 // a new-side failure — fall through to the legacy replay.
                 Buffered::Error => prometheus::record_upstream_error(route_id, Upstream::New),
+                // `Buffered` is `#[non_exhaustive]`; unreachable today. An
+                // outcome that cannot be shown to be a complete body is not one
+                // to relay to the client, so it takes the failure path — which
+                // is the conservative direction here, since the legacy replay
+                // still serves the client.
+                _ => prometheus::record_upstream_error(route_id, Upstream::New),
             }
         }
     }
@@ -815,7 +827,7 @@ async fn primary_succeeded(
         );
     }
 
-    match body::buffer_or_stream_within(resp, shadow_req.max_body_bytes, deadline).await {
+    match buffer_or_stream_within(resp, shadow_req.max_body_bytes, deadline).await {
         Buffered::Full(bytes) => {
             let legacy = Captured {
                 status: status.as_u16(),
@@ -866,6 +878,15 @@ async fn primary_succeeded(
             // profile would record a status the client never saw.
             (bad_gateway(), ResponseOrigin::UpstreamSilent)
         }
+        // `Buffered` is `#[non_exhaustive]`; unreachable today. The demotion
+        // arms above each need the body the variant carries, which an unknown
+        // variant cannot be assumed to have — so this takes the `Error` path,
+        // the only one that does not depend on holding a body.
+        _ => {
+            drop(shadow_req);
+            drop(permit);
+            (bad_gateway(), ResponseOrigin::UpstreamSilent)
+        }
     }
 }
 
@@ -908,42 +929,20 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         .is_some_and(|essence| essence.trim().eq_ignore_ascii_case("text/event-stream"))
 }
 
-/// Build the upstream URL from the upstream origin + the request's path/query.
-///
-/// The upstream is expected to be an origin (`scheme://host[:port]`). Returns
-/// `None` if setting the request path would change it (dot-segment collapse such
-/// as `/a/../b`, or a path the URL parser re-encodes) — Limen refuses to forward
-/// a rewritten path rather than risk sending the upstream a different resource
-/// than the client asked for.
-fn build_upstream_url(base: &Url, path: &str, query: Option<&str>) -> Option<Url> {
-    let mut url = base.clone();
-    url.set_path(path);
-    if url.path() != path {
-        return None;
-    }
-    url.set_query(query);
-    Some(url)
-}
-
-/// Whether headers are being forwarded on the request or response leg.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Direction {
-    Request,
-    Response,
-}
-
 /// Copy headers, dropping:
-/// - hop-by-hop headers ([`HOP_BY_HOP`]) and any header named in a `Connection`
-///   header's token list (RFC 7230 §6.1);
-/// - `transfer-encoding` (a hop-by-hop header) in both directions, since the
-///   relay re-frames the body;
+/// - everything [`stridelabs_http::proxy::filter_headers`] drops, which is the
+///   generic proxy-hop answer and the whole of what limen used to spell out
+///   here: hop-by-hop headers
+///   ([`HOP_BY_HOP`](stridelabs_http::proxy::HOP_BY_HOP)) and any header named
+///   in a `Connection` header's token list (RFC 7230 §6.1), including
+///   `transfer-encoding` in both directions since the relay re-frames the body,
+///   plus `host` and `content-length` on the **request** leg — the upstream
+///   client sets Host and frames the streamed request body itself;
 /// - `x-limen-upstream` ([`X_LIMEN_UPSTREAM`]) in **both** directions,
 ///   unconditionally, whether `debug.upstream_header` is on or off: a client
 ///   must never make its own value reach an upstream, and an upstream must
 ///   never make its own value reach the client — only [`handle`], after this
 ///   filter has already run, is allowed to set it on the client response;
-/// - on the **request** leg, `host` and `content-length` — the upstream client
-///   sets Host and frames the streamed request body itself;
 /// - on the **request** leg, a client-supplied `X-Limen-Shadow`
 ///   unconditionally — Limen is the only party allowed to assert shadow
 ///   status (`shadow::plan` sets it on the shadow copy only); without this a
@@ -956,68 +955,43 @@ enum Direction {
 ///
 /// Response `content-length` is preserved: the body is relayed unchanged, so the
 /// length still matches (and `HEAD`/`304` keep their meaningful length).
+///
+/// The generic hop rules are the shared crate's; the `x-limen-*` and
+/// `X-Forwarded-*` strips above are limen's product policy and are why this
+/// wrapper exists at all rather than the crate function being called directly.
+/// They are applied by removing the names *after* the generic copy: `remove`
+/// takes every field line under a name, so the result is the same map the
+/// hand-written single-pass filter produced.
 fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
-    let connection_named = connection_tokens(src);
-    let mut out = HeaderMap::with_capacity(src.len());
-    for (name, value) in src {
-        let n = name.as_str();
-        let drop = HOP_BY_HOP.contains(&n)
-            || connection_named.iter().any(|t| t == n)
-            || n == X_LIMEN_UPSTREAM
-            || (direction == Direction::Request
-                && (n == "host" || n == "content-length" || n == forwarded::X_LIMEN_SHADOW))
-            || (direction == Direction::Response
-                && (n == forwarded::X_FORWARDED_FOR
-                    || n == forwarded::X_FORWARDED_PROTO
-                    || n == forwarded::X_LIMEN_SHADOW));
-        if drop {
-            continue;
+    let mut out = stridelabs_http::proxy::filter_headers(src, direction);
+    out.remove(X_LIMEN_UPSTREAM);
+    match direction {
+        Direction::Request => {
+            out.remove(forwarded::X_LIMEN_SHADOW);
         }
-        out.append(name.clone(), value.clone());
+        Direction::Response => {
+            out.remove(forwarded::X_FORWARDED_FOR);
+            out.remove(forwarded::X_FORWARDED_PROTO);
+            out.remove(forwarded::X_LIMEN_SHADOW);
+        }
     }
     out
 }
 
-/// Whether the request carries a body, per its framing headers — a non-zero
-/// `content-length` or any `transfer-encoding`. Used to keep a body-bearing
-/// GET/HEAD out of shadowing (the shadow replays an empty request).
-fn request_has_body(headers: &HeaderMap) -> bool {
-    if headers.contains_key("transfer-encoding") {
-        return true;
-    }
-    headers
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<u64>().ok())
-        .is_some_and(|n| n > 0)
-}
-
-/// Lowercased header names listed in any `Connection` header's comma-separated
-/// token list — these are connection-specific and must not be forwarded.
-fn connection_tokens(headers: &HeaderMap) -> Vec<String> {
-    headers
-        .get_all("connection")
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(','))
-        .map(|t| t.trim().to_ascii_lowercase())
-        .filter(|t| !t.is_empty())
-        .collect()
-}
-
 /// Turn the upstream response into a streamed client response.
+///
+/// Deliberately **not** [`stridelabs_http::proxy::relay_response`], which is
+/// otherwise line-for-line this function: the crate's version calls the crate's
+/// own generic filter, which knows nothing about `x-limen-upstream`. Adopting it
+/// would relay an upstream-forged `x-limen-upstream` straight to the client
+/// whenever `debug.upstream_header` is off — the exact leak
+/// [`filter_headers`]'s unconditional strip exists to prevent, and the one
+/// `tests/upstream_header.rs` pins. What is shared is the assembly underneath
+/// ([`response_from_parts`]); the filter choice stays limen's.
 fn relay_response(resp: reqwest::Response) -> Response {
     let status = resp.status();
     let headers = filter_headers(resp.headers(), Direction::Response);
     response_from_parts(status, headers, Body::from_stream(resp.bytes_stream()))
-}
-
-/// Assemble a client response from a status, headers, and body.
-fn response_from_parts(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
-    let mut response = Response::new(body);
-    *response.status_mut() = status;
-    *response.headers_mut() = headers;
-    response
 }
 
 fn not_found() -> Response {
@@ -1042,6 +1016,19 @@ fn gateway_timeout() -> Response {
     (StatusCode::GATEWAY_TIMEOUT, "limen: upstream timed out\n").into_response()
 }
 
+/// Two kinds of test live here, and the difference matters when reading them.
+///
+/// The `filter_*` tests exercise limen's own wrapper — the `x-limen-*` and
+/// `X-Forwarded-*` strips are product policy and nothing upstream will ever
+/// assert them.
+///
+/// The `upstream_url_*` and `detects_request_body_presence` tests exercise
+/// functions that now live in [`stridelabs_http::proxy`]. They were kept when
+/// the implementations left rather than deleted along with them: they are the
+/// behavior limen *depends on* — a path that would be rewritten is refused, a
+/// zero `content-length` is not a body — and keeping them means a future
+/// version bump of the shared crate has to survive limen's own statement of
+/// that contract, not only the crate's.
 #[cfg(test)]
 mod tests {
     use super::*;
