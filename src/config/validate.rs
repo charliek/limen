@@ -1882,6 +1882,35 @@ routes:
         ));
     }
 
+    /// The other half of the steal rule, pinned because it is the case the
+    /// orientation check is easiest to over-refuse: BOTH templates conditioned,
+    /// overlapping (not provably disjoint), narrower subsuming into broader.
+    /// Path specificity orders the pair — the narrower wins where it matches —
+    /// and the condition on the narrower shape is the operator declaring which
+    /// of *its own* requests it wants, so this is ordinary refinement, not a
+    /// steal. Only equal-rank pairs (identical templates, equal prefixes) need
+    /// provable disjointness (spec Section 5.2, Precedence).
+    #[test]
+    fn a_conditioned_narrower_template_refines_a_conditioned_broader_one() {
+        assert_accepted(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}", query_present: ["login_verifier"] }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth", query_present: ["login_verifier"] }"#,
+        ));
+        // Orientation-independent: the narrow route listed first is the same
+        // refinement, accepted the same way.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["POST"], path_template: "/oauth2/auth", query_present: ["login_verifier"] }"#,
+            r#"{ methods: ["POST"], path_template: "/oauth2/{action}", query_present: ["login_verifier"] }"#,
+        ));
+        // Unrelated, non-disjoint conditions (a `query_present` pair over
+        // different names, which the equal-shape rule would refuse) are also
+        // fine once the shapes are subsumption-ordered.
+        assert_accepted(&two_routes(
+            r#"{ methods: ["GET"], path_template: "/conversations/{id}", query_present: ["a"] }"#,
+            r#"{ methods: ["GET"], path_template: "/conversations/export", query_absent: ["b"] }"#,
+        ));
+    }
+
     /// Co-matchable but incomparable: each template pins a segment the other
     /// leaves open, so no order is defensible and Limen refuses to start.
     #[test]

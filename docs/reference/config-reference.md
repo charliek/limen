@@ -165,6 +165,15 @@ some parameter appears in one route's `query_present` and the other's
 `query_absent`. The check is conservative on purpose: anything it cannot prove
 disjoint is an error, rather than letting config order silently decide.
 
+That rule governs pairs of *equal* path rank only. Where the path itself
+already orders the pair — a longer prefix, or a strictly narrower template —
+the path decides first, conditioned or not: a conditioned narrower template
+sitting over a conditioned broader one is ordinary refinement (the narrower
+wins where it matches, and its condition narrows only its own shape) and needs
+no disjointness. The one exception is the steal orientation in the overlap
+table below — a narrower *unconditioned* template over a broader
+query-conditioned one — which is rejected at load time.
+
 A route declaring neither field matches exactly as it did before these fields
 existed.
 
