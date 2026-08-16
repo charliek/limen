@@ -238,17 +238,12 @@ impl CompiledRoute {
     /// that cannot move — which reads on a dashboard exactly like a breaker
     /// that has never had to.
     ///
-    /// Matched exhaustively, unlike [`rollout_target`](Self::rollout_target):
-    /// there is no safe default for a new mode here, so one has to declare
-    /// which side of `gate_new` it falls on.
+    /// The mode half is [`RouteMode::gates_new`], which is matched exhaustively
+    /// there so a new mode has to declare which side of `gate_new` it falls on
+    /// — and so the report page's config-side mirror of this predicate cannot
+    /// answer differently.
     pub fn breaker_consulted(&self) -> bool {
-        self.breaker.is_some()
-            && match self.mode {
-                RouteMode::PercentageSplit | RouteMode::FailoverToLegacy => true,
-                RouteMode::LegacyOnly | RouteMode::NewOnly | RouteMode::ShadowLegacyPrimary => {
-                    false
-                }
-            }
+        self.breaker.is_some() && self.mode.gates_new()
     }
 
     /// Whether this route matches the given (already-uppercased) method, path,

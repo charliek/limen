@@ -365,6 +365,21 @@ impl RouteMode {
         !matches!(self, RouteMode::LegacyOnly)
     }
 
+    /// Whether a request in this mode reaches the new-upstream gate
+    /// ([`crate::routing::decision`]'s `gate_new`) — the one place a circuit
+    /// breaker is ever consulted, and so the mode half of
+    /// [`crate::routing::CompiledRoute::breaker_consulted`].
+    ///
+    /// Matched exhaustively on purpose: there is no safe default for a new
+    /// mode, so adding one has to declare which side of the gate it falls on
+    /// here, once, rather than in each of the places that ask.
+    pub fn gates_new(self) -> bool {
+        match self {
+            RouteMode::PercentageSplit | RouteMode::FailoverToLegacy => true,
+            RouteMode::LegacyOnly | RouteMode::NewOnly | RouteMode::ShadowLegacyPrimary => false,
+        }
+    }
+
     /// The serialized (snake_case) name, for display and error messages.
     pub fn as_str(self) -> &'static str {
         match self {

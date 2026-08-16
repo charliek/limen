@@ -63,14 +63,18 @@ use std::path::{Path, PathBuf};
 use serde::Deserialize;
 
 use crate::config::load::{load as load_config, ConfigOverrides};
-use crate::config::model::Config;
+use crate::config::model::{Config, FailSafeMode, RouteMode};
 use crate::observability::prometheus::{
-    COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL,
-    DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT, SHADOW_SKIPPED_TOTAL,
-    SHADOW_TOTAL,
+    BREAKER_TRANSITIONS_TOTAL, CIRCUIT_BREAKER_STATE, COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL,
+    DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL, DIFF_SINK_WRITTEN_TOTAL,
+    FLAG_CONSECUTIVE_FAILURES, FLAG_PROVIDER_STALE, FLAG_STALENESS_SECONDS, REQUESTS_TOTAL,
+    ROLLOUT_RESOLVED_TARGET_PERCENTAGE, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT,
+    SHADOW_SKIPPED_TOTAL, SHADOW_TOTAL,
 };
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
-use crate::verdict::{Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
+use crate::resilience::BreakerState;
+use crate::routing::Upstream;
+use crate::verdict::{Sample, Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 
 /// The metric families the runtime-counters section renders, each tagged with
 /// what an *absent* family is allowed to mean — mirroring
@@ -374,13 +378,22 @@ pub struct RouteProfileDto {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigView {
     pub routes: Vec<ConfigRoute>,
+    /// `flags.fail_safe_mode` — what a stale flag provider displaces every
+    /// rollout with. Carried because the rollout section states the *joined*
+    /// truth ("0% because the flags are stale"), and that sentence is only
+    /// honest if the page read which fail-safe the config actually declares.
+    pub fail_safe_mode: FailSafeMode,
+    /// `flags.stale_ttl_ms` — the threshold the stale gauge is set against, so
+    /// the page can tell one coherent provider snapshot from three gauges that
+    /// cannot have come from one (see [`flag_tuple_fault`]).
+    pub stale_ttl_ms: u64,
 }
 
 /// One configured route, as the page renders it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigRoute {
     pub id: String,
-    pub mode: String,
+    pub mode: RouteMode,
     pub comparison_enabled: bool,
     pub sample_rate: f64,
     /// `comparison.effective_min_comparisons()`.
@@ -389,22 +402,97 @@ pub struct ConfigRoute {
     /// *and* a non-zero effective floor. Mirrors that filter so the page can
     /// tell a route the verdict legitimately omits from one it lost.
     pub expects_floor_row: bool,
+    /// The `rollout:` block, for the modes that carry one.
+    pub rollout: Option<RolloutSettings>,
+    /// The `circuit_breaker:` block, tuning included: the numbers that decide
+    /// what an open breaker on this route even means.
+    pub breaker: BreakerSettings,
+    /// Whether a failed in-flight request may be replayed against legacy
+    /// (safety invariant 4).
+    pub failover_safe: bool,
+}
+
+/// A route's `rollout:` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutSettings {
+    pub percentage_flag: String,
+    pub default_percentage: f64,
+    /// `assignment_key.header`, when the key comes from one.
+    pub assignment_header: Option<String>,
+    /// What happens when that header is absent.
+    pub assignment_fallback: String,
+}
+
+/// A route's `circuit_breaker:` block.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BreakerSettings {
+    pub enabled: bool,
+    pub failure_rate_threshold: f64,
+    pub min_requests: u32,
+    pub open_duration_ms: u64,
+    pub half_open_max_requests: u32,
+}
+
+impl ConfigRoute {
+    /// Whether this route runs one of the two modes the rollout section reports
+    /// on — the modes whose requests reach the new-upstream gate, which is
+    /// where a rollout target and a breaker are decided at all.
+    fn is_rollout_route(&self) -> bool {
+        self.mode.gates_new()
+    }
+
+    /// Whether a target-percentage series must exist for this route — the
+    /// config-side mirror of [`crate::routing::CompiledRoute::rollout_target`],
+    /// which is what decides the registered set. Mirrored rather than shared:
+    /// this side reads a raw [`Config`], and a `CompiledRoute` exists only
+    /// after the routing table compiles.
+    fn expects_target_series(&self) -> bool {
+        self.mode == RouteMode::PercentageSplit && self.rollout.is_some()
+    }
+
+    /// Whether the four transition counters must exist — the config-side mirror
+    /// of [`crate::routing::CompiledRoute::breaker_consulted`], down to the
+    /// shared [`RouteMode::gates_new`] the two both ask. Having a breaker is not
+    /// enough: a `legacy_only` route may configure one no request will ever ask.
+    fn breaker_consulted(&self) -> bool {
+        self.breaker.enabled && self.is_rollout_route()
+    }
 }
 
 impl ConfigView {
     fn from_config(config: &Config) -> ConfigView {
         ConfigView {
+            fail_safe_mode: config.flags.fail_safe_mode,
+            stale_ttl_ms: config.flags.stale_ttl_ms,
             routes: config
                 .routes
                 .iter()
                 .map(|r| ConfigRoute {
                     id: r.id.clone(),
-                    mode: r.mode.as_str().to_string(),
+                    mode: r.mode,
                     comparison_enabled: r.comparison.enabled,
                     sample_rate: r.comparison.sample_rate,
                     floor: r.comparison.effective_min_comparisons(),
                     expects_floor_row: r.comparison.enabled
                         && r.comparison.effective_min_comparisons() > 0,
+                    rollout: r.rollout.as_ref().map(|rollout| RolloutSettings {
+                        percentage_flag: rollout.percentage_flag.clone(),
+                        default_percentage: rollout.default_percentage,
+                        assignment_header: rollout.assignment_key.header.clone(),
+                        assignment_fallback: match rollout.assignment_key.fallback {
+                            crate::config::model::AssignmentFallback::RequestRandom => {
+                                "request_random".to_string()
+                            }
+                        },
+                    }),
+                    breaker: BreakerSettings {
+                        enabled: r.circuit_breaker.enabled,
+                        failure_rate_threshold: r.circuit_breaker.failure_rate_threshold,
+                        min_requests: r.circuit_breaker.min_requests,
+                        open_duration_ms: r.circuit_breaker.open_duration_ms,
+                        half_open_max_requests: r.circuit_breaker.half_open_max_requests,
+                    },
+                    failover_safe: r.failover_safe,
                 })
                 .collect(),
         }
@@ -412,6 +500,11 @@ impl ConfigView {
 
     fn route(&self, id: &str) -> Option<&ConfigRoute> {
         self.routes.iter().find(|r| r.id == id)
+    }
+
+    /// The routes the rollout section reports on, in config order.
+    fn rollout_routes(&self) -> impl Iterator<Item = &ConfigRoute> {
+        self.routes.iter().filter(|r| r.is_rollout_route())
     }
 }
 
@@ -549,6 +642,962 @@ impl MetricsView {
             .filter_map(|r| r.route.clone())
             .collect()
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rollout and resilience
+//
+// A second, typed reading of the *same* parsed scrape the counters section
+// renders — never a second scrape, and deliberately not routed through
+// [`MetricsView`]: that view's contract is an exact-`u64` count per sample, and
+// three of the families below are floats (a percentage, a staleness in
+// seconds). Widening it to hold them would loosen the one property it exists
+// for.
+//
+// The discipline here is per-*route*, not per-family: one route's torn series
+// makes that route's row unavailable and leaves every other row standing,
+// because "we cannot say what route X was doing" is a different claim from "we
+// cannot say what any of this was doing", and collapsing them costs the page
+// the routes it could still have reported honestly.
+// ---------------------------------------------------------------------------
+
+/// Every family this section reads. Their *absence as a set* is what tells a
+/// scrape from a limen that predates rollout truth from one that carries it.
+const ROLLOUT_FAMILIES: [&str; 6] = [
+    ROLLOUT_RESOLVED_TARGET_PERCENTAGE,
+    CIRCUIT_BREAKER_STATE,
+    BREAKER_TRANSITIONS_TOTAL,
+    FLAG_PROVIDER_STALE,
+    FLAG_STALENESS_SECONDS,
+    FLAG_CONSECUTIVE_FAILURES,
+];
+
+/// One cell of the rollout table. The third variant is the point of the type:
+/// a value the scrape could not settle is rendered as unsettled, never as the
+/// zero it would default to.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Reading<T> {
+    /// Read from the scrape and validated.
+    Known(T),
+    /// The config says this cell cannot exist — a failover route has no
+    /// rollout target, a breakerless route has no breaker state.
+    NotApplicable(&'static str),
+    /// The scrape does not settle it, and why.
+    Unknown(String),
+}
+
+impl<T> Reading<T> {
+    fn known(&self) -> Option<&T> {
+        match self {
+            Reading::Known(value) => Some(value),
+            _ => None,
+        }
+    }
+}
+
+/// What the flag-provider gauges said at scrape time. Process-wide: one
+/// provider serves every route.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FlagProviderTruth {
+    /// `limen_flag_provider_stale` — 1 means every rollout is displaced by the
+    /// configured fail-safe, whatever the flags say.
+    pub stale: bool,
+    /// Age of the last successful refresh. `None` is the exporter's `-1`
+    /// sentinel: there has never been one.
+    pub staleness_seconds: Option<f64>,
+    pub consecutive_failures: u64,
+}
+
+/// The share of a route's traffic each upstream actually served, as counted by
+/// `limen_requests_total`. The rollout's *target* is what it asked for; this is
+/// what happened.
+///
+/// Each side is `None` when the scrape carries no series for that upstream at
+/// all. That is **not** a zero and is not rendered as one: this counter is
+/// registered on the first request of its kind, so an absent side is
+/// "zero recorded, and nothing registered the series to say so" — a distinction
+/// a rollout at 0% (which legitimately has no `new` side) turns on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObservedShare {
+    pub new: Option<u64>,
+    pub legacy: Option<u64>,
+}
+
+impl ObservedShare {
+    /// New's share, treating an absent side as the zero it stands for — but
+    /// only ever rendered beside the annotation that says the side was absent
+    /// (see [`observed_cell`]). `None` when neither side counted anything: a
+    /// share of no traffic is not 0%.
+    pub fn percentage(self) -> Option<f64> {
+        // `u128`: two `u64` counts cannot overflow it, so the denominator has
+        // no panic path and no saturation whatever a scrape carries.
+        let new = self.new.unwrap_or(0) as u128;
+        let total = new + self.legacy.unwrap_or(0) as u128;
+        (total > 0).then(|| new as f64 * 100.0 / total as f64)
+    }
+
+    /// The sides the scrape carried no series for, in render order.
+    pub fn missing_sides(self) -> Vec<&'static str> {
+        [(self.new, "new"), (self.legacy, "legacy")]
+            .iter()
+            .filter(|(count, _)| count.is_none())
+            .map(|(_, name)| *name)
+            .collect()
+    }
+}
+
+/// One route's rollout standing: what it targeted, what it served, and what its
+/// breaker was doing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RouteTruth {
+    /// The resolved target percentage from the gauge — never the config's
+    /// `default_percentage`, which is what the rollout would fall back to
+    /// rather than what it resolved to.
+    pub target: Reading<f64>,
+    pub observed: Reading<ObservedShare>,
+    pub breaker_state: Reading<BreakerState>,
+    /// The four legal transitions, in [`BreakerState::TRANSITIONS`] order.
+    pub transitions: Reading<[u64; 4]>,
+    /// Set when the gauge and the transition history disagree by exactly one
+    /// legal step — the benign race between the scrape handler's gauge refresh
+    /// and the exposition render. Carries the state the *counters* imply, and
+    /// makes the cell say so rather than presenting either reading as settled.
+    pub state_skew: Option<BreakerState>,
+}
+
+/// One row of the rollout table: the route as configured, plus what the scrape
+/// says about it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutRow {
+    pub id: String,
+    pub mode: RouteMode,
+    pub failover_safe: bool,
+    pub rollout: Option<RolloutSettings>,
+    pub breaker: BreakerSettings,
+    pub breaker_consulted: bool,
+    /// Why this row cannot be believed. Non-empty means the row renders
+    /// unavailable — its cells are not rendered at all — and every entry
+    /// becomes a banner failure.
+    pub rejected: Vec<String>,
+    pub truth: RouteTruth,
+}
+
+/// What the section was able to check against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RolloutScope {
+    /// The config declares rollout routes, and the rows were checked against
+    /// exactly that set.
+    Configured,
+    /// The config declares neither rollout mode: an honest empty, not a
+    /// finding.
+    NoRolloutRoutes,
+    /// No config parsed, so the route set the scrape *should* carry is unknown
+    /// and no per-route presence could be required. The process-wide flag
+    /// gauges are still readable.
+    Unchecked,
+}
+
+/// The flag-provider block's standing. Split out of [`Reading`] because its
+/// two failure modes carry different weight: a gauge the scrape does not have
+/// is only owed where a config proves there was a rollout, while three gauges
+/// that contradict each other are corruption wherever they turn up — limen
+/// derives all three from **one** `health()` snapshot, so no live provider can
+/// produce a tuple that disagrees with itself.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FlagReading {
+    /// No route runs a rollout, so no provider health is owed.
+    NotApplicable,
+    Known(FlagProviderTruth),
+    /// A gauge is absent, duplicated, or not a number.
+    Absent(String),
+    /// The three gauges cannot have come from one snapshot.
+    Contradiction(String),
+}
+
+impl FlagReading {
+    fn known(&self) -> Option<&FlagProviderTruth> {
+        match self {
+            FlagReading::Known(truth) => Some(truth),
+            _ => None,
+        }
+    }
+}
+
+/// The rollout section's model.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RolloutResilienceView {
+    pub scope: RolloutScope,
+    pub flags: FlagReading,
+    pub rows: Vec<RolloutRow>,
+    /// `flags.fail_safe_mode`, for the sentence a stale provider earns.
+    pub fail_safe_mode: Option<FailSafeMode>,
+    /// Rollout series the config cannot account for: an unknown route label, or
+    /// a series on a route that cannot own one. Either way the scrape and the
+    /// config describe different deployments.
+    pub stray: Vec<String>,
+}
+
+impl RolloutResilienceView {
+    /// The honest empty.
+    fn none_configured() -> RolloutResilienceView {
+        RolloutResilienceView {
+            scope: RolloutScope::NoRolloutRoutes,
+            flags: FlagReading::NotApplicable,
+            rows: Vec::new(),
+            fail_safe_mode: None,
+            stray: Vec::new(),
+        }
+    }
+
+    /// What the banner must treat as a failure.
+    ///
+    /// Three kinds, and none of them may ride under a green banner:
+    /// - A **stale provider**: every `percentage_split` route was displaced by
+    ///   the fail-safe, so the rollout in the config is not the rollout that
+    ///   ran.
+    /// - A **diverting breaker**: an open breaker means the new upstream is not
+    ///   being exercised at all and a half-open one means it is on probation.
+    ///   Either is a campaign whose comparison coverage is not what the config
+    ///   asked for, however clean the diffs look.
+    /// - A **row the page could not read**, or a series the config cannot
+    ///   account for.
+    pub fn failures(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if self.scope == RolloutScope::NoRolloutRoutes {
+            return out;
+        }
+        match &self.flags {
+            // Absence is only demanded where the config proves there was a
+            // rollout to report on; a contradiction needs no such licence.
+            FlagReading::Absent(why) if self.scope == RolloutScope::Configured => {
+                out.push(format!("rollout: {why}"));
+            }
+            FlagReading::Contradiction(why) => out.push(format!("rollout: {why}")),
+            FlagReading::Known(flags) if flags.stale => out.push(format!(
+                "rollout: the flag provider is stale — every percentage_split route is displaced \
+                 by fail-safe {}, so the rollout that ran is not the one this config describes",
+                self.fail_safe_mode.map_or("mode", fail_safe_name)
+            )),
+            _ => {}
+        }
+        out.extend(self.stray.iter().map(|why| format!("rollout: {why}")));
+        for row in &self.rows {
+            for why in &row.rejected {
+                out.push(format!("rollout: route {}: {why}", row.id));
+            }
+            // The reported state, which under a one-step skew is the more
+            // diverting of the two readings — a breaker caught mid-transition
+            // is not an excuse to report the calmer end of it.
+            if let Reading::Known(state) = &row.truth.breaker_state {
+                match state {
+                    BreakerState::Open => out.push(format!(
+                        "rollout: breaker open on route {} — the new upstream is blocked and \
+                         every request on this route is being served by legacy",
+                        row.id
+                    )),
+                    BreakerState::HalfOpen => out.push(format!(
+                        "rollout: breaker half-open on route {} — the new upstream is on \
+                         probation and only trial requests reach it",
+                        row.id
+                    )),
+                    BreakerState::Closed => {}
+                }
+            }
+        }
+        out
+    }
+}
+
+/// The configured fail-safe, in the exposition's own vocabulary.
+fn fail_safe_name(mode: FailSafeMode) -> &'static str {
+    match mode {
+        FailSafeMode::LegacyOnly => "legacy_only",
+    }
+}
+
+/// The samples of `family` carrying this route id.
+fn route_samples<'a>(scrape: &'a Scrape, family: &'a str, route: &str) -> Vec<&'a Sample> {
+    scrape
+        .family(family)
+        .filter(|s| s.labels.get("route").map(String::as_str) == Some(route))
+        .collect()
+}
+
+/// A gauge's raw token as a finite float. The raw token, never `Sample::value`:
+/// the same reasoning as [`MetricsView::from_scrape`] — a value this page
+/// cannot represent is a refusal, not a rounding.
+fn finite(family: &str, raw: &str) -> Result<f64, String> {
+    match raw.parse::<f64>() {
+        Ok(value) if value.is_finite() => Ok(value),
+        _ => Err(format!(
+            "{family} carries {raw:?}, which is not a finite number"
+        )),
+    }
+}
+
+/// An exact non-negative integer count, on the [`MetricsView`] contract.
+fn exact_u64(family: &str, raw: &str) -> Result<u64, String> {
+    raw.parse::<u64>().map_err(|_| {
+        format!(
+            "{family} carries {raw:?}, which is not an exact non-negative integer count that fits \
+             a 64-bit counter — refusing to round or saturate it"
+        )
+    })
+}
+
+/// The one series of `family` for this route, or why there is not exactly one.
+fn sole_series<'a>(scrape: &'a Scrape, family: &'a str, route: &str) -> Result<&'a Sample, String> {
+    match route_samples(scrape, family, route).as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!(
+            "the scrape carries no {family} series for this route — limen registers it at \
+             startup, so its absence is a scrape that cannot answer for the route, never a zero"
+        )),
+        many => Err(format!(
+            "the scrape carries {} {family} series for this route — more than one cannot be \
+             reconciled into a single reading, and picking or summing them would be inventing the \
+             answer",
+            many.len()
+        )),
+    }
+}
+
+/// The resolved rollout target: exactly one series, a finite percentage in
+/// `0..=100`.
+fn read_target(scrape: &Scrape, route: &str) -> Result<f64, String> {
+    let sample = sole_series(scrape, ROLLOUT_RESOLVED_TARGET_PERCENTAGE, route)?;
+    let value = finite(ROLLOUT_RESOLVED_TARGET_PERCENTAGE, &sample.raw_value)?;
+    if !(0.0..=100.0).contains(&value) {
+        return Err(format!(
+            "{ROLLOUT_RESOLVED_TARGET_PERCENTAGE} reads {:?}, which is not a percentage in \
+             0..=100 — the resolver clamps into that range, so a value outside it did not come \
+             from one",
+            sample.raw_value
+        ));
+    }
+    Ok(value)
+}
+
+/// The breaker state gauge for a route's **new** upstream.
+///
+/// Required, not optional: limen's `/metrics` handler writes this gauge for
+/// every route that has a breaker, on every scrape. Its absence beside a
+/// breaker-consulted route is therefore a torn or foreign scrape — and a
+/// breaker whose state cannot be read is exactly the one that must not render
+/// as a quiet "closed".
+///
+/// The `upstream` label must be `new`: the breaker guards that upstream and
+/// nothing else, so a sole series carrying another label — or none — is a
+/// series limen did not write, and reading it as the breaker's state would be
+/// answering with somebody else's number.
+fn read_breaker_state(scrape: &Scrape, route: &str) -> Result<BreakerState, String> {
+    let samples = route_samples(scrape, CIRCUIT_BREAKER_STATE, route);
+    if let Some(odd) = samples
+        .iter()
+        .find(|s| s.labels.get("upstream").map(String::as_str) != Some(Upstream::New.as_str()))
+    {
+        return Err(format!(
+            "the scrape carries a {CIRCUIT_BREAKER_STATE} series for this route with upstream={:?} \
+             — the breaker guards the new upstream, so a state under any other label is not this \
+             breaker's",
+            odd.labels.get("upstream").cloned().unwrap_or_default()
+        ));
+    }
+    let sample = match samples.as_slice() {
+        [] => {
+            return Err(format!(
+                "the scrape carries no {CIRCUIT_BREAKER_STATE} series for this route — limen \
+                 writes this gauge on every scrape for every route that has a breaker, so its \
+                 absence is a scrape that cannot say whether the breaker was diverting, never a \
+                 closed one"
+            ))
+        }
+        [one] => one,
+        many => {
+            return Err(format!(
+                "the scrape carries {} {CIRCUIT_BREAKER_STATE} series for this route — a breaker \
+                 is in one state, and reconciling two readings into one would be inventing it",
+                many.len()
+            ))
+        }
+    };
+    // The gauge is an enum written as a float, so the three legal readings are
+    // compared exactly: 1.5 is not "roughly half-open", it is a value limen's
+    // exporter cannot have written.
+    let value = finite(CIRCUIT_BREAKER_STATE, &sample.raw_value)?;
+    for (encoded, state) in [
+        (0.0, BreakerState::Closed),
+        (1.0, BreakerState::HalfOpen),
+        (2.0, BreakerState::Open),
+    ] {
+        if value == encoded {
+            return Ok(state);
+        }
+    }
+    Err(format!(
+        "{CIRCUIT_BREAKER_STATE} reads {:?}, which is not one of 0 (closed), 1 (half-open) or 2 \
+         (open)",
+        sample.raw_value
+    ))
+}
+
+/// The `from`→`to` pair a transition series carries. Absent labels read as
+/// empty rather than being skipped: a series without them is still a series
+/// [`read_transitions`]'s legality check has to refuse.
+fn transition_pair(sample: &Sample) -> (&str, &str) {
+    (
+        sample.labels.get("from").map(String::as_str).unwrap_or(""),
+        sample.labels.get("to").map(String::as_str).unwrap_or(""),
+    )
+}
+
+/// The four transition counters, in [`BreakerState::TRANSITIONS`] order. All
+/// four are registered at startup for a breaker-consulted route, so a missing
+/// one is a scrape that cannot answer rather than a breaker that never moved.
+fn read_transitions(scrape: &Scrape, route: &str) -> Result<[u64; 4], String> {
+    let samples = route_samples(scrape, BREAKER_TRANSITIONS_TOTAL, route);
+    let mut counts = [0u64; 4];
+    for (index, (from, to)) in BreakerState::TRANSITIONS.iter().enumerate() {
+        let matching: Vec<&Sample> = samples
+            .iter()
+            .copied()
+            .filter(|s| transition_pair(s) == (from.as_str(), to.as_str()))
+            .collect();
+        counts[index] = match matching.as_slice() {
+            [one] => exact_u64(BREAKER_TRANSITIONS_TOTAL, &one.raw_value)?,
+            [] => {
+                return Err(format!(
+                    "the breaker is consulted here but the scrape carries no \
+                     {BREAKER_TRANSITIONS_TOTAL} series for {}→{} — all four are registered at \
+                     startup, so a missing one is not a transition that never happened",
+                    from.as_str(),
+                    to.as_str()
+                ))
+            }
+            many => {
+                return Err(format!(
+                    "the scrape carries {} {BREAKER_TRANSITIONS_TOTAL} series for {}→{} — summing \
+                     them would be inventing a transition count",
+                    many.len(),
+                    from.as_str(),
+                    to.as_str()
+                ))
+            }
+        };
+    }
+    // A pair the state machine cannot make means this is not limen's breaker
+    // being described, and the four counts above cannot be trusted to be its
+    // whole story.
+    for sample in &samples {
+        let pair = transition_pair(sample);
+        let legal = BreakerState::TRANSITIONS
+            .iter()
+            .any(|(from, to)| (from.as_str(), to.as_str()) == pair);
+        if !legal {
+            return Err(format!(
+                "the scrape carries a {BREAKER_TRANSITIONS_TOTAL} series for {}→{}, which is not \
+                 a transition limen's breaker can make",
+                pair.0, pair.1
+            ));
+        }
+    }
+    Ok(counts)
+}
+
+/// The state a transition history *implies*, or why no history could have
+/// produced these four counts.
+///
+/// A breaker starts closed, so each state's occupancy is its entries minus its
+/// exits (plus one for closed, which is where the machine begins):
+///
+/// ```text
+/// open      = (closed→open) + (half_open→open) − (open→half_open)
+/// half_open = (open→half_open) − (half_open→closed) − (half_open→open)
+/// closed    = 1 + (half_open→closed) − (closed→open)
+/// ```
+///
+/// The three sum to 1 algebraically, so the whole consistency question is
+/// whether each one lands in `{0, 1}`. A negative occupancy means a state was
+/// exited more often than it was entered; a 2 means it was entered twice
+/// without leaving. Either is a tuple no run of limen's state machine can
+/// produce — it is a hand-edited, merged, or foreign scrape, and the counts
+/// beside it cannot be believed either. Signed arithmetic throughout: these are
+/// differences of counters, and `u64` subtraction would wrap a contradiction
+/// into an enormous plausible-looking number.
+fn state_from_transitions(counts: [u64; 4]) -> Result<BreakerState, String> {
+    let [closed_open, open_half, half_closed, half_open] = counts.map(i128::from);
+    let occupancy = [
+        (
+            BreakerState::Closed,
+            1 + half_closed - closed_open,
+            "closed",
+        ),
+        (
+            BreakerState::HalfOpen,
+            open_half - half_closed - half_open,
+            "half-open",
+        ),
+        (
+            BreakerState::Open,
+            closed_open + half_open - open_half,
+            "open",
+        ),
+    ];
+    for (_, count, name) in &occupancy {
+        if !(0..=1).contains(count) {
+            return Err(format!(
+                "the {BREAKER_TRANSITIONS_TOTAL} counts {counts:?} (in {}) describe no history a \
+                 breaker can have: they leave it {count} times in the {name} state, and a breaker \
+                 is in exactly one state at a time",
+                transition_order()
+            ));
+        }
+    }
+    occupancy
+        .iter()
+        .find(|(_, count, _)| *count == 1)
+        .map(|(state, _, _)| *state)
+        // Unreachable: the three occupancies sum to 1 by construction, so one
+        // of them is 1 once all three are known to be in {0, 1}. Stated as a
+        // refusal rather than an unwrap — this page never guesses a state.
+        .ok_or_else(|| {
+            format!("the {BREAKER_TRANSITIONS_TOTAL} counts {counts:?} imply no state at all")
+        })
+}
+
+/// The transition order the count tuples are printed in, named so an error
+/// message about `[2, 1, 1, 0]` says which number is which.
+fn transition_order() -> String {
+    BreakerState::TRANSITIONS
+        .iter()
+        .map(|(from, to)| format!("{}→{}", from.as_str(), to.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Reconcile the state gauge against the state the transition counts imply.
+///
+/// `Ok(None)` is agreement. `Ok(Some(implied))` is a **one-step skew**, which
+/// is benign and expected: the `/metrics` handler refreshes the state gauge for
+/// every route and *then* renders the exposition, so a transition landing
+/// inside that window is already counted but not yet in the gauge.
+///
+/// The tolerance is **directional** — the counters may be one transition *ahead*
+/// of the gauge, never behind it. `CircuitBreaker::publish` increments the
+/// counter with the state mutex still held, in the same critical section that
+/// stores the new phase, so no reader can see a new state beside an
+/// un-incremented counter. A symmetric tolerance would also be vacuous: the
+/// four legal transitions connect all three states pairwise, so accepting
+/// either direction would accept every mismatch there is.
+///
+/// Two steps apart is not tolerated. It is possible in principle (two
+/// transitions inside one render) and vanishingly rare in practice, and a page
+/// that shrugged at arbitrary drift could never catch the torn scrape this
+/// check exists for.
+fn reconcile_state(
+    gauge: BreakerState,
+    implied: BreakerState,
+) -> Result<Option<BreakerState>, String> {
+    if gauge == implied {
+        return Ok(None);
+    }
+    let one_step_ahead = BreakerState::TRANSITIONS
+        .iter()
+        .any(|(from, to)| *from == gauge && *to == implied);
+    if one_step_ahead {
+        return Ok(Some(implied));
+    }
+    // Every pair that is not one step *ahead* is one step behind: the four
+    // transitions connect all three states pairwise, so there is no third
+    // case to word. Behind is the impossible one — the counter is incremented
+    // under the same lock that stores the state, so a scrape cannot show a
+    // state whose own transition has not been counted yet.
+    Err(format!(
+        "{CIRCUIT_BREAKER_STATE} reads {} but the {BREAKER_TRANSITIONS_TOTAL} counts describe a \
+         breaker that is {} — the counters are published under the same lock that stores the \
+         state, so they can run one transition ahead of the gauge but never behind it. The gauge \
+         and the counters are not describing the same breaker",
+        gauge.as_str(),
+        implied.as_str(),
+    ))
+}
+
+/// The share each upstream actually served, summed across method and status
+/// class. Read straight off the scrape rather than through [`MetricsView`]:
+/// this family is not part of that view's contract, and coupling the two would
+/// tie the rollout answer to a section that renders something else.
+///
+/// **An absent side is not a failure, and not a zero.** `limen_requests_total`
+/// is registered on the first request of its kind, so a route serving 0% to new
+/// legitimately carries no `new` series at all — the same shape a lost counter
+/// takes. The scrape-level question ("did this come from a limen exporter?") is
+/// already settled upstream by [`MetricsView`]'s required families, so nothing
+/// is gained by failing here and a real 0%-stage rollout would be failed for
+/// being at 0%. What the page owes instead is *rendering*: the side is carried
+/// as `None` all the way to [`observed_cell`], which prints
+/// "no series = zero recorded" beside the share rather than a bare percentage.
+fn read_observed(scrape: &Scrape, route: &str) -> Result<Reading<ObservedShare>, String> {
+    let samples = route_samples(scrape, REQUESTS_TOTAL, route);
+    // `None` is "this side was never counted", which is not the same fact as a
+    // side that was counted and summed to zero.
+    let side = |upstream: Upstream| -> Result<Option<u64>, String> {
+        let mut total = None::<u64>;
+        for sample in samples
+            .iter()
+            .filter(|s| s.labels.get("upstream").map(String::as_str) == Some(upstream.as_str()))
+        {
+            let value = exact_u64(REQUESTS_TOTAL, &sample.raw_value)?;
+            total = Some(total.unwrap_or(0).checked_add(value).ok_or_else(|| {
+                format!(
+                    "the {REQUESTS_TOTAL} counts for upstream {} do not fit a 64-bit sum",
+                    upstream.as_str()
+                )
+            })?);
+        }
+        Ok(total)
+    };
+    Ok(Reading::Known(ObservedShare {
+        new: side(Upstream::New)?,
+        legacy: side(Upstream::Legacy)?,
+    }))
+}
+
+/// The one series of a process-wide family, or why there is not exactly one.
+fn sole_process_series<'a>(scrape: &'a Scrape, family: &'static str) -> Result<&'a Sample, String> {
+    match scrape.family(family).collect::<Vec<_>>().as_slice() {
+        [one] => Ok(one),
+        [] => Err(format!(
+            "the scrape carries no {family} series — limen's control plane sets the \
+             flag-provider gauges on every scrape, so their absence means this scrape cannot say \
+             whether the flags were fresh"
+        )),
+        many => Err(format!(
+            "the scrape carries {} {family} series — one provider has one health, and \
+             reconciling two readings would be inventing it",
+            many.len()
+        )),
+    }
+}
+
+/// Whether the three gauges could have come from one `health()` snapshot.
+///
+/// They always do — `CachedFlags::health` derives all three from a single read
+/// under one lock and the `/metrics` handler writes them together — so a tuple
+/// that contradicts itself is corruption, a merge of two scrapes, or a document
+/// somebody edited. The legal tuples, given `ttl = flags.stale_ttl_ms / 1000`
+/// and `stale = age > ttl` (or no successful refresh at all):
+///
+/// | `stale` | `staleness_seconds` | legal | why                                    |
+/// |---------|---------------------|-------|----------------------------------------|
+/// | 1       | `-1` (never)        | yes   | never refreshed is always stale        |
+/// | 1       | `age >= ttl`        | yes   | aged past the TTL                      |
+/// | 0       | `age <= ttl`        | yes   | refreshed within the TTL               |
+/// | 0       | `-1` (never)        | **no**| never refreshed cannot read fresh      |
+/// | 0       | `age > ttl`         | **no**| past the TTL cannot read fresh         |
+/// | 1       | `age < ttl`         | **no**| inside the TTL cannot read stale       |
+///
+/// The boundary (`age == ttl`) is legal on both sides deliberately: the gauge
+/// is a millisecond count divided into seconds and the comparison is strict, so
+/// refusing equality would fail a healthy provider over a rounding.
+///
+/// Without a config there is no TTL to check against, and only the
+/// TTL-independent row — fresh with no successful refresh, ever — can be
+/// judged. That one needs no TTL: it is a contradiction at any TTL.
+fn flag_tuple_fault(truth: &FlagProviderTruth, stale_ttl_ms: Option<u64>) -> Option<String> {
+    match (truth.stale, truth.staleness_seconds) {
+        (false, None) => Some(format!(
+            "{FLAG_PROVIDER_STALE} reads 0 (fresh) while {FLAG_STALENESS_SECONDS} reads -1 (no \
+             successful refresh has ever happened) — a provider that never refreshed is stale at \
+             every TTL, so these two gauges did not come from one health snapshot"
+        )),
+        (stale, Some(age)) => {
+            let ttl = stale_ttl_ms? as f64 / 1000.0;
+            match (stale, age) {
+                (false, age) if age > ttl => Some(format!(
+                    "{FLAG_PROVIDER_STALE} reads 0 (fresh) while {FLAG_STALENESS_SECONDS} reads \
+                     {age} — past this config's stale_ttl_ms of {ttl}s, which is the very \
+                     condition that sets the stale gauge"
+                )),
+                (true, age) if age < ttl => Some(format!(
+                    "{FLAG_PROVIDER_STALE} reads 1 (stale) while {FLAG_STALENESS_SECONDS} reads \
+                     {age} — inside this config's stale_ttl_ms of {ttl}s, so nothing in limen \
+                     could have set the stale gauge"
+                )),
+                _ => None,
+            }
+        }
+        (true, None) => None,
+    }
+}
+
+/// The three process-wide flag-provider gauges, which limen's control plane
+/// refreshes on *every* scrape — so their absence beside live rollout series is
+/// a torn or foreign scrape, not a quiet provider.
+fn read_flags(scrape: &Scrape, stale_ttl_ms: Option<u64>) -> FlagReading {
+    let read = || -> Result<FlagProviderTruth, String> {
+        let sole = |family: &'static str| sole_process_series(scrape, family);
+        let raw_stale = &sole(FLAG_PROVIDER_STALE)?.raw_value;
+        // A boolean written as a float: exactly 0 or exactly 1, and anything
+        // between them is a reading this page will not round toward "fresh".
+        let raw = finite(FLAG_PROVIDER_STALE, raw_stale)?;
+        let stale = if raw == 0.0 {
+            false
+        } else if raw == 1.0 {
+            true
+        } else {
+            return Err(format!(
+                "{FLAG_PROVIDER_STALE} reads {raw_stale:?}, which is neither 0 (fresh) nor 1 \
+                 (stale)"
+            ));
+        };
+        let raw_age = &sole(FLAG_STALENESS_SECONDS)?.raw_value;
+        let age = finite(FLAG_STALENESS_SECONDS, raw_age)?;
+        let staleness_seconds = if age == -1.0 {
+            // The exporter's sentinel for "no successful refresh, ever".
+            None
+        } else if age < 0.0 {
+            return Err(format!(
+                "{FLAG_STALENESS_SECONDS} reads {raw_age:?} — the only negative value this gauge \
+                 carries is the -1 sentinel for a provider that has never refreshed"
+            ));
+        } else {
+            Some(age)
+        };
+        Ok(FlagProviderTruth {
+            stale,
+            staleness_seconds,
+            consecutive_failures: exact_u64(
+                FLAG_CONSECUTIVE_FAILURES,
+                &sole(FLAG_CONSECUTIVE_FAILURES)?.raw_value,
+            )?,
+        })
+    };
+    match read() {
+        Ok(truth) => match flag_tuple_fault(&truth, stale_ttl_ms) {
+            Some(why) => FlagReading::Contradiction(why),
+            None => FlagReading::Known(truth),
+        },
+        Err(why) => FlagReading::Absent(why),
+    }
+}
+
+/// A reading whose failure rejects the whole row: the error becomes the row's
+/// rejection, and the cell points at it rather than repeating it — the row
+/// renders as one spanning unavailable, so a per-cell copy would never be read.
+fn or_reject<T>(result: Result<Reading<T>, String>, rejected: &mut Vec<String>) -> Reading<T> {
+    match result {
+        Ok(reading) => reading,
+        Err(why) => {
+            rejected.push(why);
+            Reading::Unknown("see the row's rejection above".to_string())
+        }
+    }
+}
+
+/// One route's row, checked against the config that declared it.
+fn rollout_row(scrape: &Scrape, route: &ConfigRoute, flags: &FlagReading) -> RolloutRow {
+    let mut rejected = Vec::new();
+
+    // Each cell is gated on the config first: a reading the config rules out is
+    // not applicable, never a series the scrape failed to carry.
+    let target = if route.expects_target_series() {
+        or_reject(
+            read_target(scrape, &route.id).map(Reading::Known),
+            &mut rejected,
+        )
+    } else {
+        Reading::NotApplicable("only a percentage_split route resolves a rollout target")
+    };
+
+    let observed = or_reject(read_observed(scrape, &route.id), &mut rejected);
+
+    let gauge_state = if route.breaker.enabled {
+        or_reject(
+            read_breaker_state(scrape, &route.id).map(Reading::Known),
+            &mut rejected,
+        )
+    } else {
+        Reading::NotApplicable("no circuit breaker is configured on this route")
+    };
+
+    let transitions = if route.breaker_consulted() {
+        or_reject(
+            read_transitions(scrape, &route.id).map(Reading::Known),
+            &mut rejected,
+        )
+    } else {
+        Reading::NotApplicable("this route never consults a circuit breaker")
+    };
+
+    // The gauge against the history: two readings of one breaker, taken
+    // microseconds apart by the same handler. A one-step skew is the race
+    // between them and renders as one; anything else means they are not
+    // readings of the same breaker at all.
+    let (breaker_state, state_skew) = match (&gauge_state, &transitions) {
+        (Reading::Known(gauge), Reading::Known(counts)) => {
+            match state_from_transitions(*counts)
+                .and_then(|implied| reconcile_state(*gauge, implied).map(|skew| (implied, skew)))
+            {
+                // Under a skew the *more diverting* of the two readings is the
+                // one reported: a breaker caught mid-transition is not licence
+                // to report the calmer end of it.
+                Ok((implied, Some(_))) => {
+                    let worst = [*gauge, implied]
+                        .into_iter()
+                        .max_by_key(|state| match state {
+                            BreakerState::Closed => 0,
+                            BreakerState::HalfOpen => 1,
+                            BreakerState::Open => 2,
+                        })
+                        .unwrap_or(*gauge);
+                    (Reading::Known(worst), Some(implied))
+                }
+                Ok((_, None)) => (Reading::Known(*gauge), None),
+                Err(why) => {
+                    rejected.push(why);
+                    (
+                        Reading::Unknown("see the row's rejection above".to_string()),
+                        None,
+                    )
+                }
+            }
+        }
+        _ => (gauge_state, None),
+    };
+
+    // The one cross-family check: a stale provider displaces the rollout
+    // outright (`resolve_percentage` returns the fail-safe before it looks at
+    // any flag), so a nonzero target beside `stale 1` is a pair of readings no
+    // limen produces — and exactly the pair that would let a displaced rollout
+    // render as a running one.
+    if let (Some(flags), Some(target)) = (flags.known(), target.known()) {
+        if flags.stale && *target != 0.0 {
+            rejected.push(format!(
+                "the flag provider is stale, so this route's resolved target must be 0 (fail-safe \
+                 displaces the rollout), but {ROLLOUT_RESOLVED_TARGET_PERCENTAGE} reads {target}"
+            ));
+        }
+    }
+
+    RolloutRow {
+        id: route.id.clone(),
+        mode: route.mode,
+        failover_safe: route.failover_safe,
+        rollout: route.rollout.clone(),
+        breaker: route.breaker.clone(),
+        breaker_consulted: route.breaker_consulted(),
+        rejected,
+        truth: RouteTruth {
+            target,
+            observed,
+            breaker_state,
+            transitions,
+            state_skew,
+        },
+    }
+}
+
+/// Rollout series the config cannot account for.
+///
+/// Two shapes, both meaning the scrape and the config describe different
+/// deployments: a `route` label the config has never heard of, and a series on
+/// a configured route that cannot own one — a target on a route that is not a
+/// `percentage_split`, transitions on a route whose breaker is never consulted,
+/// a breaker state on a route with no breaker. `register_rollout_series` emits
+/// exactly the set the config implies, so anything else came from a different
+/// route table, and a page that reported the rows it recognized while
+/// swallowing the rest would be describing half a deployment.
+fn stray_series(scrape: &Scrape, config: &ConfigView) -> Vec<String> {
+    /// Whether a configured route may own a series of this family — the
+    /// config-side mirror of what `register_rollout_series` emits.
+    type MayOwn = fn(&ConfigRoute) -> bool;
+
+    let owners: [(&str, MayOwn); 3] = [
+        (ROLLOUT_RESOLVED_TARGET_PERCENTAGE, |r| {
+            r.expects_target_series()
+        }),
+        (BREAKER_TRANSITIONS_TOTAL, ConfigRoute::breaker_consulted),
+        (CIRCUIT_BREAKER_STATE, |r| r.breaker.enabled),
+    ];
+    let mut out = Vec::new();
+    for (family, may_own) in owners {
+        let mut unknown = BTreeSet::new();
+        let mut unowned = BTreeSet::new();
+        for sample in scrape.family(family) {
+            let Some(id) = sample.labels.get("route") else {
+                continue;
+            };
+            match config.route(id) {
+                None => unknown.insert(id.clone()),
+                Some(route) if !may_own(route) => unowned.insert(id.clone()),
+                Some(_) => false,
+            };
+        }
+        for id in unknown {
+            out.push(format!(
+                "the scrape carries a {family} series for route {id}, which this config does not \
+                 declare — the scrape and the config describe different route tables"
+            ));
+        }
+        for id in unowned {
+            out.push(format!(
+                "the scrape carries a {family} series for route {id}, which this config gives no \
+                 way to produce one — limen registers that series only for the routes that can \
+                 emit it"
+            ));
+        }
+    }
+    out
+}
+
+/// Build the section's model from the scrape the counters section already
+/// parsed, checked against the config's rollout routes.
+///
+/// `Err` is reserved for the one thing that makes the whole section
+/// unreadable: a scrape that carries no rollout family at all while the config
+/// says there was a rollout to report on.
+fn rollout_view(
+    scrape: &Scrape,
+    config: Option<&ConfigView>,
+) -> Result<RolloutResilienceView, String> {
+    let Some(config) = config else {
+        // No config: the route set the scrape should carry cannot be known, so
+        // nothing per-route may be required of it. The provider gauges are
+        // process-wide and readable regardless.
+        return Ok(RolloutResilienceView {
+            scope: RolloutScope::Unchecked,
+            // No config, so no TTL to check the tuple against: only the
+            // contradiction that holds at every TTL can be caught here.
+            flags: read_flags(scrape, None),
+            rows: Vec::new(),
+            fail_safe_mode: None,
+            stray: Vec::new(),
+        });
+    };
+    if config.rollout_routes().next().is_none() {
+        return Ok(RolloutResilienceView::none_configured());
+    }
+    if !ROLLOUT_FAMILIES.iter().any(|f| scrape.has_family(f)) {
+        return Err(format!(
+            "this config declares rollout routes but the scrape carries no rollout truth at all: \
+             none of {} is present. The limen that produced it predates these series (or the \
+             scrape came from something else) — either way it cannot say what the rollout was \
+             doing, which is not the same as a rollout at 0%",
+            ROLLOUT_FAMILIES.join(", ")
+        ));
+    }
+    let flags = read_flags(scrape, Some(config.stale_ttl_ms));
+    let rows = config
+        .rollout_routes()
+        .map(|route| rollout_row(scrape, route, &flags))
+        .collect();
+    Ok(RolloutResilienceView {
+        scope: RolloutScope::Configured,
+        flags,
+        rows,
+        fail_safe_mode: Some(config.fail_safe_mode),
+        stray: stray_series(scrape, config),
+    })
 }
 
 /// The sink's records, split the way `verdict::evaluate` splits them.
@@ -788,6 +1837,9 @@ pub struct Evidence {
     pub verdict: Section<VerdictArtifact>,
     pub profile: Section<ProfileDto>,
     pub metrics: Section<MetricsView>,
+    /// A second reading of the metrics artifact: what the rollout targeted,
+    /// what it served, and what its breakers and flag provider were doing.
+    pub rollout: Section<RolloutResilienceView>,
     /// Semantic violations found in a full verdict document.
     pub verdict_violations: Vec<String>,
     /// Cross-artifact disagreements.
@@ -880,21 +1932,78 @@ fn read_profile(path: Option<&PathBuf>) -> Section<ProfileDto> {
     }
 }
 
-fn read_metrics(path: Option<&PathBuf>) -> Section<MetricsView> {
+/// One metrics artifact, read once. The scrape is kept beside the counters
+/// view so the rollout section can be a second reading of the *same* parse —
+/// two readers of one document cannot disagree about what the document said.
+struct MetricsRead {
+    view: Section<MetricsView>,
+    scrape: Option<Scrape>,
+}
+
+fn read_metrics(path: Option<&PathBuf>) -> MetricsRead {
+    let unavailable = |why: String| MetricsRead {
+        view: Section::Unavailable(why),
+        scrape: None,
+    };
     let Some(path) = path else {
-        return Section::NotProvided;
+        return MetricsRead {
+            view: Section::NotProvided,
+            scrape: None,
+        };
     };
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) => return Section::Unavailable(format!("cannot read metrics artifact: {e}")),
+        Err(e) => return unavailable(format!("cannot read metrics artifact: {e}")),
     };
     let scrape = match Scrape::parse(&text) {
         Ok(scrape) => scrape,
-        Err(e) => return Section::Unavailable(format!("metrics artifact is not a scrape: {e}")),
+        Err(e) => return unavailable(format!("metrics artifact is not a scrape: {e}")),
     };
     match MetricsView::from_scrape(&scrape) {
-        Ok(view) => Section::Ok(view),
-        Err(e) => Section::Unavailable(e),
+        Ok(view) => MetricsRead {
+            view: Section::Ok(view),
+            scrape: Some(scrape),
+        },
+        Err(e) => unavailable(e),
+    }
+}
+
+/// The rollout section's standing, decided in the order the three-way
+/// semantics require.
+///
+/// The honest empty comes **first**: a config that declares no rollout route
+/// has no rollout to report whatever the scrape turned out to be, and calling
+/// that section unavailable would invent a subject for it.
+///
+/// After that the section follows the metrics artifact, mirroring
+/// `render_counters`' contract: absent `--metrics` is NOT PROVIDED (an absence
+/// of evidence, not a rollout at zero), and a metrics artifact this page
+/// refused is UNAVAILABLE here too — a scrape limen's own gate will not read is
+/// not one this section will mine rollout truth out of.
+fn read_rollout(
+    metrics: &MetricsRead,
+    config: Option<&ConfigView>,
+) -> Section<RolloutResilienceView> {
+    if let Some(config) = config {
+        if config.rollout_routes().next().is_none() {
+            return Section::Ok(RolloutResilienceView::none_configured());
+        }
+    }
+    match (&metrics.view, &metrics.scrape) {
+        (Section::NotProvided, _) => Section::NotProvided,
+        (Section::Unavailable(why), _) => Section::Unavailable(format!(
+            "the metrics artifact could not be read, so nothing about the rollout could be: {why}"
+        )),
+        (Section::Ok(_), Some(scrape)) => match rollout_view(scrape, config) {
+            Ok(view) => Section::Ok(view),
+            Err(why) => Section::Unavailable(why),
+        },
+        // Unreachable: a parsed counters view is built from a scrape this read
+        // kept. Stated as an unavailable rather than an unwrap, because the one
+        // thing this page may never do is render a missing input as a zero.
+        (Section::Ok(_), None) => {
+            Section::Unavailable("the parsed scrape was not retained".to_string())
+        }
     }
 }
 
@@ -1239,6 +2348,7 @@ pub fn decide_banner(evidence: &Evidence) -> Banner {
         verdict,
         profile,
         metrics,
+        rollout,
         verdict_violations,
         drift,
     } = evidence;
@@ -1319,6 +2429,17 @@ pub fn decide_banner(evidence: &Evidence) -> Banner {
         Section::Unavailable(why) => failures.push(format!("metrics: {why}")),
         Section::Ok(_) => {}
     }
+    // The rollout section is a reading of the metrics artifact, so it follows
+    // that input's standing: not provided is a note the metrics row already
+    // carries, and unreadable is a failure. What it adds is the per-route
+    // truth — a route whose series are missing, duplicated or impossible, and
+    // a flag provider that was stale while a rollout was supposed to be
+    // running, are failures the counters section cannot see.
+    match rollout {
+        Section::NotProvided => {}
+        Section::Unavailable(why) => failures.push(format!("rollout: {why}")),
+        Section::Ok(view) => failures.extend(view.failures()),
+    }
 
     if let Section::Ok(report) = sink {
         if report.malformed_lines > 0 {
@@ -1381,7 +2502,9 @@ pub fn analyze(inputs: &Inputs) -> PageModel {
     let config = read_config(inputs.config.as_ref());
     let verdict = read_verdict(inputs.verdict.as_ref());
     let profile = read_profile(inputs.profile.as_ref());
-    let metrics = read_metrics(inputs.metrics.as_ref());
+    let metrics_read = read_metrics(inputs.metrics.as_ref());
+    let rollout = read_rollout(&metrics_read, config.get());
+    let metrics = metrics_read.view;
 
     let full_verdict = verdict.get().and_then(VerdictArtifact::full);
     let verdict_violations = full_verdict.map(semantic_violations).unwrap_or_default();
@@ -1431,6 +2554,7 @@ pub fn analyze(inputs: &Inputs) -> PageModel {
         verdict,
         profile,
         metrics,
+        rollout,
         verdict_violations,
         drift,
     };
@@ -1599,6 +2723,7 @@ pub fn render(model: &PageModel) -> String {
     render_checks(&mut out, model);
     render_routes(&mut out, model);
     render_coverage(&mut out, model);
+    render_rollout(&mut out, model);
     render_mismatches(&mut out, model);
     render_counters(&mut out, model);
     render_profile(&mut out, model);
@@ -1798,7 +2923,7 @@ fn render_routes(out: &mut String, model: &PageModel) {
                     "<tr>{}<td>{}</td><td>{}</td><td class=\"num\">{:.2}</td>\
                      <td class=\"num\">{}</td><td>{}</td></tr>",
                     route_cell(&route.id),
-                    esc(&route.mode),
+                    esc(route.mode.as_str()),
                     if route.comparison_enabled {
                         pill("good", "enabled")
                     } else {
@@ -1848,8 +2973,349 @@ fn render_coverage(out: &mut String, model: &PageModel) {
     out.push_str("</table>\n");
 }
 
+/// A percentage, printed the way the scrape carried it: no invented precision,
+/// no trailing `.0` on a whole number.
+fn pct(value: f64) -> String {
+    if value.fract() == 0.0 {
+        format!("{value:.0}%")
+    } else {
+        format!("{value}%")
+    }
+}
+
+/// A cell whose value the scrape did not settle: the pill says so and the
+/// sentence says why. Never an em dash on its own here — a blank cell in a
+/// rollout table reads as nothing to report.
+fn unsettled(word: &str, why: &str) -> String {
+    format!("<td>{} {}</td>", pill("warn", word), esc(why))
+}
+
+/// A cell the config rules out. The reason rides the `title` because the
+/// column is about routes for which it *does* apply.
+fn inapplicable(why: &str) -> String {
+    format!("<td title=\"{}\">—</td>", esc(why))
+}
+
+/// The two arms every rollout cell answers the same way; only the known arm is
+/// the column's own business. [`observed_cell`] is the deliberate exception —
+/// an unread share is a traffic statement, not an UNAVAILABLE one.
+fn reading_cell<T>(reading: &Reading<T>, known: impl FnOnce(&T) -> String) -> String {
+    match reading {
+        Reading::Known(value) => known(value),
+        Reading::NotApplicable(why) => inapplicable(why),
+        Reading::Unknown(why) => unsettled("UNAVAILABLE", why),
+    }
+}
+
+/// The resolved-target cell. When the provider is stale the number never
+/// travels alone: a bare `0%` reads as a rollout somebody turned down, and the
+/// whole point of this section is that it was displaced instead.
+fn target_cell(target: &Reading<f64>, flags: &FlagReading) -> String {
+    reading_cell(target, |value| {
+        if flags.known().is_some_and(|f| f.stale) {
+            format!("<td>{} — fail-safe (flags stale)</td>", pct(*value))
+        } else {
+            format!("<td>{}</td>", pct(*value))
+        }
+    })
+}
+
+/// The observed-share cell: the percentage *and* the counts behind it, because
+/// "90%" over ten requests and over ten thousand are different facts.
+fn observed_cell(observed: &Reading<ObservedShare>) -> String {
+    let count = |side: Option<u64>| match side {
+        Some(count) => count.to_string(),
+        // Never a bare `0`: an absent series and a counted zero are different
+        // facts, and this column is where a rollout at 0% would otherwise be
+        // indistinguishable from one whose counters were lost.
+        None => "no series = zero recorded".to_string(),
+    };
+    match observed {
+        Reading::Known(share) => {
+            let detail = format!(
+                "(new: {} / legacy: {})",
+                count(share.new),
+                count(share.legacy)
+            );
+            match share.percentage() {
+                // The one rounded number on the page, to a tenth — and the only
+                // one that may be, because it is *derived* rather than read,
+                // and the counts it came from sit beside it unrounded.
+                Some(percentage) => format!(
+                    "<td>{} {}</td>",
+                    pct((percentage * 10.0).round() / 10.0),
+                    esc(&detail)
+                ),
+                // Both sides zero — whether counted or absent, no request on
+                // this route was recorded, and there is no share to state.
+                None => format!(
+                    "<td>{} no traffic recorded {}</td>",
+                    pill("warn", "NO SHARE"),
+                    esc(&detail)
+                ),
+            }
+        }
+        Reading::NotApplicable(why) => inapplicable(why),
+        Reading::Unknown(why) => format!("<td>{} {}</td>", pill("warn", "NO SHARE"), esc(why)),
+    }
+}
+
+/// The breaker cell: the state's name and its own color, never the gauge's
+/// number. "2" on a status page is not a state anybody reads.
+///
+/// A one-step skew between the gauge and the transition history says so in the
+/// cell. The race is benign — the scrape handler refreshes the gauge and then
+/// renders — but a page that silently picked one of the two readings would be
+/// presenting a coin flip as a measurement.
+fn breaker_cell(truth: &RouteTruth) -> String {
+    let cell = reading_cell(&truth.breaker_state, |state| {
+        let (class, word) = match state {
+            BreakerState::Closed => ("good", "closed"),
+            BreakerState::HalfOpen => ("warn", "half-open"),
+            BreakerState::Open => ("bad", "open"),
+        };
+        format!("<td>{}</td>", pill(class, word))
+    });
+    let Some(implied) = truth.state_skew else {
+        return cell;
+    };
+    // Reopen the cell to append the caveat: the reported state is the more
+    // diverting of the two, and the counters' reading is named beside it.
+    let inner = cell
+        .strip_prefix("<td>")
+        .and_then(|c| c.strip_suffix("</td>"))
+        .unwrap_or(&cell)
+        .to_string();
+    format!(
+        "<td>{inner} {} the transition counts describe a breaker that is {} — a transition landed \
+         between the gauge refresh and this render, so the more diverting of the two is \
+         reported</td>",
+        pill("warn", "STATE/COUNTERS SKEWED"),
+        esc(implied.as_str())
+    )
+}
+
+/// The four transition counts, compact: `closed→open 2, open→half-open 1, …`.
+/// All four always, including the zeros — a breaker that never opened is the
+/// answer a rollout review is looking for, and omitting the zero would leave
+/// the reader to guess whether it was zero or unknown.
+fn transitions_cell(transitions: &Reading<[u64; 4]>) -> String {
+    reading_cell(transitions, |counts| {
+        let display = |state: BreakerState| match state {
+            BreakerState::HalfOpen => "half-open",
+            other => other.as_str(),
+        };
+        let text = BreakerState::TRANSITIONS
+            .iter()
+            .zip(counts.iter())
+            .map(|((from, to), count)| format!("{}→{} {count}", display(*from), display(*to)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("<td>{}</td>", esc(&text))
+    })
+}
+
+/// The rollout's own section: what each route targeted, what it served, and
+/// what was answering for it.
+///
+/// The three-way semantics are the same ones the rest of the page runs on, with
+/// one addition specific to this section: a config with no rollout route at all
+/// is an *honest empty* — one line, no table, no finding — because a page that
+/// rendered a red "unavailable" over a campaign that never had a rollout would
+/// be crying wolf on every shadow-only deployment.
+fn render_rollout(out: &mut String, model: &PageModel) {
+    out.push_str("<h2>5. Rollout &amp; resilience</h2>\n");
+    match &model.evidence.rollout {
+        // Mirrors `render_counters`: no scrape is an absence of evidence. The
+        // config's rollout settings are deliberately *not* shown on their own
+        // here — a table of what a rollout was asked to do, on a page about
+        // what a campaign did, reads as a report that something was checked.
+        Section::NotProvided => note(
+            out,
+            "neutral",
+            "NOT PROVIDED",
+            "No metrics scrape was captured, so nothing is known about what any rollout targeted, \
+             what it served, or whether a circuit breaker or a stale flag provider was answering \
+             for it. This is an absence of evidence, not a rollout at 0%.",
+        ),
+        Section::Unavailable(why) => note(out, "bad", "UNAVAILABLE", why),
+        Section::Ok(view) => render_rollout_view(out, view),
+    }
+}
+
+fn render_rollout_view(out: &mut String, view: &RolloutResilienceView) {
+    match view.scope {
+        RolloutScope::NoRolloutRoutes => {
+            return note(
+                out,
+                "neutral",
+                "NO ROLLOUT",
+                "This config declares no percentage_split or failover_to_legacy route, so there \
+                 is no rollout to report on.",
+            )
+        }
+        RolloutScope::Unchecked => note(
+            out,
+            "warn",
+            "UNCHECKED",
+            "No config was provided, so which routes this scrape *should* carry rollout series \
+             for is unknown and no per-route reading below could be required of it. Only the \
+             process-wide flag-provider gauges are readable.",
+        ),
+        RolloutScope::Configured => {}
+    }
+
+    // The provider block comes first: it is the single fact that can displace
+    // every row below, and a reader who meets the rows first will read a table
+    // of zeros before learning why they are zeros.
+    render_flag_provider(out, view);
+
+    if view.rows.is_empty() {
+        return;
+    }
+    render_rollout_rows(out, view);
+    render_rollout_config(out, &view.rows);
+}
+
+/// The flag provider's own standing, as a note above the table.
+fn render_flag_provider(out: &mut String, view: &RolloutResilienceView) {
+    match &view.flags {
+        FlagReading::NotApplicable => {}
+        FlagReading::Absent(why) => note(out, "bad", "FLAG PROVIDER UNKNOWN", why),
+        // Named apart from an absence: these three gauges come from one
+        // `health()` snapshot, so a tuple that disagrees with itself is a
+        // scrape that was edited, merged, or is not limen's.
+        FlagReading::Contradiction(why) => note(out, "bad", "FLAG PROVIDER INCOHERENT", why),
+        FlagReading::Known(flags) => {
+            let age = match flags.staleness_seconds {
+                Some(seconds) => format!("Last successful refresh {seconds}s ago"),
+                None => "No successful refresh has ever been recorded".to_string(),
+            };
+            let failures = format!(
+                "{} consecutive failed refresh(es) since the last success.",
+                flags.consecutive_failures
+            );
+            if flags.stale {
+                note(
+                    out,
+                    "bad",
+                    "STALE",
+                    &format!(
+                        "The flag provider is stale, so every percentage_split route is displaced \
+                         by fail-safe {}: their resolved target is 0% whatever the flag says, and \
+                         a 0% here is a rollout that was switched off for them rather than one \
+                         that was turned down. {age}. {failures}",
+                        view.fail_safe_mode.map_or("mode", fail_safe_name)
+                    ),
+                );
+            } else {
+                note(out, "good", "FRESH", &format!("{age}. {failures}"));
+            }
+        }
+    }
+}
+
+/// What each route actually did, one row per rollout route.
+fn render_rollout_rows(out: &mut String, view: &RolloutResilienceView) {
+    out.push_str(
+        "<table>\n<tr><th>Route</th><th>Mode</th><th>Resolved target</th>\
+         <th>Observed new share</th><th>Breaker</th><th>Breaker transitions</th>\
+         <th>Failover-safe</th></tr>\n",
+    );
+    for row in &view.rows {
+        if !row.rejected.is_empty() {
+            // One spanning cell rather than five unsettled ones: the row was
+            // rejected as a whole, and five separate "unavailable" cells would
+            // suggest five separate readings were attempted and lost.
+            let _ = writeln!(
+                out,
+                "<tr>{}<td>{}</td><td colspan=\"5\">{} {}</td></tr>",
+                route_cell(&row.id),
+                esc(row.mode.as_str()),
+                pill("bad", "UNAVAILABLE"),
+                esc(&row.rejected.join(" "))
+            );
+            continue;
+        }
+        let _ = writeln!(
+            out,
+            "<tr>{}<td>{}</td>{}{}{}{}<td>{}</td></tr>",
+            route_cell(&row.id),
+            esc(row.mode.as_str()),
+            target_cell(&row.truth.target, &view.flags),
+            observed_cell(&row.truth.observed),
+            breaker_cell(&row.truth),
+            transitions_cell(&row.truth.transitions),
+            present(row.failover_safe),
+        );
+    }
+    out.push_str("</table>\n");
+}
+
+/// The breaker's tuning as a sentence: the numbers that decide what an open
+/// breaker on this route even means, and whether anything ever asks it.
+fn breaker_prose(breaker: &BreakerSettings, consulted: bool) -> String {
+    if !breaker.enabled {
+        return "disabled".to_string();
+    }
+    format!(
+        "enabled — opens above a failure rate of {} over at least {} request(s), stays open \
+         {}ms, then admits {} trial request(s){}",
+        breaker.failure_rate_threshold,
+        breaker.min_requests,
+        breaker.open_duration_ms,
+        breaker.half_open_max_requests,
+        if consulted {
+            ""
+        } else {
+            " (never consulted in this mode)"
+        }
+    )
+}
+
+/// What the config asked for, beside what happened — a separate table from the
+/// one above so no configured number can be mistaken for a reading.
+fn render_rollout_config(out: &mut String, rows: &[RolloutRow]) {
+    out.push_str("<h3>As configured</h3>\n");
+    out.push_str(
+        "<table>\n<tr><th>Route</th><th>Mode</th><th>Rollout flag</th>\
+         <th class=\"num\">Default</th><th>Assignment key</th><th>Circuit breaker</th>\
+         <th>Failover-safe</th></tr>\n",
+    );
+    for row in rows {
+        let (flag, default, key) = match &row.rollout {
+            Some(rollout) => (
+                rollout.percentage_flag.clone(),
+                format!("{}", rollout.default_percentage),
+                match &rollout.assignment_header {
+                    Some(header) => format!(
+                        "header {header}, falling back to {}",
+                        rollout.assignment_fallback
+                    ),
+                    None => rollout.assignment_fallback.clone(),
+                },
+            ),
+            None => ("—".to_string(), "—".to_string(), "—".to_string()),
+        };
+        let breaker = breaker_prose(&row.breaker, row.breaker_consulted);
+        let _ = writeln!(
+            out,
+            "<tr>{}<td>{}</td><td class=\"mono\">{}</td><td class=\"num\">{}</td><td>{}</td>\
+             <td>{}</td><td>{}</td></tr>",
+            route_cell(&row.id),
+            esc(row.mode.as_str()),
+            esc(&flag),
+            esc(&default),
+            esc(&key),
+            esc(&breaker),
+            present(row.failover_safe),
+        );
+    }
+    out.push_str("</table>\n");
+}
+
 fn render_mismatches(out: &mut String, model: &PageModel) {
-    out.push_str("<h2>5. Mismatches</h2>\n");
+    out.push_str("<h2>6. Mismatches</h2>\n");
     let state = &model.evidence.sink_state;
     note(out, state.class(), state.word(), state.prose());
 
@@ -1964,7 +3430,7 @@ fn render_mismatches(out: &mut String, model: &PageModel) {
 }
 
 fn render_counters(out: &mut String, model: &PageModel) {
-    out.push_str("<h2>6. Runtime counters</h2>\n");
+    out.push_str("<h2>7. Runtime counters</h2>\n");
     match &model.evidence.metrics {
         Section::NotProvided => note(
             out,
@@ -2036,7 +3502,7 @@ fn render_counters(out: &mut String, model: &PageModel) {
 }
 
 fn render_profile(out: &mut String, model: &PageModel) {
-    out.push_str("<h2>7. Observe profile</h2>\n");
+    out.push_str("<h2>8. Observe profile</h2>\n");
     match &model.evidence.profile {
         Section::NotProvided => note(
             out,
@@ -2395,6 +3861,321 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             .find(|f| f.name == COMPARISON_SKIPPED_TOTAL)
             .unwrap();
         assert_eq!(skipped.rows[0].labels, "reason=event_stream");
+    }
+
+    /// The rollout families are read by their *own* view, and none of them may
+    /// join [`FAMILIES`]: three of them are floats (a percentage, a staleness
+    /// in seconds), and that array's contract is an exact `u64` per sample.
+    /// Widening it to carry them would loosen the one property it exists for —
+    /// so the two readers stay disjoint by construction, and this pins it.
+    #[test]
+    fn the_rollout_families_are_not_on_the_exact_counter_contract() {
+        let counters: BTreeSet<&str> = FAMILIES.iter().map(|(name, _)| *name).collect();
+        for family in ROLLOUT_FAMILIES {
+            assert!(
+                !counters.contains(family),
+                "{family} is on the exact-u64 counters contract"
+            );
+        }
+        // `limen_requests_total` is read by this section and by neither
+        // `FAMILIES` nor `verdict` — stated so a later addition to that array
+        // is a deliberate coupling rather than an accident.
+        assert!(!counters.contains(REQUESTS_TOTAL));
+    }
+
+    /// One `percentage_split` route with a consulted breaker, as the config
+    /// side of the rollout section sees it.
+    fn split_route() -> ConfigRoute {
+        ConfigRoute {
+            id: "split".to_string(),
+            mode: RouteMode::PercentageSplit,
+            comparison_enabled: false,
+            sample_rate: 0.0,
+            floor: 0,
+            expects_floor_row: false,
+            rollout: Some(RolloutSettings {
+                percentage_flag: "f".to_string(),
+                default_percentage: 10.0,
+                assignment_header: None,
+                assignment_fallback: "request_random".to_string(),
+            }),
+            breaker: BreakerSettings {
+                enabled: true,
+                failure_rate_threshold: 0.5,
+                min_requests: 20,
+                open_duration_ms: 30_000,
+                half_open_max_requests: 5,
+            },
+            failover_safe: false,
+        }
+    }
+
+    fn scrape(text: &str) -> Scrape {
+        Scrape::parse(text).expect("test scrape")
+    }
+
+    /// Every rollout series a healthy `split` route exports.
+    const ROLLOUT: &str = "\
+limen_rollout_resolved_target_percentage{route=\"split\"} 12.5
+limen_circuit_breaker_state{route=\"split\",upstream=\"new\"} 2
+limen_breaker_transitions_total{route=\"split\",from=\"closed\",to=\"open\"} 1
+limen_breaker_transitions_total{route=\"split\",from=\"open\",to=\"half_open\"} 0
+limen_breaker_transitions_total{route=\"split\",from=\"half_open\",to=\"closed\"} 0
+limen_breaker_transitions_total{route=\"split\",from=\"half_open\",to=\"open\"} 0
+limen_flag_provider_stale 0
+limen_flag_provider_staleness_seconds 4
+limen_flag_provider_consecutive_failures 0
+";
+
+    /// The TTL [`ROLLOUT`]'s flag tuple is coherent against — the config
+    /// default, so the fixture reads like a real deployment's scrape.
+    const TTL_MS: Option<u64> = Some(30_000);
+
+    fn row_of(text: &str) -> RolloutRow {
+        let scraped = scrape(text);
+        let flags = read_flags(&scraped, TTL_MS);
+        rollout_row(&scraped, &split_route(), &flags)
+    }
+
+    #[test]
+    fn a_whole_rollout_route_reads_off_one_scrape() {
+        let row = row_of(ROLLOUT);
+        assert!(row.rejected.is_empty(), "{:?}", row.rejected);
+        assert_eq!(row.truth.target, Reading::Known(12.5));
+        // The gauge says open and the one counted transition agrees.
+        assert_eq!(row.truth.breaker_state, Reading::Known(BreakerState::Open));
+        assert_eq!(row.truth.transitions, Reading::Known([1, 0, 0, 0]));
+        assert_eq!(row.truth.state_skew, None);
+        // No request counter at all: both sides absent, and never a 0% share.
+        assert_eq!(
+            row.truth.observed,
+            Reading::Known(ObservedShare {
+                new: None,
+                legacy: None
+            })
+        );
+    }
+
+    /// The occupancy arithmetic, stated as a table: a breaker starts closed,
+    /// and each state is entries minus exits.
+    #[test]
+    fn the_state_a_transition_history_implies() {
+        for (counts, expected) in [
+            ([0, 0, 0, 0], BreakerState::Closed),
+            ([1, 0, 0, 0], BreakerState::Open),
+            ([1, 1, 0, 0], BreakerState::HalfOpen),
+            ([1, 1, 1, 0], BreakerState::Closed),
+            ([1, 1, 0, 1], BreakerState::Open),
+            ([2, 2, 2, 0], BreakerState::Closed),
+        ] {
+            assert_eq!(state_from_transitions(counts), Ok(expected), "{counts:?}");
+        }
+        // Tuples no history can produce: more exits than entries, or two
+        // entries without an exit between them.
+        for impossible in [
+            [0, 1, 0, 0], // half-open exited without ever being entered
+            [1, 2, 0, 0], // …twice over
+            [2, 0, 0, 0], // opened twice without closing
+            [0, 0, 1, 0], // closed re-entered without ever leaving
+        ] {
+            let err = state_from_transitions(impossible).unwrap_err();
+            assert!(err.contains("no history a breaker can have"), "{err}");
+        }
+    }
+
+    /// The counters may run one transition ahead of the gauge (the handler
+    /// refreshes the gauge, then renders), never behind it.
+    #[test]
+    fn only_a_counters_ahead_skew_is_tolerated() {
+        use BreakerState::{Closed, HalfOpen, Open};
+        assert_eq!(reconcile_state(Closed, Closed), Ok(None));
+        assert_eq!(reconcile_state(Closed, Open), Ok(Some(Open)));
+        assert_eq!(reconcile_state(Open, HalfOpen), Ok(Some(HalfOpen)));
+        assert_eq!(reconcile_state(HalfOpen, Closed), Ok(Some(Closed)));
+        assert_eq!(reconcile_state(HalfOpen, Open), Ok(Some(Open)));
+        // The only two pairs left, and both are the counters lagging the
+        // gauge — impossible, because the counter is incremented under the
+        // same lock that stores the state. (The four transitions connect the
+        // three states pairwise, so "not one ahead" always means "one behind":
+        // there is no third case to word.)
+        for (gauge, implied) in [(Open, Closed), (Closed, HalfOpen)] {
+            let err = reconcile_state(gauge, implied).unwrap_err();
+            assert!(err.contains("never behind it"), "{err}");
+            assert!(err.contains("not describing the same breaker"), "{err}");
+        }
+    }
+
+    /// The tuple table from [`flag_tuple_fault`], exercised on both sides of
+    /// the TTL boundary — which is legal in both directions, so a rounding
+    /// cannot fail a healthy provider.
+    #[test]
+    fn the_legal_flag_tuples_are_the_ones_one_snapshot_can_produce() {
+        let truth = |stale, age| FlagProviderTruth {
+            stale,
+            staleness_seconds: age,
+            consecutive_failures: 0,
+        };
+        for legal in [
+            truth(true, None),        // never refreshed is always stale
+            truth(true, Some(45.0)),  // aged past the TTL
+            truth(true, Some(30.0)),  // exactly at it
+            truth(false, Some(30.0)), // …legal on the fresh side too
+            truth(false, Some(0.0)),
+        ] {
+            assert_eq!(flag_tuple_fault(&legal, TTL_MS), None, "{legal:?}");
+        }
+        for (illegal, needle) in [
+            (truth(false, None), "never refreshed"),
+            (truth(false, Some(45.0)), "past this config's stale_ttl_ms"),
+            (truth(true, Some(1.0)), "inside this config's stale_ttl_ms"),
+        ] {
+            let why = flag_tuple_fault(&illegal, TTL_MS).expect("a fault");
+            assert!(why.contains(needle), "{why}");
+        }
+        // Without a config there is no TTL to check against, and only the
+        // contradiction that holds at every TTL can be judged.
+        assert!(flag_tuple_fault(&truth(false, None), None).is_some());
+        assert_eq!(flag_tuple_fault(&truth(false, Some(45.0)), None), None);
+    }
+
+    /// A transition pair limen's state machine cannot make means this is not
+    /// limen's breaker being described, so the four counts beside it cannot be
+    /// taken as its whole story either.
+    #[test]
+    fn an_impossible_transition_pair_rejects_the_row() {
+        let text = format!(
+            "{ROLLOUT}limen_breaker_transitions_total{{route=\"split\",from=\"open\",\
+             to=\"closed\"}} 3\n"
+        );
+        let err = read_transitions(&scrape(&text), "split").unwrap_err();
+        assert!(err.contains("open→closed"), "{err}");
+        assert!(err.contains("not a transition"), "{err}");
+    }
+
+    #[test]
+    fn a_target_outside_the_resolvers_range_is_refused() {
+        let text = ROLLOUT.replace(
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 12.5",
+            "limen_rollout_resolved_target_percentage{route=\"split\"} 250",
+        );
+        let err = read_target(&scrape(&text), "split").unwrap_err();
+        assert!(err.contains("250"), "{err}");
+        assert!(err.contains("0..=100"), "{err}");
+
+        // …and so is a value that is not a number at all, or two of them.
+        for bad in ["NaN", "+Inf"] {
+            let text = ROLLOUT.replace("12.5", bad);
+            assert!(read_target(&scrape(&text), "split").is_err(), "{bad}");
+        }
+        let text =
+            format!("{ROLLOUT}limen_rollout_resolved_target_percentage{{route=\"split\"}} 30\n");
+        let err = read_target(&scrape(&text), "split").unwrap_err();
+        assert!(err.contains("more than one"), "{err}");
+    }
+
+    /// `-1` is the exporter's sentinel for "no successful refresh, ever" — it
+    /// is the one negative reading, and it must not render as an age.
+    #[test]
+    fn the_staleness_sentinel_is_not_an_age() {
+        let text = ROLLOUT.replace(
+            "limen_flag_provider_staleness_seconds 4",
+            "limen_flag_provider_staleness_seconds -1",
+        );
+        // The sentinel is read as "never", and the tuple stays coherent only
+        // because the fixture's stale gauge is flipped with it.
+        let stale_sentinel =
+            text.replace("limen_flag_provider_stale 0", "limen_flag_provider_stale 1");
+        assert_eq!(
+            read_flags(&scrape(&stale_sentinel), TTL_MS),
+            FlagReading::Known(FlagProviderTruth {
+                stale: true,
+                staleness_seconds: None,
+                consecutive_failures: 0,
+            })
+        );
+        // Fresh beside the sentinel is the contradiction, not a reading.
+        assert!(matches!(
+            read_flags(&scrape(&text), TTL_MS),
+            FlagReading::Contradiction(_)
+        ));
+
+        let text = ROLLOUT.replace(
+            "limen_flag_provider_staleness_seconds 4",
+            "limen_flag_provider_staleness_seconds -7",
+        );
+        let FlagReading::Absent(why) = read_flags(&scrape(&text), TTL_MS) else {
+            panic!("a negative age that is not the sentinel must not read as one");
+        };
+        assert!(why.contains("-1 sentinel"), "{why}");
+    }
+
+    /// The state gauge is written on every scrape for every route that has a
+    /// breaker, so its absence rejects the row: a breaker whose state cannot
+    /// be read is exactly the one that must not render as a quiet "closed".
+    #[test]
+    fn an_absent_breaker_state_rejects_the_row() {
+        let text: String = ROLLOUT
+            .lines()
+            .filter(|l| !l.starts_with(CIRCUIT_BREAKER_STATE))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let row = row_of(&text);
+        assert!(
+            row.rejected
+                .iter()
+                .any(|why| why.contains("never a closed one")),
+            "{:?}",
+            row.rejected
+        );
+        assert!(matches!(row.truth.breaker_state, Reading::Unknown(_)));
+    }
+
+    /// The breaker guards the new upstream; a state under any other label is
+    /// not this breaker's, and reading it would be answering with somebody
+    /// else's number.
+    #[test]
+    fn a_breaker_state_under_another_upstream_is_refused() {
+        for label in ["upstream=\"legacy\"", "upstream=\"old\"", "route=\"split\""] {
+            let text = ROLLOUT.replace(
+                "limen_circuit_breaker_state{route=\"split\",upstream=\"new\"}",
+                &format!("limen_circuit_breaker_state{{route=\"split\",{label}}}"),
+            );
+            let err = read_breaker_state(&scrape(&text), "split").unwrap_err();
+            assert!(err.contains("guards the new upstream"), "{label}: {err}");
+        }
+    }
+
+    #[test]
+    fn the_observed_share_is_the_two_counters_and_nothing_else() {
+        let text = format!(
+            "{ROLLOUT}\
+limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"new\",status_class=\"2xx\"}} 1
+limen_requests_total{{route=\"split\",method=\"POST\",upstream=\"new\",status_class=\"5xx\"}} 2
+limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"legacy\",status_class=\"2xx\"}} 7
+limen_requests_total{{route=\"other\",method=\"GET\",upstream=\"new\",status_class=\"2xx\"}} 99
+"
+        );
+        let share = |new, legacy| ObservedShare { new, legacy };
+        assert_eq!(
+            read_observed(&scrape(&text), "split").unwrap(),
+            Reading::Known(share(Some(3), Some(7)))
+        );
+        assert_eq!(share(Some(3), Some(7)).percentage(), Some(30.0));
+        // A route that served nothing on either side has no share — not 0%.
+        assert_eq!(share(Some(0), Some(0)).percentage(), None);
+        assert_eq!(share(None, None).percentage(), None);
+        // An absent side stands for the zero it *is* — but is carried as an
+        // absence all the way to the cell, which annotates it rather than
+        // printing a bare percentage.
+        assert_eq!(share(None, Some(7)).percentage(), Some(0.0));
+        assert_eq!(share(None, Some(7)).missing_sides(), ["new"]);
+        assert_eq!(share(Some(7), None).percentage(), Some(100.0));
+        // The denominator is `u128`: two saturated counters have a share, not
+        // an overflow.
+        assert_eq!(
+            share(Some(u64::MAX), Some(u64::MAX)).percentage(),
+            Some(50.0)
+        );
     }
 
     #[test]
