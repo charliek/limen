@@ -35,11 +35,17 @@ flags:
 #   dir: "./limen-diffs"
 
 # Debug-only affordances (spec territory: campaign falsification, never
-# production). WARNING: sink_canary exposes POST /debug/canary, which injects
-# a synthetic mismatch into the live sink on every call — never enable this in
-# production. `limen run` logs a loud warning at startup if it is on.
+# production). `limen run` logs a loud warning at startup for either field.
+#   sink_canary:     exposes POST /debug/canary, which injects a synthetic
+#                     mismatch into the live sink on every call.
+#   upstream_header:  adds x-limen-upstream: legacy|new to every RELAYED
+#                     response (absent on limen-synthesized ones); inbound
+#                     copies of the header are always stripped either way.
+#                     Ground truth for external rollout verification, e.g.
+#                     the rollout simulation's per-request evidence.
 # debug:
 #   sink_canary: true
+#   upstream_header: true
 
 # Observe mode (docs/guides/observe-mode.md): a strictly passive, bounded
 # per-route traffic profile — no shadow request, no body byte read — served

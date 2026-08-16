@@ -458,6 +458,8 @@ exit "$verdict_exit"
 0%  →  1%  →  5%  →  25%  →  50%  →  100%
 ```
 
+This ladder is tested doctrine, not a prescription taken on faith: it is the procedure the [rollout simulation](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) ran live, 2026-08-16, against two real backends (Python legacy, Rust new) behind a real limen process, driving 1000 keyed clients through two passes per route at every rung. Each stage's verdict checked record completeness, the validity guard, exact stage ends, exact central-binomial bounds on the observed split, two-pass stickiness (a key's side never flips within a stage), and monotone nesting of the new-side key set — raising the flag only ever *adds* keys, which is exact arithmetic for a fixed key set under the deterministic `blake3` bucketing (spec §6.4), not a statistical tendency. Flag flips propagated end-to-end in ~580ms against the file provider's 500ms poll, measured from the [resolved-target gauge](#10-monitoring-validating-the-proxy-itself), not assumed.
+
 ```yaml
 routes:
   - id: "get-user"
@@ -472,6 +474,7 @@ routes:
 Raise the flag at runtime (no redeploy) via the flag provider. After each increase:
 - Recheck the budget (8.1) on the now-live new traffic.
 - For write routes, run the read-back drift check (7.3).
+- Watch `limen_rollout_resolved_target_percentage{route}` confirm the flag actually took. It is the flag-resolved **target**, deliberately not the effective share — an open breaker doesn't move it — and a stale-flag fail-safe reads `0` here (with the staleness gauges saying why) even while the flag file still claims otherwise.
 - Only advance when green; otherwise **hold or roll back** (8.5).
 
 ### 8.5 Rollback / abort criteria (named, automatic where possible)
@@ -488,7 +491,9 @@ Rollback mechanisms, in order of automaticity:
 2. **Lower the rollout flag** (manual, instant, no redeploy) — the primary deliberate rollback lever.
 3. **Set the route to `legacy_only`** (config change) — full stop for that route.
 
-Because traffic shifting is flag-driven, rollback is **fast and reversible** — a core safety property of the approach.
+Because traffic shifting is flag-driven, rollback is **fast and reversible** — a core safety property of the approach, and one the [rollout simulation](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) exercised on all three tiers rather than assumed. Killing the new backend mid-ladder (at 50%) opened the breaker on every split route — `limen_breaker_transitions_total` recording each closed→open — while `failover_safe` routes kept serving `200`s throughout via client-invisible replay and the non-`failover_safe` routes failed **visibly** (limen-synthesized `502`/`504`, no replay, confirmed independently by the legacy access log carrying none of their request nonces): invariant 4's two arms, each attested on its own evidence. Restarting the backend walked the breaker open→half_open→closed per route — read off the transition counters *before* anyone compared key sets — and the recovered 50% population equaled the pre-kill one exactly. Lowering the flag from 50% back to 5% returned **exactly** the earlier 5% key set: rollback lands you on the identical population you started from, not a merely similarly-sized one, and it does so in about the same ~580ms it takes a flag to propagate at all (8.4).
+
+**Residuals.** All of the above was one limen process on one host, in front of one pair of real backends, under a synthetic keyed workload rather than an organic traffic mix, with no load balancer or fleet of proxies in front to skew flag propagation. The drills prove the mechanisms; they don't stand in for production topology.
 
 ---
 
@@ -526,7 +531,8 @@ Distinct from validating the service: you must also confirm **Limen** is behavin
 - **Shadow truly off the client path.** Client-visible latency must be unchanged whether shadowing is on or off (Limen guarantees this architecturally; verify it in staging by toggling shadow and watching client latency).
 - **Comparison coverage.** Watch `limen_comparison_skipped_total` by reason — `response_too_large`, `event_stream` (the response declared `text/event-stream`, so it is skipped by content type before any buffering), `response_buffer_timeout` (buffering outlived what was left of the request's `primary_ms`; a slow body hits this whether or not it declared a `Content-Length`) — and, separately, `limen_shadow_skipped_total`'s `concurrency_limit` / `request_too_large`, where no shadow was dispatched at all. If most eligible traffic lands in these, your parity result rests on too little data: raise `max_body_bytes` for the first reason, but note the other two are deadline- and content-type-driven and will not move. Remember that an unsampled request is recorded in neither family — coverage is `sample_rate` against eligible volume, computed by you, not a metric to read.
 - **Flag health.** Provider health and staleness metrics green — a stale flag provider means rollout decisions may be running on the fail-safe (legacy), which is safe but means your "rollout" isn't actually happening.
-- **Circuit-breaker state.** Know whether a breaker is open; an open breaker silently routing to legacy can masquerade as "new service has no traffic / no errors."
+- **Rollout target.** `limen_rollout_resolved_target_percentage{route}` is the flag-resolved percentage a `percentage_split` route is scraped at — deliberately the *target*, not the effective share (an open breaker doesn't move it). Stale flags resolve it to `0`, with the staleness gauges above saying why; use it to confirm a flag change actually took before trusting anything downstream of it.
+- **Circuit-breaker state.** Know whether a breaker is open; an open breaker silently routing to legacy can masquerade as "new service has no traffic / no errors." `limen_breaker_transitions_total{route,from,to}` counts every state change (closed↔open↔half_open) alongside the sampled state gauge, so a breaker that flapped between two scrapes is visible in the counters even when the gauge caught it in either state.
 
 **Two-part latency obligation, restated:**
 1. **The proxy adds acceptable overhead** (proxy health) — Limen SLO.

@@ -743,20 +743,26 @@ The opt-in is deliberately per route and per method: shadowing a write sends a s
 ### 6.4 `percentage_split`
 
 - Resolve rollout percentage from flags.
-- Deterministically select legacy or new by hashing `route_id + ':' + assignment_key` into bucket 0–9999; if bucket `< percentage * 100`, choose new, else legacy.
+- Deterministically select legacy or new by hashing `route_id + ':' + assignment_key` into bucket 0–9999; if bucket `< percentage * 100`, choose new, else legacy. This is exact, not statistical, in one direction that matters operationally: for a fixed key set, raising the percentage only ever *adds* keys to the new-side set (`newkeys(p1) ⊆ newkeys(p2)` for `p1 <= p2`), and lowering it back down returns exactly the prior set.
 - Missing assignment key → configured fallback (`request_random` in MVP).
 - Optionally shadow the non-primary upstream if configured.
 - Circuit-breaker / fail-safe can override the new selection toward legacy.
+- A `percentage_split` request the split assigned to new is eligible for `failover_safe` mid-flight replay on new-side failure, on the same terms as Section 6.5 — the route's `failover_safe` flag is consulted whether the mode is `percentage_split` or `failover_to_legacy`; only `new_only` is excluded, since it has no legacy leg to replay against.
+- The percentage a route resolved to at scrape time is exported as
+  `limen_rollout_resolved_target_percentage{route}` (Section 10.1) — the
+  flag-resolved *target*, not the effective share; an open breaker does not
+  move it, and a stale flag provider resolves it to `0`.
 
 ### 6.5 `failover_to_legacy`
 
 - Prefer **new** as primary.
 - Fall back to legacy when new fails, times out, or the circuit is open.
 - **Non-idempotent writes are never auto-failed-over by default.** A request that may have already taken effect on the new service (a non-idempotent POST) must **not** be retried against legacy, because the side effect could be applied twice (e.g. a resource created on both). This is a load-bearing safety guarantee.
-- Auto-failover for a route is gated by the route's **`failover_safe`** flag (Section 5.2):
+- Auto-failover for a route is gated by the route's **`failover_safe`** flag (Section 5.2), and applies under **both** `failover_to_legacy` (new is primary for every request) and `percentage_split` (new is primary for whichever requests the split assigned to it, Section 6.4) — the two modes that can put new in front of a live legacy:
   - `failover_safe: false` (default): on new-side failure, Limen returns the failure to the client rather than silently retrying on legacy. The circuit breaker may still *route subsequent* requests to legacy (that is a routing decision, not a retry of an in-flight request), but the **failed request itself is not replayed**.
   - `failover_safe: true`: the route's operations are affirmed idempotent (GET/HEAD/PUT/DELETE, or a write the team has made idempotent), and Limen may retry the failed request against legacy.
-- Validation **requires** `failover_safe: true` to be set explicitly on any `failover_to_legacy` route whose methods include non-idempotent verbs (Section 5.3), so the safety decision is always conscious rather than defaulted.
+- Validation **requires** `failover_safe: true` to be set explicitly on any `failover_to_legacy` route whose methods include non-idempotent verbs (Section 5.3), so the safety decision is always conscious rather than defaulted. `percentage_split` routes are valid with or without the flag either way.
+- **One budget, not two.** The new attempt and the legacy replay share a single `timeouts.primary_ms` deadline (Section 9.2), taken once immediately before the new attempt is sent; the replay — when it happens — gets only what is left of it, because it is the second leg of *this* client request, not a fresh one. The practical consequence: a new-side failure that returns fast (a 5xx, a refused or reset connection) is replayed with whatever budget remains, but a new-side **timeout** has by definition already spent the whole budget and is **not** replayed — the client gets the timeout, and the breaker still records the failure for subsequent routing. A client on a `failover_safe` route must never wait roughly two timeouts deep for a route that declared one.
 
 > **Distinction that matters:** *routing* the next request to legacy because the circuit is open is always safe — no request is executed twice. *Retrying an in-flight request* that already hit new is only safe when the operation is idempotent. `failover_safe` governs the second, dangerous case; the circuit breaker governs the first, safe one.
 
@@ -884,7 +890,13 @@ Per-route, per-(new-)upstream breaker:
 - After `open_duration_ms`, transition to **half-open**.
 - **Half-open**: allow up to `half_open_max_requests` trial requests; success closes the circuit, failure reopens it.
 - Failures = 5xx responses, connection failures, timeouts (configurable).
-- Emit state-transition metrics and logs.
+- Emit state-transition metrics and logs — **met**: every transition
+  (`closed`↔`open`↔`half_open`) increments
+  `limen_breaker_transitions_total{route,from,to}` and logs at `info`,
+  alongside the pre-existing scrape-time-sampled `limen_circuit_breaker_state`
+  gauge. The transition series is what let the rollout simulation's kill
+  drill prove open→half_open→closed recovery from counters rather than a
+  timer (Section 15.6).
 
 ### 9.2 Timeouts
 
@@ -1147,10 +1159,22 @@ The MVP is **done** when all of the following hold:
 - Static, file, and Redis providers work; missing flags use defaults; invalid refresh keeps last known good; staleness beyond TTL triggers fail-safe.
 - Rollout is deterministic per assignment key; 0% → all legacy, 100% → all new (subject to breaker/fail-safe); intermediate splits distribute within tolerance.
 - File and Redis flag changes take effect **without restart**.
+- **Exercised live, not only by fixture**: rollout determinism (exact-set
+  stickiness, monotone nesting of the new-side key set across the ladder,
+  exact set-equality on rollback) and flag-staleness fail-safe (observed
+  traffic shift to legacy, not just a log assertion) were both proven against
+  two real implementations of the same API — the slauth rollout simulation,
+  2026-08-16.
 
 ### 15.6 Resilience
 - Circuit breaker opens on threshold breach, routes to legacy while open, transitions through half-open, and reopens/closes correctly.
-- `failover_to_legacy` falls back on new failure/timeout/open-circuit, and does not replay a failed in-flight request against legacy unless the route sets `failover_safe: true`; validation rejects a `failover_to_legacy` route with non-idempotent methods that omits the flag.
+- `failover_to_legacy` falls back on new failure/timeout/open-circuit, and does not replay a failed in-flight request against legacy unless the route sets `failover_safe: true`; validation rejects a `failover_to_legacy` route with non-idempotent methods that omits the flag. The same `failover_safe` gate applies under `percentage_split` (Section 6.4).
+- **Exercised live, not only by fixture**: breaker open→half_open→closed
+  recovery after a real backend was killed and restarted was proven from the
+  transition counters, and both arms of the `failover_safe`/non-`failover_safe`
+  distinction (client-invisible replay vs. visible failure) were
+  independently attested on live split traffic — the slauth rollout
+  simulation, 2026-08-16.
 
 ### 15.7 Observability & ops
 - Prometheus `/metrics` exposes the full required metric set with low-cardinality labels.
@@ -1228,14 +1252,15 @@ The MVP is **done** when all of the following hold:
 
 Prioritize a clean MVP with strong tests over breadth or cleverness.
 
-**Safe default choices:**
-- Default to legacy when uncertain.
-- Never block client responses on shadow/comparison.
-- Never shadow writes by default; a write is shadowed only where a route opted its method into `comparison.shadow_methods`, and only with a bounded, replayed body.
-- Never replay a failed in-flight request against legacy unless the route is explicitly `failover_safe: true` (idempotent). Routing *subsequent* requests to legacy via the circuit breaker is fine; *retrying the same request* that may already have hit new is not, unless idempotent.
-- Never log sensitive values by default.
-- Bound all buffers.
-- Validate configuration and contracts at startup; refuse to start on invalid config.
+**Safe default choices** (numbered to match the canonical load-bearing
+invariant list in limen's `CLAUDE.md`):
+1. Default to legacy when uncertain.
+2. Never block client responses on shadow/comparison.
+3. Never shadow writes by default; a write is shadowed only where a route opted its method into `comparison.shadow_methods`, and only with a bounded, replayed body.
+4. Never replay a failed in-flight request against legacy unless the route is explicitly `failover_safe: true` (idempotent). Routing *subsequent* requests to legacy via the circuit breaker is fine; *retrying the same request* that may already have hit new is not, unless idempotent.
+5. Never log sensitive values by default.
+6. Bound all buffers.
+7. Validate configuration and contracts at startup; refuse to start on invalid config.
 
 **Keep abstractions modular** behind traits — `FlagProvider`, the comparison/normalization engine, route decisioning, and the upstream client — so future work (Redis→LaunchDarkly, a shared normalization crate, a Pingora data-plane, client TLS termination, advanced write migration) can land without reshaping the core.
 
