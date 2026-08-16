@@ -309,10 +309,21 @@ the proxy that recorded it is the only authority on whether it is complete.
 ### Preconditions
 
 - **The config must be the profiled proxy's config.** `suggest-routes` cannot
-  corroborate the route table, `match` conditions, or `observe.sample_rate` any
-  other way, so a config declaring no `observe:` block, or one whose
-  `sample_rate` disagrees with the profile document, is treated as "not this
-  proxy's config" — exit `50`, never an averaged or best-effort answer.
+  corroborate the route table, `match` conditions, `observe.sample_rate`, or a
+  route's own matcher any other way, so a config declaring no `observe:`
+  block, or one whose `sample_rate` disagrees with the profile document, is
+  treated as "not this proxy's config" — exit `50`, never an averaged or
+  best-effort answer. The same check runs one level down, per route: a
+  profile's recorded `match_basis` (`prefix:…` or `template:…`) must agree
+  with what the config now compiles that route to, or the run refuses rather
+  than reinterpret an old capture — `distinct_read_paths` counts *paths*
+  under a `path_prefix` and *shapes* under a `path_template`, so a route
+  templated (or un-templated) since the profile was taken would otherwise be
+  classified against a number that no longer means what it used to. A
+  profile whose own counters could not have come from the recorder (e.g.
+  `read_transport_errors` exceeding `reads`, or stability counters exceeding
+  the successful reads that could have produced them) is refused the same
+  way — corrupt or hand-edited, not a smaller truth to classify anyway.
 - **Traffic has stopped, or the deadline is long enough to outlast it.**
   Quiescence is observed (two consecutive byte-identical profile scrapes
   **and** `limen_in_flight_requests == 0`), not slept — mirroring
@@ -334,7 +345,7 @@ the proxy that recorded it is the only authority on whether it is complete.
 | `0` | Draft emitted. |
 | `20` | Nothing was profiled: no observations at all, or every route's reason is `no-observations`/`insufficient-reads`/`partial-sample`. A sampled profile counts here too — R0 already refused to classify every route, so a draft resting on it rests on no evidence. A draft nobody's traffic informed is not evidence. |
 | `40` | The profile never quiesced within `--drain-deadline-ms`. |
-| `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy. |
+| `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy — including a **stale profile** (a route's recorded `match_basis` disagrees with the matcher the config now compiles for it — see [Preconditions](#preconditions)) and a **consistency refusal** (the profile's own counters could not have come from the recorder, e.g. more `read_transport_errors` than `reads`). |
 | `1` | Unexpected tooling error (anyhow). |
 | `2` | CLI usage error (clap). |
 
@@ -355,10 +366,12 @@ whether) a draft would render it:
     "disposition": "compare_candidate",
     "reason": "stable-repeated-reads",
     "evidence": {
+      "match_basis": "prefix:/devices/",
       "observations": 34,
       "reads": 34,
       "writes": 0,
       "transport_errors": 0,
+      "read_transport_errors": 0,
       "distinct_read_paths": 1,
       "distinct_read_paths_overflow": false,
       "status_classes": { "2xx": 34 },
@@ -384,7 +397,12 @@ whether) a draft would render it:
 `disposition` and `reason` are both stable, published vocabularies; the three
 dispositions are tabulated in [observe mode](../guides/observe-mode.md#reading-a-suggestion),
 and the traffic shapes the reasons name are catalogued in [classifying
-routes](../guides/classifying-routes.md).
+routes](../guides/classifying-routes.md). `match_basis` is copied verbatim
+from the profile (`prefix:…` or `template:…`) — it is what a stale profile is
+checked against before classification ever runs (see
+[Preconditions](#preconditions)), and it says which question
+`distinct_read_paths` answers for this route. `read_transport_errors` is the
+read-scoped subset of `transport_errors` that R8a's carve-out reads.
 `narrowing_matches` lists **every** narrowing rule that matched, not just the
 one named by `reason`: first-match-wins picks the right disposition but hides
 the rest of the evidence, so a route demoted for `body-varies` that also

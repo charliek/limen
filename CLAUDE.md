@@ -11,7 +11,9 @@ deterministic percentage rollout via feature flags, and fail-safe fallback to
 legacy. The authoritative design is `docs/limen_spec.md` (Section numbers
 referenced throughout the code refer to it). `docs/runbook.md` and
 `docs/prfaq.md` give operational and motivational context; `docs/pharos_spec.md`
-describes the companion test suite that shares the behavioral contract.
+describes the companion test suite that shares the behavioral contract. limen
+is upstream-of-record for `docs/runbook.md` and `docs/prfaq.md` — pharos keeps
+byte-identical cross-copies; edit here and re-sync there, never the reverse.
 
 ## Toolchain
 

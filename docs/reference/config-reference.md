@@ -97,7 +97,8 @@ Each route declares exactly one mode and the upstreams it needs.
 |---|---|---|---|
 | `id` | string | — | Unique; also a metric label. |
 | `match.methods` | list | — | HTTP methods; at least one, all known verbs. |
-| `match.path_prefix` | string | — | Must start with `/`; longest prefix wins. |
+| `match.path_prefix` | string | — | Must start with `/`; longest prefix wins. Exactly one of `path_prefix` / `path_template` required. |
+| `match.path_template` | string | — | One exact path shape with `{param}` segments (see below). Exactly one of `path_prefix` / `path_template` required. |
 | `match.query_present` | list | `[]` | Query parameter names that must **all** be present (see below). |
 | `match.query_absent` | list | `[]` | Query parameter names of which **none** may be present. |
 | `legacy_upstream` | url | — | Required unless mode is `new_only`. |
@@ -153,16 +154,77 @@ one-time tokens, so the shadow's copy deterministically fails at the shared
 authorization server ("The consent verifier has already been used"). Splitting
 the route relays those hops uncompared and keeps the bounces compared.
 
-**Precedence.** Longest `path_prefix` still wins outright; at an *equal* prefix
-a query-conditioned route beats an unconditioned one (in either config order);
-config order is the final tiebreak. Two conditioned routes on the same prefix
-and method are rejected at load time unless **provably disjoint** — some
-parameter appears in one route's `query_present` and the other's `query_absent`.
-The check is conservative on purpose: anything it cannot prove disjoint is an
-error, rather than letting config order silently decide.
+**Precedence.** Every `path_template` route is tried **before** every
+`path_prefix` route; within the template tier the fewest-parameters template
+wins (more literal = narrower), within the prefix tier the longest prefix
+still wins outright. At an *equal* key in either tier a query-conditioned
+route beats an unconditioned one (in either config order); config order is the
+final tiebreak. Two conditioned routes on the same prefix and method (or the
+same path template) are rejected at load time unless **provably disjoint** —
+some parameter appears in one route's `query_present` and the other's
+`query_absent`. The check is conservative on purpose: anything it cannot prove
+disjoint is an error, rather than letting config order silently decide.
 
 A route declaring neither field matches exactly as it did before these fields
 existed.
+
+### `match.path_template` (route by shape, not just by subtree)
+
+A route may name its paths with a template instead of a prefix — exactly one
+of `path_prefix` / `path_template` per route, never both, never neither (spec
+§5.2). A template is one exact shape: `{name}` spans exactly one non-empty
+path segment, so `/conversations/{id}` matches `/conversations/42` but not
+`/conversations/42/messages` or `/conversations`. Matching never
+percent-decodes — `%2F` inside a segment stays one character of that segment —
+and a request path with an empty segment (`//`) or a trailing slash never
+matches a template; it falls through to the prefix tier instead.
+
+```yaml
+routes:
+  - id: "get-conversation"
+    match: { methods: ["GET"], path_template: "/conversations/{id}" }
+    ...
+  - id: "export-conversations"
+    match: { methods: ["GET"], path_template: "/conversations/export" }
+    ...
+```
+
+Reach for a template when one path under a prefix behaves differently from its
+siblings and no prefix can carve it out — `/conversations/export` is a report,
+every other `/conversations/<id>` is a fetch, and no prefix names that split.
+The all-literal `export` template above is the narrower of the two shapes and
+is matched first.
+
+**Syntax rules**, enforced at `validate-config` time:
+
+- Starts with `/`; no segment may be empty — no `//`, no trailing slash, and
+  the bare `/` on its own is rejected, since a matching path's segments are
+  never empty.
+- A `{name}` parameter must span a whole segment (`/v{n}` and `/{a}b` are
+  rejected, not silently read as literal text); `name` must be a valid
+  identifier (`[A-Za-z_][A-Za-z0-9_]*`) and must not repeat within one
+  template.
+- At least one segment must be a literal — an all-parameter template would
+  match every path of its length and be consulted ahead of every
+  `path_prefix` route, which is a catch-all wearing a template's clothes.
+
+**Overlap.** Because templates are matched before prefixes, an overlapping
+pair could silently steal a sibling route's traffic, so every pair of routes
+whose methods overlap is validated against one decision:
+
+| Pair | Accepted | Rejected |
+|---|---|---|
+| Two templates that can never match the same path (different segment counts, or a literal clash somewhere) | always | — |
+| Two templates where one is strictly narrower (every differing segment is a literal on the narrow side, a parameter on the broad side) | the broader is unconditioned, the narrower is itself conditioned, or the pair is provably query-disjoint | the broader carries a query condition, the narrower does not, and the two are not provably disjoint — the narrower would win on every path and steal exactly the requests the condition exists to except |
+| Two templates of the identical shape (parameter names aside) | exactly one is query-conditioned, or both are and are provably disjoint | both unconditioned — a template pair has no prefix length left to order them by, so this is a typo, not a precedence — or both conditioned without disjointness |
+| Two co-matchable templates where neither is narrower | never | always — which one would win is an accident of config order, so rewrite one narrower or disjoint |
+| A template and an unconditioned prefix that intersect | every path the template matches lies under the prefix (the template refines the prefix's subtree) | the template takes only part of the prefix's traffic — the pair would split it on a boundary neither route states |
+| A template and a query-conditioned prefix that intersect | the pair is provably query-disjoint | not provably disjoint — the template would take the requests the conditioned prefix exists to except |
+
+"Provably disjoint" is the same rule used above for two conditioned prefixes:
+some parameter in one route's `query_present`, the other's `query_absent`.
+Error messages quote the two route ids and, for a template pair, a concrete
+path that matches both, so you can see exactly what collides.
 
 ### `rollout`
 
@@ -367,5 +429,8 @@ a non-empty `diff_sink.dir`, the query-condition rules (non-empty unique names,
 written as **literal decoded names** — no `%`, `+`, or edge whitespace, since the
 request's query is percent-decoded before comparison and an encoded spelling
 could never match; no name in both fields; provably disjoint conditioned routes
-on one prefix), and the `failover_safe` gate — collecting **all** problems and naming the offending
-field and route. A full valid example lives at `config/limen.example.yaml`.
+on one prefix), that `match` sets exactly one of `path_prefix` / `path_template`
+and that a `path_template` parses (see [`match.path_template`](#matchpath_template-route-by-shape-not-just-by-subtree)
+for the syntax and overlap rules), and the `failover_safe` gate — collecting
+**all** problems and naming the offending field and route. A full valid
+example lives at `config/limen.example.yaml`.

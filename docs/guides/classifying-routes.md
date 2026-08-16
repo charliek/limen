@@ -186,7 +186,7 @@ on relay-only and stay there.
 
 ## The sharp-edge catalog
 
-Four shapes account for most of the classification mistakes worth naming
+Six shapes account for most of the classification mistakes worth naming
 explicitly, because each one has bitten a real campaign in a way that a naive
 first pass at the taxonomy did not anticipate.
 
@@ -195,7 +195,9 @@ first pass at the taxonomy did not anticipate.
 | One-time-token hops | A query parameter or path segment names a verifier, challenge, or code the backend invalidates on first use. | The shadow's replay is a *guaranteed* failure, not a parallel observation — it proves nothing and drowns real signal. | C |
 | Writes in GET clothing | A bare redirect (3xx, possibly with no cookie at all) or an otherwise read-shaped call that accepts a pending flow step. | Comparing it plainly (no `Location`/`Set-Cookie` narrowing) can shadow *and compare clean*, hiding the mutation entirely — and re-sending it can break the flow at the shared backend. | D |
 | XFF-keyed behavior | A route whose behavior — a rate limit bucket, a geo decision — is keyed off a forwarded-client-address header the *test harness* sets synthetically to isolate scenarios. | Any correct reverse proxy collapses synthetic `X-Forwarded-For` bucketing the same way a real one would from behind a shared edge, so the route's behavior through the lens legitimately diverges from behind it — a false mismatch that traffic shape alone cannot distinguish from a real one. | — (harness-dependent; exclude from comparison rather than classify) |
-| Wildcard-proxy granularity | One route config (a path prefix, a catch-all) actually serves many distinct underlying paths — some safe to compare, some not — folded into a single classification decision. | Classification is inherently per *route*; safety is inherently per *path*. A route this coarse can carry a minority of mutating traffic that never moves the aggregate signal enough to demote the whole route. See [sub-path aliasing](#what-observation-can-and-cannot-tell-you) below — this is the sharp edge with no traffic-side fix. | any |
+| Wildcard-proxy granularity | One route config (a path prefix, a catch-all) actually serves many distinct underlying paths — some safe to compare, some not — folded into a single classification decision. | Classification is inherently per *route*; safety is inherently per *path*. A route this coarse can carry a minority of mutating traffic that never moves the aggregate signal enough to demote the whole route. See [sub-path aliasing](#what-observation-can-and-cannot-tell-you) below — this is the one sharp edge with a config-side fix, `match.path_template`. | any |
+| Wildcard-shaped templates | A `path_template` most of whose segments are parameters (`/api/{a}/{b}/{c}`) rather than literals. | The template still absorbs whatever cardinality R7/R8 exist to catch — quiet path-count rules mean the shape was named once, not that the operation is narrow. See [the wildcard-template residual](#what-observation-can-and-cannot-tell-you) below. | any |
+| Error-only corpora | Every read the route ever answered came back 4xx/5xx — the route has never once shown what it returns when it works. | A fixed-length error page can still satisfy the raw repeat-evidence signal, so absent a rule watching status class, a route with zero successful reads could still reach `compare_candidate` on evidence that only shows how it fails. See [R8a](#what-observation-can-and-cannot-tell-you) below. | — |
 
 ## What observation can and cannot tell you
 
@@ -223,10 +225,35 @@ route served without ever writing a user-identifying string to the control
 plane. No classification rule can see which sub-paths a route's reads actually
 hit, because that information was never recorded in the first place — refusing
 to record it is what makes the profile safe to expose, and it is exactly what
-makes this residual unfixable within observe mode's design. This is the single
+makes this residual unfixable *from traffic*. This is the single
 strongest argument for keeping route granularity a human decision, and for
 never letting a tool draft a comparison-enabled route on the strength of
 traffic shape alone.
+
+**The lever against it lives in config, not in observation.**
+[`match.path_template`](../reference/config-reference.md#matchpath_template-route-by-shape-not-just-by-subtree)
+turns the fold itself into a decision the operator makes explicitly: splitting
+`/orders/` into `/orders/{id}` and `/orders/{id}/mark-read` makes the two
+operations two routes with two profiles, each classified on its own evidence.
+No traffic shape can make this split for you — the recorder still cannot see
+which path a read hit, so a tool can never *infer* the boundary — but once the
+config draws it, R7 and R8 read `distinct_read_paths` per *operation* rather
+than per prefix, and a route that used to hide a minority of mutating traffic
+inside a majority of safe reads becomes two routes the classifier can actually
+tell apart.
+
+**A template does not, on its own, guarantee narrow granularity.** Absorbing
+path cardinality is what a template is *for* — `/conversations/{id}` reports
+one distinct path however many ids it served — but a template whose segments
+are almost entirely parameters (`/api/{a}/{b}/{c}`) absorbs just as much
+cardinality while naming almost nothing. R7 and R8 go quiet on a shape like
+that by the same mechanism that makes them go quiet on a well-scoped template,
+so their silence is not evidence the operation is narrow, only that it was
+named once instead of counted per id. R10 (`no-repeat-evidence`) is the net
+that remains: candidacy still requires a *concrete* request to repeat with a
+stable length, so a wildcard-shaped template with no actual repeat traffic
+still lands short of `compare_candidate` even though the path-count rules
+never fired.
 
 **The `Content-Length` stability signal fails in both directions, and only one
 of them is safe.** Absent a body byte to inspect — reading one would delay
@@ -261,6 +288,28 @@ buffered and compared exactly like any other as long as it finishes inside the
 route's size and time bounds. A missing `Content-Length` is a hole in the
 *profile's* evidence, not an exclusion from comparison (see [observe
 mode](observe-mode.md#length-less-responses-collapse-to-one-bucket)).
+
+**A corpus of nothing but failures cannot vouch for a route, and the
+classifier now says so explicitly.** Status class used to participate in no
+danger rule, so a route whose reads answered nothing but 4xx/5xx could still
+repeat at a fixed length and reach `compare_candidate` on evidence that never
+once showed what the operation returns when it works — a stable 404 page is
+still a stable length. Tapper's phase-04 field test recorded two real
+instances of exactly this: a legitimately-all-404 route (an images endpoint
+whose test corpus never produced a cache hit) and a corpus poisoned by an
+unrelated driver bug that made every read fail for reasons that had nothing to
+do with the route's own safety. Both reached candidacy under the earlier rule
+table. `no-success-evidence` (R8a) now demotes any route whose reads were
+observed and never once answered `2xx`, provided at least one of them actually
+reached an upstream — a route where every read was withheld by a transport
+failure is [R3/R10's](observe-mode.md#reading-a-suggestion) to demote, not
+R8a's, so a flapping upstream cannot manufacture the same verdict a genuinely
+broken route earns; withheld evidence only withholds. Stability evidence is
+success-qualified for the same reason: only `2xx` reads enter the fingerprint
+map at all, because a fixed-length error page repeating says nothing about the
+body an operation returns when it succeeds. That is the asymmetry the whole
+classifier rests on — **an error can condemn a route, it can never vouch for
+one.**
 
 **Classification requires a full, unsampled traffic set — sampling and
 classification are mutually exclusive.** The dangerous rules (a redirecting

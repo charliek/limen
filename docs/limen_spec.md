@@ -612,13 +612,47 @@ Both default to `[]`, and a route declaring neither behaves exactly as it did be
 
 The motivating case is a path whose hops are not equally safe to shadow. Shadow-comparing `/oauth2/auth` works for the initial authorize bounce, but the `login_verifier` / `consent_verifier` hops replay one-time tokens, so the shadow's copy deterministically fails at the shared authorization server ("The consent verifier has already been used", recorded in slauth's dual-lens campaign v1). Splitting the path into a conditioned route that relays the verifier hops and an unconditioned one that keeps comparing the bounces recovers the comparison without touching the tokens.
 
-**Precedence.** Among the routes whose method, path prefix, and query conditions all match:
+**Path templates.** A route may name its paths with `match.path_template` instead of `match.path_prefix` — exactly one of the two, never both, never neither (Section 5.3). A template names one exact shape: `/conversations/{id}` matches `/conversations/42` but not `/conversations/42/messages` or `/conversations`. Each `{name}` spans exactly one non-empty raw path segment; matching is segment-count-exact and never percent-decodes, so `%2F` inside a segment stays one character of that segment and never a boundary, and a request path carrying an empty segment (`//`) or a trailing slash never matches a template — it falls through to the prefix tier instead, which is where a path a template cannot name belongs. A template must carry at least one literal segment (an all-parameter template is a catch-all wearing a template's clothes, and the template tier is consulted ahead of every prefix route) and must not name the same parameter twice.
 
-1. Longest `path_prefix` wins — unchanged, and it outranks every query condition, so a longer unconditioned prefix still beats a shorter conditioned one.
-2. At an **equal** prefix, a query-**conditioned** route (declaring either field) beats an unconditioned one. This is what lets a narrow exception sit alongside the general route for a path, in either config order.
-3. Config order remains the final stable tiebreak.
+```yaml
+routes:
+  - id: "get-conversation"
+    match:
+      methods: ["GET"]
+      path_template: "/conversations/{id}"
+    ...
+  - id: "export-conversations"
+    match:
+      methods: ["GET"]
+      path_template: "/conversations/export"
+    ...
+```
 
-Two conditioned routes that could both match one request are rejected at load time (Section 5.3), so this ordering never has to choose between them.
+The reason templates exist: one path under a prefix behaves differently from its siblings, and no prefix can say so. `/conversations/export` is a report and every other `/conversations/<id>` is a fetch; the all-literal template above is the narrower of the two shapes and is consulted first (see Precedence, below).
+
+**Overlap validation.** Because templates are matched before prefixes, an overlapping pair could silently steal traffic from a sibling route, so every pair of routes whose methods overlap is checked at load time and one of the following must hold:
+
+| Pair | Legal when | Refused otherwise |
+|---|---|---|
+| Two templates, not co-matchable (different segment counts, or a literal clash at some position) | always | — |
+| Two templates, one strictly narrower (a literal refines a parameter at every differing position) | the broader is unconditioned, or the narrower is itself conditioned, or the two are provably query-disjoint | the broader is query-conditioned, the narrower is not, and the two are not provably disjoint — the narrower would win on every path it matches and steal the requests the condition exists to except |
+| Two templates, identical shape (parameter names aside) | exactly one is query-conditioned, or both are and provably disjoint | both unconditioned (nothing left to order them by — a prefix pair has length to fall back on, a template pair does not) or both conditioned without disjointness |
+| Two templates, co-matchable but neither narrower than the other | never | always — which one wins would be an accident of config order, so one of the two must be rewritten narrower or disjoint |
+| A template and an unconditioned prefix that intersect | every path the template matches lies under the prefix (the template is a refinement of the prefix's subtree) | the template takes only some of the prefix's traffic and leaves the rest — the pair would split the prefix route's traffic on a boundary neither route states |
+| A template and a query-conditioned prefix that intersect | the two are provably query-disjoint | not provably disjoint — the template would take the requests the conditioned prefix exists to except |
+
+"Provably disjoint" is the same test Section 5.3 already defines for two conditioned prefixes at an equal prefix: some parameter appears in one route's `query_present` and the other's `query_absent`. Two prefix routes overlapping each other are not this table's business — longest prefix always decides, and the equal-prefix query rules above handle the tie.
+
+**Precedence.** Among the routes whose method and query conditions all match:
+
+1. Every `path_template` route is consulted **before** every `path_prefix` route — a template names an exact shape, a prefix names a subtree, so the specific must be tried before the general or a catch-all would swallow the refinement written to escape it.
+2. Within the template tier, fewer parameters wins (the more literal template is the narrower one, and the overlap table above guarantees exactly one of any two co-matchable templates is narrower, or they are the same shape). Within the prefix tier, the longest prefix wins — unchanged.
+3. At an equal key within either tier, a query-**conditioned** route (declaring either field) beats an unconditioned one. This is what lets a narrow exception sit alongside the general route for a path, in either config order.
+4. Config order remains the final stable tiebreak.
+
+Two conditioned routes that could both match one request, and any path-template pair or template/prefix pair the overlap table above refuses, are rejected at load time (Section 5.3), so this ordering never has to choose arbitrarily.
+
+**Profile provenance.** A route's matcher travels with any observe-mode profile recorded under it, as `match_basis` (`prefix:/devices` or `template:/conversations/{id}`) — required on the wire, so a profile from a build that predates this field fails to parse rather than defaulting to a basis nobody recorded. `read_transport_errors`, the read-scoped subset of `transport_errors`, is required alongside it for the same reason: a route whose writes are timing out while its reads answer normally must not have its read-transport-failure evidence silently disarmed by a whole-route counter. `limen suggest-routes` refuses to classify (exit `50`) whenever the profile disagrees with the config it is handed: a `match_basis` recorded under a different matcher than the config now declares (a route templated since the profile was captured, or the reverse), counters that could not have come from the recorder (more read transport errors than reads, or stability counters exceeding the successful reads that could have produced them), or a profile sharing no route id with the config at all. A stale or hand-edited profile is treated as a required input being unavailable, never as a discrepancy to average over — the operator-facing workflow is covered by the observe mode and classifying-routes guides.
 
 Local flags file:
 
@@ -648,6 +682,9 @@ migration.get-device.shadow_enabled: true
 - Validation refuses `shadow_methods` entries that could not take effect: a method other than `POST`, a mode that does not shadow, `comparison.enabled: false`, or a method `match.methods` does not carry (Section 6.1).
 - `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
 - `diff_sink.dir`, if the block is present, is non-empty. The directory (and its parent) need **not** exist — it is created on the first mismatch, so a fresh deploy is not failed for a directory nothing has written to yet.
+- A route's `match` sets **exactly one** of `path_prefix` or `path_template` — never both (two answers to the same question) and never neither (an omitted `path_prefix` defaulting to `/` would silently turn a mistyped route into a catch-all shadowing every path in the service).
+- A `path_template` parses: it starts with `/`; no segment is empty (no `//`, no trailing slash, and the bare `/` is rejected — none can ever match, since a matching path's segments are all non-empty); a `{name}` parameter spans a whole segment (`/v{n}` and `/{a}b` are rejected, not treated as literal text); a parameter name is a valid identifier (`[A-Za-z_][A-Za-z0-9_]*`) and is not repeated; and the template carries at least one literal segment.
+- Every pair of routes whose methods overlap is checked against the overlap decision table in Section 5.2 above; anything that table does not prove legal is rejected at load time, refusing to start (safety invariant 7) rather than leaving matching to an arbitrary tiebreak.
 
 Validation failures must name the offending field and route.
 

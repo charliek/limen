@@ -225,9 +225,9 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 **The loop:**
 1. Run the suite locally, focused on the route under work:
    ```bash
-   npm run ftest -- run --scenario users.get-user-success
+   bun run ftest -- run --scenario users.get-user-success
    # or a whole service by tag:
-   npm run ftest -- run --include-tag migration-ready
+   bun run ftest -- run --include-tag migration-ready
    ```
 2. For each failure, **diagnose which kind it is**:
    - **Real behavioral gap in the new service** → fix the new service. (This is the productive majority.)

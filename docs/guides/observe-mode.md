@@ -114,11 +114,13 @@ observed — traffic never adds a route to the document, it only fills one in:
 {
   "sample_rate": 1.0,
   "routes": {
-    "get-device": {
+    "get-conversation": {
+      "match_basis": "template:/conversations/{id}",
       "observations": 148,
       "reads": 148,
       "writes": 0,
       "transport_errors": 0,
+      "read_transport_errors": 0,
       "methods": { "GET": 148 },
       "query_names": [],
       "query_names_overflow": false,
@@ -136,10 +138,12 @@ observed — traffic never adds a route to the document, it only fills one in:
       "fingerprint_overflow": false
     },
     "oauth-login-hop": {
+      "match_basis": "prefix:/oauth2/auth",
       "observations": 0,
       "reads": 0,
       "writes": 0,
       "transport_errors": 0,
+      "read_transport_errors": 0,
       "methods": {},
       "query_names": [],
       "query_names_overflow": false,
@@ -160,14 +164,60 @@ observed — traffic never adds a route to the document, it only fills one in:
 }
 ```
 
-`get-device` has been driven; `oauth-login-hop` has not — and the document
-says so explicitly rather than by omission, the same absence-vs-zero
+`get-conversation` has been driven; `oauth-login-hop` has not — and the
+document says so explicitly rather than by omission, the same absence-vs-zero
 discipline the [observability guide](observability.md#metrics) already
 applies to Limen's zero-registered metric series. `sample_rate` travels with the document because
 the proxy that recorded it is the only authority on whether the profile is
 complete; a config file handed to `suggest-routes` later cannot be trusted to
 restate it accurately, so the two are cross-checked and a mismatch is a typed
 failure rather than a silent average.
+
+Every field above is **required** — a document missing one, including a
+profile a pre-templating build of Limen recorded, fails to parse rather than
+reading as a pristine or zero-filled route. `match_basis` and
+`read_transport_errors` are the two newest required fields, and both exist
+for the same reason `sample_rate` does: only the proxy that recorded the
+profile can state them, so a document that omits either is a document
+`suggest-routes` cannot trust.
+
+### `match_basis`: what a route's distinct-path count is counting
+
+`match_basis` records the matcher a route was profiled under, verbatim:
+`prefix:/oauth2/auth` or `template:/conversations/{id}`. It matters because
+`distinct_read_paths` answers a different question depending on it. Under a
+`path_prefix` route the count is *paths* — `get-conversation` above, if it
+were still `path_prefix: "/conversations/"`, would report one distinct path
+per conversation id, climbing without bound as traffic grows. Templated as
+`/conversations/{id}`, the same traffic reports `distinct_read_paths: 1`:
+every id folds into the one shape the route names, because absorbing that
+cardinality is what naming the shape is *for*. This is template-normalized
+counting — the recorder keys the counter on the matched template's text
+rather than the concrete path, so R7 (wildcard granularity) and R8 (opaque
+path ids) read "how many operations" instead of "how many resources", and a
+route that would otherwise look like a wildcard proxy reaches candidacy on the
+evidence the template was written to produce.
+
+`suggest-routes` refuses to classify (exit `50`) whenever a route's recorded
+`match_basis` disagrees with what the config now declares — a route templated
+(or un-templated) since the profile was captured. The two matchers count
+`distinct_read_paths` differently, so reinterpreting an old profile under a
+new matcher would silently read a per-id path spread as one tidy endpoint —
+the unsafe direction for a rule built to catch exactly that shape. Re-profile
+against the current config rather than reusing the old capture.
+
+### Stability is success-qualified
+
+`length_repeats`, `length_varied`, and `length_missing` — the whole stability
+signal — accrue **only from upstream reads whose status class is `2xx`**.
+Every other counter in the profile (`status_classes`, `redirect_reads`,
+`set_cookie_reads`, `distinct_read_paths`) stays all-reads, including errors,
+but a 404 page repeating at a fixed length says nothing about how the
+operation's body behaves when it works — counting it would manufacture the
+exact affirmative evidence candidacy rests on out of a route that has never
+once succeeded. The asymmetry is the point: an error response can still
+*condemn* a route (it lands in `status_classes`, where R8a reads it), it can
+never *vouch* for one.
 
 ### Length-less responses collapse to one bucket
 

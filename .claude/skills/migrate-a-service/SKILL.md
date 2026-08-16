@@ -33,9 +33,14 @@ observe: {}    # presence is the whole switch; no `enabled` field; sample_rate d
 
 **Where the route inventory comes from**, in descending fidelity: the service's own OpenAPI document or
 route table (one `curl -s http://legacy/openapi.json | jq '.paths | keys'` for a FastAPI-style service),
-else the framework's router registration read from source, else path sampling from access logs. Folding
-operations onto `path_prefix` routes is a judgement call and the first one you make — keep it coarse
-enough to read and expect stage 3 to refine it against the handler source.
+else the framework's router registration read from source, else path sampling from access logs. **Prefer
+`match.path_template` over `path_prefix` for any REST-shaped operation you can already name** —
+`/conversations/{id}` instead of folding it under `path_prefix: "/conversations/"` — because the profile
+recorder counts `distinct_read_paths` per the matched shape: a template gives you per-*operation* counters
+from the first request, while a prefix folds every id into one aggregate you can only split later by
+re-profiling. Where the inventory itself is uncertain, `path_prefix` is still the right coarse starting
+point; expect stage 3 to refine it against the handler source, and treat a fold discovered there as a
+reason to template and re-profile rather than to classify around it.
 
 Drive representative traffic **unsampled**: the classifier's danger rules are existential, so sampling and
 classification are mutually exclusive. A sampled profile is refused outright — every route lands
@@ -70,7 +75,7 @@ read floor and the wildcard-granularity rule.
 | `0` | Draft emitted on real classifications. |
 | `20` | Nothing usefully profiled: no observations, every route below the read floor, or a sampled profile. |
 | `40` | The profile never quiesced within `--drain-deadline-ms`. |
-| `50` | Required input unavailable: control plane unreachable, running proxy has no `observe:` block, unreadable `--profile`, or a config that does not describe the profiled proxy. |
+| `50` | Required input unavailable: control plane unreachable, running proxy has no `observe:` block, unreadable `--profile`, or a config that does not describe the profiled proxy — including a **stale profile**, where a route's recorded `match_basis` (`prefix:…`/`template:…`) disagrees with what the config now declares (re-profile after templating a route, never reclassify the old capture), and a **consistency refusal**, where a profile's own counters could not have come from the recorder (e.g. more read transport errors than reads) and are therefore corrupt or hand-edited. |
 
 **Exit `20` still writes a draft** — the document goes to stdout either way, so the existence of a file
 proves nothing. `20` means the draft rests on refusals to classify: unadoptable, not absent. **Branch on
@@ -85,7 +90,7 @@ in the inventory:
 
 | Disposition | What it means |
 |---|---|
-| `relay_only` | A danger signal fired (redirecting read, cookie-minting read, one-time-token query name, catch-all/wildcard granularity) **or** too little was observed to say anything. Different states — do not record the second as the first. |
+| `relay_only` | A danger signal fired (redirecting read, cookie-minting read, one-time-token query name, catch-all/wildcard granularity, **or every observed read failed — R8a, `no-success-evidence`**) **or** too little was observed to say anything. Different states — do not record the second as the first. A route where reads only ever answered 4xx/5xx has demonstrated how it fails, not that it is safe; an error can condemn a route, it can never vouch for one. |
 | `compare_narrowed` | Nothing dangerous fired, but the body cannot be trusted for equality (varying length, several content types, incomplete stability evidence). The narrowing becomes contract work. |
 | `compare_candidate` | A fingerprint repeated with a stable length and no danger signal. A hypothesis carrying evidence, never a safety claim. |
 
