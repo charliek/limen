@@ -66,6 +66,12 @@ impl Config {
         self.debug.is_some_and(|d| d.sink_canary)
     }
 
+    /// Whether the `x-limen-upstream` response attribution header is enabled
+    /// (absent block = off).
+    pub fn upstream_header_enabled(&self) -> bool {
+        self.debug.is_some_and(|d| d.upstream_header)
+    }
+
     /// Whether observe mode is on. Presence of the block is the whole switch —
     /// there is no `enabled` field to disagree with it.
     pub fn observe_enabled(&self) -> bool {
@@ -87,6 +93,19 @@ pub struct DebugConfig {
     /// synthetic mismatch through the real compare → observer → sink pipeline
     /// under the reserved route id `__limen_canary__`.
     pub sink_canary: bool,
+    /// Add an `x-limen-upstream: legacy|new` response header attributing the
+    /// upstream whose response is being *relayed* to the client — not the one
+    /// merely attempted. Absent on every limen-synthesized response
+    /// (synthesized 502/504, local refusals, unmatched routes); present on a
+    /// replayed failover response with the *legacy* value, since that is the
+    /// upstream whose response the client actually received. Exists for
+    /// proving per-key rollout determinism and replay behavior against a real
+    /// deployment (`limen suggest-routes`-adjacent tooling and the rollout
+    /// simulation), not for production operation — `limen run` logs the same
+    /// loud startup warning `sink_canary` gets. Inbound `x-limen-upstream`
+    /// from a client or an upstream is always stripped, on or off, so a
+    /// spoofed value can never reach an upstream or a client.
+    pub upstream_header: bool,
 }
 
 /// Observe mode: a bounded, strictly passive profile of the traffic Limen
@@ -840,10 +859,18 @@ routes:
         let cfg: Config = serde_yaml::from_str("{}").unwrap();
         assert!(cfg.debug.is_none());
         assert!(!cfg.sink_canary_enabled());
+        assert!(!cfg.upstream_header_enabled());
         // An empty block is still off: only an explicit `true` enables it.
         let cfg: Config = serde_yaml::from_str("debug: {}").unwrap();
-        assert_eq!(cfg.debug, Some(DebugConfig { sink_canary: false }));
+        assert_eq!(
+            cfg.debug,
+            Some(DebugConfig {
+                sink_canary: false,
+                upstream_header: false
+            })
+        );
         assert!(!cfg.sink_canary_enabled());
+        assert!(!cfg.upstream_header_enabled());
     }
 
     #[test]
@@ -853,6 +880,34 @@ routes:
         // A misspelled debug switch must fail loudly rather than silently
         // leaving the canary off — a runner would then "prove" nothing.
         assert!(serde_yaml::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
+    }
+
+    #[test]
+    fn debug_upstream_header_parses_and_rejects_typos() {
+        let cfg: Config = serde_yaml::from_str("debug:\n  upstream_header: true\n").unwrap();
+        assert!(cfg.upstream_header_enabled());
+        assert!(
+            !cfg.sink_canary_enabled(),
+            "the two switches are independent"
+        );
+        assert!(serde_yaml::from_str::<Config>("debug:\n  upstream_hedaer: true\n").is_err());
+    }
+
+    #[test]
+    fn debug_switches_enable_independently() {
+        let sink_only: Config = serde_yaml::from_str("debug:\n  sink_canary: true\n").unwrap();
+        assert!(sink_only.sink_canary_enabled());
+        assert!(!sink_only.upstream_header_enabled());
+
+        let header_only: Config =
+            serde_yaml::from_str("debug:\n  upstream_header: true\n").unwrap();
+        assert!(!header_only.sink_canary_enabled());
+        assert!(header_only.upstream_header_enabled());
+
+        let both: Config =
+            serde_yaml::from_str("debug:\n  sink_canary: true\n  upstream_header: true\n").unwrap();
+        assert!(both.sink_canary_enabled());
+        assert!(both.upstream_header_enabled());
     }
 
     #[test]

@@ -1294,6 +1294,8 @@ mod tests {
         config_from(
             r#"
 observe: {}
+debug:
+  upstream_header: true
 flags:
   provider: file
   file: { path: "./flags.local.yaml" }
@@ -1457,6 +1459,10 @@ routes:
         assert_eq!(parsed.flags.provider, config.flags.provider);
         assert_eq!(parsed.flags.fail_safe_mode, config.flags.fail_safe_mode);
         assert_eq!(parsed.observe, config.observe);
+        // `debug` is the same shape as `flags`/`observe`: dropping it would
+        // silently turn a running debug affordance off across a
+        // suggest-routes round trip.
+        assert_eq!(parsed.debug, config.debug);
         assert_eq!(parsed.server, config.server);
         assert_eq!(parsed.metrics, config.metrics);
         // The one field that is not verbatim, and why: the file provider opens

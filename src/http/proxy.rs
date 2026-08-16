@@ -49,6 +49,14 @@ const HOP_BY_HOP: &[&str] = &[
     "upgrade",
 ];
 
+/// The debug-gated upstream-attribution response header (`debug.upstream_header`,
+/// [`crate::config::model::DebugConfig`]). Only [`handle`] ever sets it — on a
+/// relayed response, when the flag is on — but [`filter_headers`] strips any
+/// inbound value unconditionally, flag on or off: a client must never make it
+/// reach an upstream, and an upstream must never make it reach the client
+/// unfiltered (spoof/leak resistance, spec plan 016 W3).
+const X_LIMEN_UPSTREAM: &str = "x-limen-upstream";
+
 /// The data-plane fallback handler: every client request flows through here.
 ///
 /// This thin wrapper owns the cross-cutting concerns — the in-flight gauge, the
@@ -98,12 +106,28 @@ pub async fn handle(State(state): State<AppState>, req: Request) -> Response {
     // `dispatch` reports the upstream that actually *served* the client, which
     // differs from the chosen primary when a failover route replays to legacy.
     let Dispatched {
-        response,
+        mut response,
         served,
         origin,
     } = dispatch(&state, route, decision, parts, body, &route_id, &request_id)
         .instrument(span)
         .await;
+
+    // `debug.upstream_header`: attribute the upstream whose response is being
+    // relayed — never the one `dispatch` merely attempted. `filter_headers`
+    // has already stripped any inbound `x-limen-upstream` (client-forged on
+    // the request leg, upstream-forged on the response leg) by this point, so
+    // `insert` here can never collide with a spoofed value.
+    if let Some(upstream) = state
+        .upstream_header_enabled()
+        .then(|| relayed_from(served, origin))
+        .flatten()
+    {
+        response.headers_mut().insert(
+            X_LIMEN_UPSTREAM,
+            HeaderValue::from_static(upstream.as_str()),
+        );
+    }
 
     let status = response.status();
     let latency = started.elapsed();
@@ -186,6 +210,27 @@ impl Dispatched {
             origin: ResponseOrigin::Refused,
         }
     }
+}
+
+/// The upstream whose response is being *relayed* to the client, if any —
+/// `None` for every limen-synthesized response.
+///
+/// This is deliberately not `served` alone. `served` names the upstream
+/// `dispatch` *attempted* on every path, including the ones where nothing was
+/// ever relayed: a transport failure or timeout with no replay
+/// (`Dispatched::silent`), a local refusal before any upstream was contacted
+/// (`Dispatched::refused`), and a primary success whose buffered body then
+/// failed mid-read (`primary_succeeded`'s `Buffered::Error` arm, which still
+/// carries the upstream that *answered* in `served` but reports
+/// `ResponseOrigin::UpstreamSilent` because the client got limen's own 502).
+/// `origin == ResponseOrigin::Upstream` is exactly the fact [`Dispatched`]
+/// already tracks for that distinction — including on a failover replay,
+/// where `served` is `Upstream::Legacy` because that is whose response the
+/// client received, not the `Upstream::New` that was tried first. This
+/// function just names the combination for [`handle`], the one caller that
+/// turns it into the `x-limen-upstream` header.
+fn relayed_from(served: Upstream, origin: ResponseOrigin) -> Option<Upstream> {
+    (origin == ResponseOrigin::Upstream).then_some(served)
 }
 
 /// Proxy a matched request to its chosen primary (and, where configured, shadow
@@ -879,6 +924,11 @@ enum Direction {
 ///   header's token list (RFC 7230 §6.1);
 /// - `transfer-encoding` (a hop-by-hop header) in both directions, since the
 ///   relay re-frames the body;
+/// - `x-limen-upstream` ([`X_LIMEN_UPSTREAM`]) in **both** directions,
+///   unconditionally, whether `debug.upstream_header` is on or off: a client
+///   must never make its own value reach an upstream, and an upstream must
+///   never make its own value reach the client — only [`handle`], after this
+///   filter has already run, is allowed to set it on the client response;
 /// - on the **request** leg, `host` and `content-length` — the upstream client
 ///   sets Host and frames the streamed request body itself;
 /// - on the **request** leg, a client-supplied `X-Limen-Shadow`
@@ -900,6 +950,7 @@ fn filter_headers(src: &HeaderMap, direction: Direction) -> HeaderMap {
         let n = name.as_str();
         let drop = HOP_BY_HOP.contains(&n)
             || connection_named.iter().any(|t| t == n)
+            || n == X_LIMEN_UPSTREAM
             || (direction == Direction::Request
                 && (n == "host" || n == "content-length" || n == forwarded::X_LIMEN_SHADOW))
             || (direction == Direction::Response

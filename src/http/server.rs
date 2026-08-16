@@ -47,6 +47,9 @@ struct Inner {
     /// is configured. `Some` is the whole enablement signal, as with the
     /// control plane's canary observer.
     observe: Option<Arc<ObserveRecorder>>,
+    /// `debug.upstream_header` — whether [`proxy::handle`] adds
+    /// `x-limen-upstream` to a relayed client response.
+    upstream_header_enabled: bool,
     shutting_down: AtomicBool,
 }
 
@@ -69,6 +72,7 @@ impl AppState {
         fail_safe_mode: FailSafeMode,
         request_body_limit: usize,
         observe: Option<Arc<ObserveRecorder>>,
+        upstream_header_enabled: bool,
     ) -> Self {
         Self {
             inner: Arc::new(Inner {
@@ -80,6 +84,7 @@ impl AppState {
                 fail_safe_mode,
                 request_body_limit,
                 observe,
+                upstream_header_enabled,
                 shutting_down: AtomicBool::new(false),
             }),
         }
@@ -131,6 +136,12 @@ impl AppState {
     /// absent — which is what the proxy's observation seam checks.
     pub fn observe_recorder(&self) -> Option<&Arc<ObserveRecorder>> {
         self.inner.observe.as_ref()
+    }
+
+    /// `debug.upstream_header` — whether [`proxy::handle`] should attribute a
+    /// relayed response with `x-limen-upstream`.
+    pub fn upstream_header_enabled(&self) -> bool {
+        self.inner.upstream_header_enabled
     }
 
     /// Whether shutdown has begun (shadows are not started during shutdown).
@@ -203,6 +214,7 @@ pub fn build_state_with_observer(
         config.flags.fail_safe_mode,
         request_body_limit,
         observe,
+        config.upstream_header_enabled(),
     ))
 }
 
@@ -290,6 +302,16 @@ pub async fn serve_with_shutdown(
         // The *same* observer the shadow path publishes to (metrics + sink
         // fanout), so the canary rides the real pipeline end to end.
         control_state = control_state.with_sink_canary(state.observer());
+    }
+    if config.upstream_header_enabled() {
+        // Loud on purpose, like the sink canary: the header discloses which
+        // upstream served (or, on a failover replay, which one legacy's
+        // response came from) on every relayed response — a rollout-topology
+        // signal a production deployment should not hand to every client.
+        warn!(
+            "debug upstream-attribution header enabled — responses carry x-limen-upstream; \
+             never enable in production"
+        );
     }
     if let Some(recorder) = state.observe_recorder() {
         // Loud on purpose: observation is passive, but the profile it builds
