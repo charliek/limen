@@ -21,9 +21,11 @@
 //!   mutate".
 //! - **Candidacy requires affirmative evidence, not merely the absence of
 //!   danger.** The fall-through is reachable only when a request fingerprint
-//!   actually repeated with a stable `Content-Length` — which R9/R10/R11
-//!   guarantee structurally. "We learned nothing" lands on `compare_narrowed`,
-//!   never on candidacy.
+//!   actually repeated with a stable `Content-Length` **on a successful read** —
+//!   which R9/R10/R11 guarantee structurally over a stability stream the
+//!   recorder success-qualifies, and R8a guarantees at the route level by
+//!   demoting any route that never once answered 2xx. "We learned nothing" and
+//!   "we learned only how it fails" both land short of candidacy.
 //!
 //! Rules are evaluated **in order, first match wins**, and every relay-only
 //! rule precedes every narrowing rule, so the safe direction always wins a tie
@@ -42,6 +44,7 @@ use serde::{Serialize, Serializer};
 
 use crate::config::model::RouteConfig;
 use crate::observability::observe::{RouteProfile, OVERSIZED};
+use crate::observability::prometheus::SUCCESS_STATUS_CLASS;
 
 /// Default read floor below which a route is not classified at all (R3).
 ///
@@ -204,6 +207,10 @@ pub enum Reason {
     WildcardGranularity,
     /// R8 — nearly every read hit a distinct path.
     OpaquePathIds,
+    /// R8a — reads were observed and not one of them succeeded, while at least
+    /// one of them reached an upstream. The route has demonstrated only how it
+    /// fails.
+    NoSuccessEvidence,
     /// R9 — repeated identical requests returned different lengths.
     BodyVaries,
     /// R10 — no request fingerprint ever repeated, or the fingerprint map
@@ -236,6 +243,7 @@ impl Reason {
             Reason::OneTimeTokenQuery => "one-time-token-query",
             Reason::WildcardGranularity => "wildcard-granularity",
             Reason::OpaquePathIds => "opaque-path-ids",
+            Reason::NoSuccessEvidence => "no-success-evidence",
             Reason::BodyVaries => "body-varies",
             Reason::NoRepeatEvidence => "no-repeat-evidence",
             Reason::StabilityUnobserved => "stability-unobserved",
@@ -315,6 +323,10 @@ pub struct Evidence {
     pub reads: u64,
     pub writes: u64,
     pub transport_errors: u64,
+    /// The read-scoped subset of [`Self::transport_errors`] — R8a's carve-out
+    /// is evaluated against this, so it is reported beside the number a reader
+    /// would otherwise reach for.
+    pub read_transport_errors: u64,
     pub distinct_read_paths: u64,
     pub distinct_read_paths_overflow: bool,
     pub status_classes: BTreeMap<String, u64>,
@@ -373,6 +385,7 @@ pub struct Evidence {
 /// | R6 | `one-time-token-query` | a one-time-token name, observed on a read **or** required by `match.query_present` | relay-only |
 /// | R7 | `wildcard-granularity` | `distinct_read_paths > max_compare_paths`, or path overflow | relay-only |
 /// | R8 | `opaque-path-ids` | `distinct_read_paths / reads >= 0.8` | relay-only |
+/// | R8a | `no-success-evidence` | reads observed, none of them 2xx, and not every read was withheld by transport | relay-only |
 /// | R9 | `body-varies` | `length_varied > 0` | narrowed |
 /// | R11 | `stability-unobserved` | **any** read lacked `Content-Length` | narrowed |
 /// | R10 | `no-repeat-evidence` | `length_repeats == 0`, or fingerprint overflow | narrowed |
@@ -403,6 +416,13 @@ pub struct Evidence {
 ///   credential), is one whose token check could not have seen everything —
 ///   and R6 is existential, so not seeing everything is not a smaller answer
 ///   but a possibly wrong one.
+/// - **R8a is evaluated last among the relay rules**, and its letter suffix is
+///   the same device as R6a's: rule numbers describe evaluation order, so a new
+///   rule slotted into the middle takes a letter rather than renumbering R9–R12
+///   out from under the consumers that cite them. Last because every earlier
+///   rule names a *more specific* danger — a route that redirects and never
+///   succeeds is better reported as the redirecting one, and R8a's own claim
+///   ("nothing here has ever worked") is the weakest statement of the set.
 /// - **R11 is evaluated before R10**, which is a correction to the rule table
 ///   rather than a transcription slip. Under the table's original "*every* read
 ///   lacked `Content-Length`" reading, R11 implied `length_repeats == 0` (a
@@ -451,12 +471,22 @@ pub struct Evidence {
 ///   rules are unchanged and still bite on every `path_prefix` route — which is
 ///   why a stale profile (recorded under a prefix, classified against a
 ///   template, or the reverse) is refused outright rather than reinterpreted.
-/// - **`transport_errors` deliberately does not demote.** A silent upstream
-///   contributes nothing to the content-type, cookie, redirect or stability
-///   evidence (the recorder attributes by origin), so a flapping upstream can
-///   only *withhold* evidence, never manufacture it — and withheld evidence is
-///   already caught by R3 and R10. Demoting on it would demote healthy routes
-///   for their upstream's bad week without making any unsafe route safe.
+/// - **`transport_errors` deliberately does not demote, and R8a is written to
+///   keep it that way.** A silent upstream contributes nothing to the
+///   content-type, cookie, redirect or stability evidence (the recorder
+///   attributes by origin), so a flapping upstream can only *withhold*
+///   evidence, never manufacture it — and withheld evidence is already caught
+///   by R3 and R10. Demoting on it would demote healthy routes for their
+///   upstream's bad week without making any unsafe route safe. R8a would break
+///   that promise if left unguarded, since a corpus of nothing but synthesized
+///   502s has no 2xx in it either; hence its third conjunct, which asks that
+///   *some* read actually reached an upstream before reading "no success" as a
+///   statement about the route. The conjunct is
+///   [`RouteProfile::read_transport_errors`] rather than `transport_errors`
+///   because the latter counts writes too: a route whose writes time out while
+///   its reads answer 404 can carry more transport errors than it has reads,
+///   and the unscoped comparison would disarm the rule on precisely the route
+///   it was written for.
 pub fn classify(
     route: &RouteConfig,
     profile: &RouteProfile,
@@ -476,6 +506,7 @@ pub fn classify(
         reads: profile.reads,
         writes: profile.writes,
         transport_errors: profile.transport_errors,
+        read_transport_errors: profile.read_transport_errors,
         distinct_read_paths: profile.distinct_read_paths,
         distinct_read_paths_overflow: profile.distinct_read_paths_overflow,
         status_classes: profile.status_classes.clone(),
@@ -523,7 +554,8 @@ pub fn classify(
     }
 }
 
-/// R0–R8, in order: the first danger signal, or `None` if the route shows none.
+/// R0–R8a, in order: the first danger signal, or `None` if the route shows
+/// none.
 fn relay_rule(
     route: &RouteConfig,
     profile: &RouteProfile,
@@ -609,6 +641,15 @@ fn relay_rule(
     if opaque_path_ids(profile) {
         return Some(Reason::OpaquePathIds);
     }
+    // R8a — last, and the reason the stability signal alone is not enough.
+    // Every rule above asks whether the traffic showed a danger; this one asks
+    // whether it showed the route *working*. A corpus in which no read ever
+    // succeeded says only how the route fails, and its 404 page repeating at a
+    // fixed length is exactly the affirmative evidence candidacy rests on —
+    // observed on a body no client will ever be served.
+    if no_success_evidence(profile) {
+        return Some(Reason::NoSuccessEvidence);
+    }
     None
 }
 
@@ -617,13 +658,26 @@ fn relay_rule(
 /// All four say the same thing about the body — that equality on it cannot be
 /// trusted — which is why they share a disposition and why their relative order
 /// only decides which label a human reads.
+///
+/// **The stability stream R9, R10 and R11 read is success-qualified.** The
+/// recorder admits only 2xx upstream reads into the fingerprint map, so
+/// `length_repeats`, `length_varied` and `length_missing` are counts over
+/// successful reads alone (see [`RouteProfile::length_repeats`]). None of the
+/// three predicates changed — only what feeds them — and the change is in the
+/// safe direction for each: a route whose only repeats were error pages now
+/// reports `length_repeats == 0` and lands on R10 rather than on candidacy.
+/// R12's content-type set and every relay rule are untouched, and still see
+/// every read.
 fn narrowing_rules(profile: &RouteProfile) -> Vec<Reason> {
     let mut matched = Vec::new();
-    // R9 — the direct observation: identical requests, different lengths.
+    // R9 — the direct observation: identical successful requests, different
+    // lengths.
     if profile.length_varied > 0 {
         matched.push(Reason::BodyVaries);
     }
-    // R11 — ANY read that never declared its length, not every read. The
+    // R11 — ANY successful read that never declared its length, not every one.
+    // (An erroring read never enters this count at all; the route's failure
+    // mode is R8a's to report, not a hole in its stability evidence.) The
     // stability map is method-blind: `length_repeats` counts repeats of a
     // fingerprint, and a fingerprint includes the method, so a route whose
     // HEADs repeat at a stable length while its GETs carry no `Content-Length`
@@ -641,8 +695,10 @@ fn narrowing_rules(profile: &RouteProfile) -> Vec<Reason> {
     }
     // R10 — absent evidence read as absent, not as passing. A corpus that hits
     // each endpoint once produces `length_repeats == 0`, which says nothing
-    // about stability; and past the fingerprint cap variance goes unrecorded,
-    // so overflow is itself a demotion rather than a silent "stable".
+    // about stability; so does a corpus that repeated only on error responses,
+    // which the recorder no longer admits. Past the fingerprint cap variance
+    // goes unrecorded, so overflow is itself a demotion rather than a silent
+    // "stable".
     if profile.length_repeats == 0 || profile.fingerprint_overflow {
         matched.push(Reason::NoRepeatEvidence);
     }
@@ -669,6 +725,37 @@ fn opaque_path_ids(profile: &RouteProfile) -> bool {
     }
     u128::from(profile.distinct_read_paths) * OPAQUE_PATH_RATIO_DEN
         >= u128::from(profile.reads) * OPAQUE_PATH_RATIO_NUM
+}
+
+/// R8a's predicate: reads were observed, **none of them succeeded**, and at
+/// least one of them reached an upstream to fail on its own terms.
+///
+/// An empty status map with reads on the clock is "no success evidence" and
+/// fires — the conservative reading, and the only one available: a profile that
+/// recorded reads but no status class for any of them is malformed, and a
+/// malformed safety input must not resolve toward candidacy.
+///
+/// The third conjunct is the transport carve-out. `read_transport_errors ==
+/// reads` means every read was withheld rather than answered, and withheld
+/// evidence only withholds — that route is R3/R10's to demote, on a label that
+/// says so. Read-scoped deliberately: see [`classify`]'s residuals.
+fn no_success_evidence(profile: &RouteProfile) -> bool {
+    profile.reads > 0
+        && successful_reads(profile) == 0
+        && profile.read_transport_errors < profile.reads
+}
+
+/// Reads that answered `2xx`, by COUNT rather than by key presence: a
+/// `.get("2xx")` of `Some(0)` is a bucket that exists and is empty, and a rule
+/// keyed on `contains_key` would read that bucket as the success it names.
+/// `pub(crate)` so the profile-consistency check at the `--profile` boundary
+/// counts successes by the same definition the rules do.
+pub(crate) fn successful_reads(profile: &RouteProfile) -> u64 {
+    profile
+        .status_classes
+        .get(SUCCESS_STATUS_CLASS)
+        .copied()
+        .unwrap_or(0)
 }
 
 /// Those of `query_names` that match the one-time-token vocabulary,
@@ -795,6 +882,7 @@ mode: legacy_only
             reads: 12,
             writes: 0,
             transport_errors: 0,
+            read_transport_errors: 0,
             methods: counts(&[("GET", 12)]),
             query_names: names(&["id"]),
             query_names_overflow: false,
@@ -829,8 +917,33 @@ mode: legacy_only
         );
     }
 
+    /// Assert `profile` is a document the recorder could actually have written,
+    /// by the same check `suggest-routes` applies at the `--profile` door
+    /// ([`crate::draft::check_profile_consistency`]) rather than by a local
+    /// restatement of it that could drift.
+    ///
+    /// Applied to every fixture that claims **candidacy**, which is where an
+    /// impossible shape does damage: a fixture claiming eleven stable repeats
+    /// on a route with one successful read proves the classifier promotes a
+    /// document nobody can send, and would go on passing after a rule that
+    /// reads those counters honestly had been broken. Demotion fixtures are
+    /// deliberately exempt — several of them are corrupt documents on purpose
+    /// (see the malformed-profile tests), and asserting the classifier fails
+    /// closed on input the door would have refused is the point of them.
+    #[track_caller]
+    fn assert_producible(profile: &RouteProfile) {
+        let document = crate::observability::observe::ObserveProfile {
+            sample_rate: 1.0,
+            routes: BTreeMap::from([("test-route".to_string(), profile.clone())]),
+        };
+        if let Err(err) = crate::draft::check_profile_consistency(&document) {
+            panic!("fixture is not a document the recorder could have produced: {err}");
+        }
+    }
+
     #[track_caller]
     fn assert_candidate(profile: &RouteProfile) {
+        assert_producible(profile);
         let suggestion = classify_clean(profile);
         assert_eq!(
             (suggestion.disposition, suggestion.reason),
@@ -1408,11 +1521,15 @@ mode: legacy_only
     #[test]
     fn r7_control_at_the_path_ceiling_is_a_candidate() {
         // Exactly `max_compare_paths`: the rule is `>`, so 8 passes. Ratio
-        // 8/50 = 0.16 keeps R8 out of it.
+        // 8/50 = 0.16 keeps R8 out of it. The status map is restated at the
+        // read count rather than inherited: 41 repeats need 41 successful reads
+        // behind them, and a fixture claiming more stability than its successes
+        // could produce is a document the `--profile` door refuses.
         let profile = RouteProfile {
             observations: 50,
             reads: 50,
             distinct_read_paths: DEFAULT_MAX_COMPARE_PATHS,
+            status_classes: counts(&[("2xx", 50)]),
             length_repeats: 41,
             ..clean_profile()
         };
@@ -1541,6 +1658,372 @@ mode: legacy_only
         assert_eq!(suggestion.disposition, Disposition::CompareNarrowed);
         assert_eq!(suggestion.reason, Reason::NoRepeatEvidence);
         assert_eq!(suggestion.evidence.path_uniqueness_ratio, None);
+    }
+
+    // -- R8a no success evidence -------------------------------------------
+
+    /// Field data from the phase-04 tapper run, transcribed: an images route
+    /// whose every read answered 4xx, at one concrete path, with repeated
+    /// identical lengths (the 404 page is a fixed size) and a single content
+    /// type. Innocuous on every other axis — no redirect, no cookie, no token
+    /// name, a specific prefix, a full sample — so nothing but R8a can catch it.
+    fn images_read_all_errors() -> RouteProfile {
+        RouteProfile {
+            observations: 6,
+            reads: 6,
+            status_classes: counts(&[("4xx", 6)]),
+            length_repeats: 5,
+            ..clean_profile()
+        }
+    }
+
+    /// The poisoned shape: an all-4xx corpus spread over several concrete paths
+    /// with counts deliberately engineered *under* R7's ceiling (6 ≤ 8) and
+    /// *under* R8's ratio (6/10 = 0.6 < 0.8), so the route reaches candidacy on
+    /// the stability of a shared error page rather than on anything it serves.
+    fn poisoned_error_pages() -> RouteProfile {
+        RouteProfile {
+            observations: 10,
+            reads: 10,
+            distinct_read_paths: 6,
+            status_classes: counts(&[("4xx", 10)]),
+            length_repeats: 4,
+            ..clean_profile()
+        }
+    }
+
+    // Both fixtures were first asserted as `assert_candidate` and run against
+    // the pre-R8a classifier — both passed, which is the miss this rule exists
+    // to close. That run is captured in the plan's `r8a-baseline-run.txt`.
+    //
+    // They keep their repeat counts deliberately, and that makes them *pre-C3
+    // documents*: a success-qualified recorder now emits zero repeats for this
+    // traffic, so `suggest-routes` would refuse these two at the `--profile`
+    // door as arithmetically impossible (`draft::check_profile_consistency`).
+    // The repeats have to stay anyway, because without them R10 would catch the
+    // shape and the fixtures would stop falsifying R8a specifically — delete
+    // R8a and these must reach candidacy, which is only true while the repeats
+    // are there. Two layers, one answer: the door refuses the document, and any
+    // in-process caller reaching `classify` directly still gets a demotion.
+    #[test]
+    fn r8a_falsification_an_all_4xx_route_is_not_a_candidate() {
+        assert_demoted(
+            &images_read_all_errors(),
+            Disposition::RelayOnly,
+            Reason::NoSuccessEvidence,
+        );
+    }
+
+    #[test]
+    fn r8a_falsification_stable_error_pages_across_paths_are_not_a_candidate() {
+        assert_demoted(
+            &poisoned_error_pages(),
+            Disposition::RelayOnly,
+            Reason::NoSuccessEvidence,
+        );
+    }
+
+    #[test]
+    fn r8a_falsification_an_all_5xx_route_is_not_a_candidate() {
+        // The upstream answered every time — these are the route's own 500s,
+        // not limen's synthesized ones — so nothing was withheld and the
+        // carve-out does not apply.
+        let profile = RouteProfile {
+            status_classes: counts(&[("5xx", 12)]),
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    #[test]
+    fn r8a_control_a_minority_of_successes_keeps_candidacy() {
+        // The rule is existential on the *absence* of success, not a ratio: a
+        // route that mostly 404s is a route whose 404s are someone else's
+        // problem, and its repeated 2xx reads are real evidence. Demoting on a
+        // mix would demote most real routes for their clients' bad URLs.
+        //
+        // Two thirds of the reads failed, and the repeats are counted within
+        // the third that did not — three repeats behind four successes, which
+        // is what a success-qualified recorder emits for this traffic. (A
+        // single success cannot repeat at all, so a one-in-twelve fixture would
+        // be testing R10 rather than R8a's control.)
+        let profile = RouteProfile {
+            status_classes: counts(&[("2xx", 4), ("4xx", 8)]),
+            length_repeats: 3,
+            ..clean_profile()
+        };
+        assert_candidate(&profile);
+    }
+
+    #[test]
+    fn r8a_control_interleaved_errors_do_not_disturb_stable_successes() {
+        // The shape the recorder now produces for such a route: the stability
+        // counts are over the 2xx reads alone, and the 4xx reads are visible
+        // only in the status mix.
+        let profile = RouteProfile {
+            observations: 18,
+            reads: 18,
+            status_classes: counts(&[("2xx", 12), ("4xx", 6)]),
+            length_repeats: 11,
+            ..clean_profile()
+        };
+        assert_candidate(&profile);
+    }
+
+    #[test]
+    fn r8a_carve_out_an_all_transport_error_corpus_is_not_r8a() {
+        // Every read reached for an upstream and got nothing, so limen answered
+        // with its own 502. Withheld evidence only withholds: R8a must not read
+        // "no 2xx" as a statement about a route nobody has heard from. The
+        // recorder records no stability for a synthesized response, so the shape
+        // lands on R10 — "we learned nothing", which is the honest label.
+        let profile = RouteProfile {
+            observations: 6,
+            reads: 6,
+            transport_errors: 6,
+            read_transport_errors: 6,
+            status_classes: counts(&[("5xx", 6)]),
+            content_types: BTreeSet::new(),
+            length_repeats: 0,
+            ..clean_profile()
+        };
+        assert_demoted(
+            &profile,
+            Disposition::CompareNarrowed,
+            Reason::NoRepeatEvidence,
+        );
+    }
+
+    #[test]
+    fn r8a_carve_out_is_read_scoped_so_failing_writes_cannot_disarm_it() {
+        // The bug the read-scoped counter exists to prevent, as a test: 6 reads
+        // that all answered 404 from a live upstream, and 20 writes whose
+        // upstream never answered. `transport_errors` (20) exceeds `reads` (6),
+        // so a carve-out written against the unscoped counter would read "every
+        // read was withheld" about a route whose reads were all answered — and
+        // silently stop demoting exactly the shape R8a is for.
+        let profile = RouteProfile {
+            observations: 26,
+            reads: 6,
+            writes: 20,
+            transport_errors: 20,
+            read_transport_errors: 0,
+            methods: counts(&[("GET", 6), ("POST", 20)]),
+            status_classes: counts(&[("4xx", 6)]),
+            length_repeats: 5,
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    #[test]
+    fn r8a_partial_transport_errors_still_demote() {
+        // Some reads were withheld, but not all: the ones that came back never
+        // succeeded, and that is a statement about the route.
+        let profile = RouteProfile {
+            observations: 6,
+            reads: 6,
+            transport_errors: 2,
+            read_transport_errors: 2,
+            status_classes: counts(&[("4xx", 4), ("5xx", 2)]),
+            length_repeats: 3,
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    // -- R8a attribution: every earlier rule still wins ---------------------
+
+    #[test]
+    fn r8a_never_pre_empts_an_earlier_relay_rule() {
+        // Rule order is the safety property, so each earlier rule is asserted
+        // against the same all-4xx corpus: the more specific danger is the one
+        // reported, and R8a is what catches the residue none of them saw.
+        let base = images_read_all_errors();
+        let cases: [(&str, RouteProfile, Reason); 5] = [
+            (
+                "R4 — a 3xx in the mix",
+                RouteProfile {
+                    status_classes: counts(&[("3xx", 3), ("4xx", 3)]),
+                    redirect_reads: 3,
+                    ..base.clone()
+                },
+                Reason::RedirectingRead,
+            ),
+            (
+                "R5 — an error that still minted a cookie",
+                RouteProfile {
+                    set_cookie_reads: 1,
+                    ..base.clone()
+                },
+                Reason::MintsState,
+            ),
+            (
+                "R6 — a token name on an erroring read",
+                RouteProfile {
+                    query_names: names(&["login_challenge"]),
+                    ..base.clone()
+                },
+                Reason::OneTimeTokenQuery,
+            ),
+            (
+                "R7 — errors spread past the path ceiling",
+                RouteProfile {
+                    observations: 20,
+                    reads: 20,
+                    distinct_read_paths: 9,
+                    status_classes: counts(&[("4xx", 20)]),
+                    ..base.clone()
+                },
+                Reason::WildcardGranularity,
+            ),
+            (
+                // 8/10 is exactly R8's ratio and exactly R7's ceiling, so R7
+                // stays quiet and R8 is the only earlier rule that can fire.
+                "R8 — a distinct erroring path per read",
+                RouteProfile {
+                    observations: 10,
+                    reads: 10,
+                    distinct_read_paths: 8,
+                    status_classes: counts(&[("4xx", 10)]),
+                    ..base.clone()
+                },
+                Reason::OpaquePathIds,
+            ),
+        ];
+        for (name, profile, reason) in cases {
+            let suggestion = classify_clean(&profile);
+            assert_eq!(
+                (suggestion.disposition, suggestion.reason),
+                (Disposition::RelayOnly, reason),
+                "{name}: expected {}, got {}",
+                reason.as_str(),
+                suggestion.reason.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn r8a_does_not_pre_empt_r0_or_r3() {
+        // R0: a sampled all-4xx profile is not classified at all — "we saw no
+        // success" is an existential claim, and sampling is what makes every
+        // existential claim unsound.
+        assert_classifies(
+            &a_route(),
+            &images_read_all_errors(),
+            &SuggestThresholds {
+                sample_rate: 0.5,
+                ..SuggestThresholds::default()
+            },
+            Disposition::RelayOnly,
+            Reason::PartialSample,
+        );
+        // R3: four erroring reads are too few to say anything, including this.
+        let thin = RouteProfile {
+            observations: 4,
+            reads: 4,
+            status_classes: counts(&[("4xx", 4)]),
+            length_repeats: 3,
+            ..clean_profile()
+        };
+        assert_demoted(&thin, Disposition::RelayOnly, Reason::InsufficientReads);
+    }
+
+    #[test]
+    fn r8a_never_fires_on_a_route_with_no_reads() {
+        // A writes-only route has demonstrated nothing about its reads, which
+        // is R2/R3's answer and not R8a's — "no read succeeded" would be a
+        // claim about reads that never happened.
+        let writes_only = RouteProfile {
+            observations: 9,
+            reads: 0,
+            writes: 9,
+            methods: counts(&[("POST", 9)]),
+            query_names: BTreeSet::new(),
+            distinct_read_paths: 0,
+            status_classes: BTreeMap::new(),
+            content_types: BTreeSet::new(),
+            length_repeats: 0,
+            ..clean_profile()
+        };
+        assert_demoted(
+            &writes_only,
+            Disposition::RelayOnly,
+            Reason::InsufficientReads,
+        );
+        // And with the floor lowered out of the way, it still is not R8a.
+        let suggestion = classify(
+            &a_route(),
+            &writes_only,
+            &SuggestThresholds {
+                min_samples: 0,
+                ..SuggestThresholds::default()
+            },
+        );
+        assert_eq!(suggestion.reason, Reason::NoRepeatEvidence);
+    }
+
+    // -- R8a on a malformed profile: fail closed ---------------------------
+
+    #[test]
+    fn r8a_reads_the_success_count_not_the_key() {
+        // A `"2xx"` bucket that exists and is zero is a bucket nothing landed
+        // in. A predicate written as `contains_key` would read the key as the
+        // success it names and pass the route through.
+        let profile = RouteProfile {
+            status_classes: counts(&[("2xx", 0), ("4xx", 12)]),
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    #[test]
+    fn r8a_fires_on_an_empty_status_map_with_reads_on_the_clock() {
+        // Malformed: the recorder buckets every read, so reads with no status
+        // class at all is a profile that has been truncated or hand-edited.
+        // The honest reading is the conservative one — there is no 2xx evidence
+        // here, and a safety input must not fail toward candidacy.
+        let profile = RouteProfile {
+            status_classes: BTreeMap::new(),
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    #[test]
+    fn r8a_ignores_bucket_names_it_does_not_know() {
+        // Only `"2xx"` is read. A profile carrying invented bucket names offers
+        // no success evidence whatever they are called.
+        let profile = RouteProfile {
+            status_classes: counts(&[("success", 12), ("200", 12), ("2XX", 12)]),
+            ..clean_profile()
+        };
+        assert_demoted(&profile, Disposition::RelayOnly, Reason::NoSuccessEvidence);
+    }
+
+    // -- The stability stream is success-qualified -------------------------
+
+    #[test]
+    fn repeated_error_pages_with_one_unique_success_are_not_a_candidate() {
+        // The recorder-side counterpart is
+        // `observe::tests::only_successful_reads_enter_the_stability_map`: five
+        // repeated 404s at one path plus one 200 at another produce exactly
+        // this shape, because only the 200 entered the fingerprint map and it
+        // never repeated. R8a does not fire (there IS a success), and the route
+        // lands on R10 — the repeats it had were never evidence.
+        let profile = RouteProfile {
+            observations: 6,
+            reads: 6,
+            distinct_read_paths: 2,
+            status_classes: counts(&[("2xx", 1), ("4xx", 5)]),
+            length_repeats: 0,
+            ..clean_profile()
+        };
+        assert_demoted(
+            &profile,
+            Disposition::CompareNarrowed,
+            Reason::NoRepeatEvidence,
+        );
     }
 
     // -- R9 body varies ----------------------------------------------------
@@ -1821,55 +2304,127 @@ mode: legacy_only
         // absence is what hid the HEAD-authorizes-GET bypass: with only the
         // other flags varied, every profile reaching candidacy happened to have
         // complete length evidence, so the sweep could not have caught a rule
-        // that accepted partial evidence.
+        // that accepted partial evidence. The status mix is in for the same
+        // reason one rule later: every profile in the sweep used to answer 2xx,
+        // so no combination could have exercised a route that repeated only on
+        // its error pages.
+        // Every shape is composed to be one the recorder could have written,
+        // and each is checked against the `--profile` door before it is
+        // classified (codex review, C3). A sweep that enumerated impossible
+        // documents would be asserting invariants about input nobody can send —
+        // and worse, its all-error shapes would have carried stability counters
+        // no success could have produced, which is the exact fail-open the door
+        // now refuses. So the status mix comes from a table of producible
+        // (status, read_transport_errors) pairs, and the three stability
+        // counters are each budgeted at a third of that shape's successful
+        // reads, which bounds their sum by the successes for free.
         let mut checked = 0;
         let mut candidates = 0;
-        for bits in 0u32..1 << 10 {
-            let head_heavy = (bits >> 9) & 1 == 1;
-            let profile = RouteProfile {
-                redirect_reads: u64::from(bits & 1),
-                set_cookie_reads: u64::from((bits >> 1) & 1),
-                location_reads: u64::from((bits >> 2) & 1),
-                length_varied: u64::from((bits >> 3) & 1),
-                length_repeats: u64::from((bits >> 4) & 1) * 7,
-                fingerprint_overflow: (bits >> 5) & 1 == 1,
-                distinct_read_paths_overflow: (bits >> 6) & 1 == 1,
-                content_types_overflow: (bits >> 7) & 1 == 1,
-                length_missing: u64::from((bits >> 8) & 1) * 6,
-                methods: if head_heavy {
-                    counts(&[("GET", 6), ("HEAD", 6)])
-                } else {
-                    counts(&[("GET", 12)])
-                },
-                ..clean_profile()
-            };
-            let suggestion = classify_clean(&profile);
-            checked += 1;
-            if suggestion.disposition != Disposition::CompareCandidate {
-                continue;
+        let mut candidates_despite_transport_errors = 0;
+        let mut reached_the_carve_out = 0;
+        for (status, read_transport_errors) in [
+            // Every read succeeded.
+            (counts(&[("2xx", 12)]), 0),
+            // A minority of the reads failed at the upstream.
+            (counts(&[("2xx", 8), ("4xx", 4)]), 0),
+            // …and a minority were withheld before the upstream answered, so
+            // they are 5xx and read-transport-errored at once.
+            (counts(&[("2xx", 8), ("5xx", 4)]), 4),
+            // Nothing succeeded, but the upstream did answer: R8a's shape.
+            (counts(&[("4xx", 12)]), 0),
+            // Nothing succeeded and nothing was answered: the carve-out.
+            (counts(&[("5xx", 12)]), 12),
+        ] {
+            let successes = status.get("2xx").copied().unwrap_or(0);
+            // A third each, so `repeats + varied + missing <= successes` holds
+            // whatever combination of the three bits is set.
+            let unit = successes / 3;
+            for bits in 0u32..1 << 10 {
+                let head_heavy = (bits >> 9) & 1 == 1;
+                let profile = RouteProfile {
+                    status_classes: status.clone(),
+                    read_transport_errors,
+                    redirect_reads: u64::from(bits & 1),
+                    set_cookie_reads: u64::from((bits >> 1) & 1),
+                    location_reads: u64::from((bits >> 2) & 1),
+                    length_varied: u64::from((bits >> 3) & 1) * unit,
+                    length_repeats: u64::from((bits >> 4) & 1) * unit,
+                    fingerprint_overflow: (bits >> 5) & 1 == 1,
+                    distinct_read_paths_overflow: (bits >> 6) & 1 == 1,
+                    content_types_overflow: (bits >> 7) & 1 == 1,
+                    length_missing: u64::from((bits >> 8) & 1) * unit,
+                    methods: if head_heavy {
+                        counts(&[("GET", 6), ("HEAD", 6)])
+                    } else {
+                        counts(&[("GET", 12)])
+                    },
+                    ..clean_profile()
+                };
+                // Not a local restatement of the arithmetic: the door's own
+                // check, so a sweep and a boundary that disagreed about what is
+                // producible would fail here rather than drift apart.
+                assert_producible(&profile);
+                let suggestion = classify_clean(&profile);
+                checked += 1;
+                if profile.read_transport_errors == profile.reads {
+                    reached_the_carve_out += 1;
+                    assert_ne!(
+                        suggestion.reason,
+                        Reason::NoSuccessEvidence,
+                        "withheld evidence only withholds — R8a must not fire on it"
+                    );
+                }
+                if suggestion.disposition != Disposition::CompareCandidate {
+                    continue;
+                }
+                candidates += 1;
+                if profile.read_transport_errors > 0 {
+                    candidates_despite_transport_errors += 1;
+                }
+                assert_eq!(suggestion.reason, Reason::StableRepeatedReads);
+                assert!(profile.length_repeats > 0, "candidacy without a repeat");
+                // The repeat has to have been a *successful* one, and the
+                // counters have to be able to account for it. `successes > 0`
+                // alone was satisfiable by a shape claiming eleven repeats
+                // behind one success — true of no recorder, and the fail-open
+                // codex found. So: at least one repeat, and a stability sum the
+                // successful reads could actually have produced.
+                let stability =
+                    profile.length_repeats + profile.length_varied + profile.length_missing;
+                assert!(
+                    stability <= successful_reads(&profile),
+                    "candidacy on more stability evidence ({stability}) than successful reads \
+                     ({}) could produce",
+                    successful_reads(&profile)
+                );
+                assert_eq!(profile.length_varied, 0, "candidacy with varied lengths");
+                assert!(!profile.fingerprint_overflow, "candidacy past the cap");
+                // The bypass, asserted as an invariant rather than as one case: no
+                // candidate may carry a read whose length was never seen, whatever
+                // the other reads did.
+                assert_eq!(
+                    profile.length_missing, 0,
+                    "candidacy with a hole in the length evidence"
+                );
+                assert_eq!(profile.redirect_reads, 0);
+                assert_eq!(profile.location_reads, 0);
+                assert_eq!(profile.set_cookie_reads, 0);
+                assert!(!profile.distinct_read_paths_overflow);
+                assert!(!profile.content_types_overflow);
             }
-            candidates += 1;
-            assert_eq!(suggestion.reason, Reason::StableRepeatedReads);
-            assert!(profile.length_repeats > 0, "candidacy without a repeat");
-            assert_eq!(profile.length_varied, 0, "candidacy with varied lengths");
-            assert!(!profile.fingerprint_overflow, "candidacy past the cap");
-            // The bypass, asserted as an invariant rather than as one case: no
-            // candidate may carry a read whose length was never seen, whatever
-            // the other reads did.
-            assert_eq!(
-                profile.length_missing, 0,
-                "candidacy with a hole in the length evidence"
-            );
-            assert_eq!(profile.redirect_reads, 0);
-            assert_eq!(profile.location_reads, 0);
-            assert_eq!(profile.set_cookie_reads, 0);
-            assert!(!profile.distinct_read_paths_overflow);
-            assert!(!profile.content_types_overflow);
         }
-        assert_eq!(checked, 1024);
+        assert_eq!(checked, 5 * 1024);
         // The sweep must not have become vacuous: if nothing reaches candidacy
-        // the assertions above are unexecuted and this test proves nothing.
+        // the assertions above are unexecuted and this test proves nothing. The
+        // carve-out counter is the same guard for the branch that asserts a
+        // rule must NOT fire — an unreachable negative proves nothing either.
         assert!(candidates > 0, "no shape reached candidacy");
+        assert!(
+            candidates_despite_transport_errors > 0,
+            "the transport dimension never reached candidacy, so the sweep proves nothing about \
+             a route whose reads were only partly withheld"
+        );
+        assert_eq!(reached_the_carve_out, 1024);
     }
 
     #[test]
@@ -1903,6 +2458,7 @@ mode: legacy_only
             (Reason::OneTimeTokenQuery, "one-time-token-query"),
             (Reason::WildcardGranularity, "wildcard-granularity"),
             (Reason::OpaquePathIds, "opaque-path-ids"),
+            (Reason::NoSuccessEvidence, "no-success-evidence"),
             (Reason::BodyVaries, "body-varies"),
             (Reason::NoRepeatEvidence, "no-repeat-evidence"),
             (Reason::StabilityUnobserved, "stability-unobserved"),

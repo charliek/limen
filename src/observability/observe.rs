@@ -25,6 +25,14 @@
 //!   contradicts. The *stability* fingerprint is deliberately exempt and stays
 //!   on the raw concrete path: two different resources must never register as
 //!   one request repeating.
+//! - **Only successes vouch.** The stability map admits upstream reads whose
+//!   status class is [`prometheus::SUCCESS_STATUS_CLASS`] and nothing else,
+//!   because a fixed-length 404 page repeating is not evidence about the body
+//!   the operation returns when it works. Every *danger* counter stays
+//!   all-reads:
+//!   an error response can still condemn a route (it lands in
+//!   [`RouteProfile::status_classes`], where the classifier's R8a reads it),
+//!   it just cannot vouch for one.
 //! - **No wall clock, canonical order.** [`ObserveProfile`] is `BTreeMap`
 //!   -ordered throughout and carries no timestamp, uptime, or counter that
 //!   advances without traffic, so two scrapes of an idle proxy are
@@ -233,7 +241,23 @@ pub struct RouteProfile {
     /// ([`ResponseOrigin::UpstreamSilent`]), so limen synthesized the status.
     /// Reported by `dispatch` rather than inferred from the response, which
     /// cannot tell a relayed 502 from a synthesized one.
+    ///
+    /// **All observations, reads and writes alike** — the one counter here that
+    /// is not read-scoped, because a silent upstream is a fact about the
+    /// upstream rather than about the route's reads. See
+    /// [`Self::read_transport_errors`] for the read-scoped half.
     pub transport_errors: u64,
+    /// The read-scoped subset of [`Self::transport_errors`]: reads where the
+    /// upstream never answered.
+    ///
+    /// Recorded separately because the whole-route counter cannot answer the
+    /// question a read rule needs to ask. The classifier's R8a carve-out is
+    /// "did *every read* fail to reach an upstream" — withheld evidence only
+    /// withholds — and a route whose writes are timing out while its reads are
+    /// answering 404 has a `transport_errors` larger than its `reads` without a
+    /// single read having been withheld. Compared against `reads`, the
+    /// unscoped counter would silently disarm the rule on exactly that route.
+    pub read_transport_errors: u64,
     /// Request method → count, bounded by [`KNOWN_METHODS`].
     pub methods: BTreeMap<String, u64>,
     /// Distinct query-parameter **names** seen on reads. Names only — a value
@@ -268,14 +292,26 @@ pub struct RouteProfile {
     pub redirect_reads: u64,
     /// Upstream read responses carrying a `Location` header.
     pub location_reads: u64,
-    /// Reads whose request fingerprint had been seen before *and* whose
-    /// upstream response carried a `Content-Length` both times.
+    /// Successful reads whose request fingerprint had been seen before *and*
+    /// whose upstream response carried a `Content-Length` both times.
+    ///
+    /// **Success-qualified**, like the two fields below: only upstream reads
+    /// whose status class is [`prometheus::SUCCESS_STATUS_CLASS`] enter the
+    /// stability map at all. An error response says nothing about how the
+    /// operation's normal body behaves — a 404 page is a fixed length on every
+    /// route that has one, so counting it manufactures exactly the affirmative
+    /// evidence candidacy rests on out of a route that has never once
+    /// succeeded. Errors stay fully
+    /// visible to every *danger* signal ([`Self::status_classes`], the redirect
+    /// and cookie counters, the query names, the distinct-path count), which is
+    /// the asymmetry the module is built on: an error can condemn a route, it
+    /// cannot vouch for one.
     pub length_repeats: u64,
     /// Of those repeats, how many changed length. `> 0` means the route's
-    /// responses are not stable across identical requests.
+    /// successful responses are not stable across identical requests.
     pub length_varied: u64,
-    /// Upstream reads whose response carried no `Content-Length`, so stability
-    /// could not be assessed at all.
+    /// Successful upstream reads whose response carried no `Content-Length`, so
+    /// stability could not be assessed at all.
     pub length_missing: u64,
     /// A new fingerprint arrived past `observe.max_fingerprints` and was
     /// dropped.
@@ -583,6 +619,7 @@ impl RouteState {
             // route out of a dead upstream — the unsafe direction.
             ResponseOrigin::UpstreamSilent => {
                 p.transport_errors += 1;
+                p.read_transport_errors += 1;
                 return;
             }
             ResponseOrigin::Refused => return,
@@ -607,13 +644,32 @@ impl RouteState {
             p.location_reads += 1;
         }
 
-        self.record_stability(config, d);
+        // Success-qualified: only a 2xx read says anything about the body the
+        // operation normally returns. An error body is a different document
+        // produced by a different code path — usually a fixed-length error page
+        // — so admitting one manufactures stability out of a route that has
+        // never succeeded, which is the same failure mode the `UpstreamSilent`
+        // arm above refuses for limen's own 502. The error is not discarded: it
+        // is already in `status_classes` above, where R8a reads it and demotes
+        // the route outright.
+        //
+        // `Refused` and `UpstreamSilent` have already returned, so nothing limen
+        // synthesized can reach this call however it was statused — the origin
+        // check does not depend on synthesized responses happening to be
+        // non-2xx.
+        if d.status_class == prometheus::SUCCESS_STATUS_CLASS {
+            self.record_stability(config, d);
+        }
     }
 
     /// The one stability signal available without touching a body:
     /// `Content-Length` variance across repeats of the same request
     /// fingerprint — `(method, path hash, sorted query-parameter names)`, never
     /// a value, never a header.
+    ///
+    /// Called only for a **successful upstream read** (see the caller): the map
+    /// is the affirmative half of the evidence, and only a response the route
+    /// actually produced on its success path belongs in it.
     ///
     /// Its limits are real and documented rather than papered over: two
     /// requests with different credentials share a fingerprint (a false
@@ -1320,6 +1376,117 @@ mod tests {
     }
 
     #[test]
+    fn only_successful_reads_enter_the_stability_map() {
+        // The field shape this qualification exists for: an images route whose
+        // every read 404s at one path, answered by a fixed-length error page.
+        // Counting those repeats would hand the classifier the one affirmative
+        // signal candidacy rests on, observed on a body no client is ever
+        // served — so the map stays empty and the failures survive only in the
+        // status classes, where the classifier's R8a reads them.
+        let rec = recorder(ObserveConfig::default());
+        let hdrs = headers(&[("content-type", "text/html"), ("content-length", "1024")]);
+        for _ in 0..5 {
+            observe_read(&rec, "/images/missing.png", None, 404, &hdrs);
+        }
+        observe_read(&rec, "/images/found.png", None, 200, &hdrs);
+        let p = profile(&rec);
+        assert_eq!(p.reads, 6);
+        assert_eq!(p.status_classes["4xx"], 5, "the failures stay visible");
+        assert_eq!(p.status_classes["2xx"], 1);
+        assert_eq!(
+            p.length_repeats, 0,
+            "five repeats of a 404 page are not evidence about the route"
+        );
+        assert_eq!(p.length_varied, 0);
+        assert_eq!(p.length_missing, 0);
+        // The error responses are still described everywhere a *danger* rule
+        // looks: the content type, the path count, and the status mix above.
+        assert_eq!(p.distinct_read_paths, 2);
+        assert!(p.content_types.contains("text/html"));
+    }
+
+    #[test]
+    fn an_error_response_neither_repeats_nor_varies() {
+        // Both directions asserted together: the error is not admitted as a
+        // stable repeat, and it does not poison a genuine one either. A 200 of
+        // one size and a 500 of another at the same fingerprint would otherwise
+        // read as a route whose body varies — a false demotion, but still an
+        // error being allowed to speak about the success path.
+        let rec = recorder(ObserveConfig::default());
+        let len = |bytes| headers(&[("content-length", bytes)]);
+        observe_read(&rec, "/a", None, 200, &len("42"));
+        observe_read(&rec, "/a", None, 500, &len("9001"));
+        observe_read(&rec, "/a", None, 200, &len("42"));
+        let p = profile(&rec);
+        assert_eq!(p.length_repeats, 1, "the two 200s, and only those");
+        assert_eq!(p.length_varied, 0);
+        assert_eq!(p.length_missing, 0);
+    }
+
+    #[test]
+    fn an_error_read_without_a_content_length_is_not_a_hole_in_the_evidence() {
+        // `length_missing` is R11's signal that the *success* evidence has a
+        // gap. A 404 with no length is not a gap in it; the route's failure is
+        // R8a's to report.
+        let rec = recorder(ObserveConfig::default());
+        observe_read(&rec, "/a", None, 404, &HeaderMap::new());
+        let p = profile(&rec);
+        assert_eq!(p.length_missing, 0);
+        assert_eq!(p.status_classes["4xx"], 1);
+    }
+
+    #[test]
+    fn a_read_transport_error_is_counted_on_both_scopes_and_a_write_only_on_one() {
+        // The classifier's R8a carve-out asks whether every *read* was withheld
+        // by transport, so the read-scoped count is recorded alongside the
+        // whole-route one. A route whose writes are timing out while its reads
+        // are answered must not look like a route nobody has heard from.
+        let rec = recorder(ObserveConfig::default());
+        observe_synthesized(
+            &rec,
+            &Method::GET,
+            "/a",
+            None,
+            502,
+            ResponseOrigin::UpstreamSilent,
+        );
+        for _ in 0..3 {
+            observe_synthesized(
+                &rec,
+                &Method::POST,
+                "/a",
+                None,
+                504,
+                ResponseOrigin::UpstreamSilent,
+            );
+        }
+        observe_read(&rec, "/a", None, 404, &headers(&[("content-length", "9")]));
+        let p = profile(&rec);
+        assert_eq!(p.reads, 2);
+        assert_eq!(p.writes, 3);
+        assert_eq!(p.transport_errors, 4, "reads and writes alike");
+        assert_eq!(p.read_transport_errors, 1, "one of the two reads");
+    }
+
+    #[test]
+    fn a_locally_refused_read_never_reaches_the_stability_map() {
+        // Belt and braces on the origin check: `Refused` returns before the
+        // status class is consulted, so even a 2xx limen produced itself — a
+        // shape no refusal path emits today — could not describe the route.
+        let rec = recorder(ObserveConfig::default());
+        for _ in 0..3 {
+            observe_synthesized(&rec, &Method::GET, "/a", None, 200, ResponseOrigin::Refused);
+        }
+        let p = profile(&rec);
+        assert_eq!(p.reads, 3);
+        assert_eq!(p.status_classes["2xx"], 3, "the client did see a 200");
+        assert_eq!(p.length_repeats, 0, "but limen wrote it, not the route");
+        assert_eq!(p.length_missing, 0);
+        assert_eq!(p.transport_errors, 0);
+        assert_eq!(p.read_transport_errors, 0);
+    }
+
+    #[test]
     fn exceeding_max_fingerprints_flags_overflow() {
         // The load-bearing case: past the cap a new fingerprint must announce
         // itself, or variance beyond it goes unrecorded and the demotion the
@@ -1548,6 +1715,25 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("match_basis");
+        assert!(serde_json::from_value::<ObserveProfile>(document).is_err());
+    }
+
+    #[test]
+    fn a_profile_without_read_transport_errors_does_not_deserialize() {
+        // The `match_basis` contract applied to the second field a classifier
+        // rule reads directly: a profile from a binary that predates it would
+        // zero-fill, and a zero there is the value that ARMS R8a's carve-out —
+        // it would read "no read was withheld" about a profile that never said.
+        // Same construction as the basis test, for the same anti-rot reason.
+        let rec = recorder(ObserveConfig::default());
+        observe_read(&rec, "/a", None, 200, &HeaderMap::new());
+        let mut document: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&rec.profile()).unwrap()).unwrap();
+        assert!(serde_json::from_value::<ObserveProfile>(document.clone()).is_ok());
+        document["routes"]["r"]
+            .as_object_mut()
+            .unwrap()
+            .remove("read_transport_errors");
         assert!(serde_json::from_value::<ObserveProfile>(document).is_err());
     }
 

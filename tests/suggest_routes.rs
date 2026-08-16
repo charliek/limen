@@ -125,30 +125,36 @@ fn profile_document(sample_rate: f64, routes: Vec<(&str, RouteProfile)>) -> Stri
     serde_json::to_string(&profile).expect("serialize profile")
 }
 
-/// The profile the harness classifies. Every route is given candidate-shaped
+/// The routes the harness classifies. Every route is given candidate-shaped
 /// traffic, so a route that ends up uncompared did so for a *reason* rather
 /// than for lack of evidence — `contracted` excepted, which is missing some
 /// `Content-Length`s (R11) and is therefore the narrowed route.
-fn hostile_profile() -> String {
+///
+/// Returned unserialized so a test that needs one route bent out of shape can
+/// bend that one and keep the rest: the list must agree with `HOSTILE_CONFIG`,
+/// and a second copy of it is a copy that goes stale in silence.
+fn hostile_routes() -> Vec<(&'static str, RouteProfile)> {
     let mut contracted = stable_reads(20, "prefix:/devices");
     contracted.length_missing = 3;
     contracted.distinct_read_paths = 2;
     let mut pat_validate = stable_reads(34, "prefix:/api/v1/pat/validate");
     pat_validate.observations = 40;
     pat_validate.writes = 6;
-    profile_document(
-        1.0,
-        vec![
-            ("pat-validate", pat_validate),
-            ("contracted", contracted),
-            ("split", stable_reads(20, "prefix:/split")),
-            ("failover", stable_reads(20, "prefix:/failover")),
-            ("verifier-hop", stable_reads(9, "prefix:/oauth2/auth")),
-            ("oauth2-auth", stable_reads(16, "prefix:/oauth2/auth")),
-            ("migrated", stable_reads(12, "prefix:/migrated")),
-            ("catchall", stable_reads(9, "prefix:/")),
-        ],
-    )
+    vec![
+        ("pat-validate", pat_validate),
+        ("contracted", contracted),
+        ("split", stable_reads(20, "prefix:/split")),
+        ("failover", stable_reads(20, "prefix:/failover")),
+        ("verifier-hop", stable_reads(9, "prefix:/oauth2/auth")),
+        ("oauth2-auth", stable_reads(16, "prefix:/oauth2/auth")),
+        ("migrated", stable_reads(12, "prefix:/migrated")),
+        ("catchall", stable_reads(9, "prefix:/")),
+    ]
+}
+
+/// [`hostile_routes`] as the document the command reads, at a full sample.
+fn hostile_profile() -> String {
+    profile_document(1.0, hostile_routes())
 }
 
 fn limen(dir: &Path, args: &[&str]) -> Output {
@@ -569,6 +575,57 @@ fn the_json_surface_carries_every_matched_narrowing_rule() {
         serde_json::json!(["stability-unobserved"])
     );
     assert_eq!(narrowed["evidence"]["length_missing"], 3);
+}
+
+#[test]
+fn a_route_that_only_ever_failed_is_relayed_and_says_why() {
+    // End to end on the published vocabulary: an all-4xx corpus that is
+    // innocuous on every other axis reaches the CLI's own surfaces — the JSON
+    // reason downstream harnesses grep for, and the draft comment a human
+    // reads — rather than being drafted as a candidate on the stability of an
+    // error page. `--adopt-suggestions` must not enable it either.
+    let mut routes = hostile_routes();
+    let (_, migrated) = routes
+        .iter_mut()
+        .find(|(id, _)| *id == "migrated")
+        .expect("migrated route");
+    migrated.status_classes = BTreeMap::from([("4xx".to_string(), migrated.reads)]);
+    // …and no stability evidence, because a success-qualified recorder accrues
+    // none from an error response. Stating it here is not bookkeeping: a
+    // document claiming repeats behind zero successes is refused at the
+    // `--profile` door as arithmetically impossible, so it would never reach
+    // the classifier this test is about. R8a is still what catches the route —
+    // it is a relay rule, so it is decided before R10 ever sees the zero.
+    migrated.length_repeats = 0;
+    migrated.length_varied = 0;
+    migrated.length_missing = 0;
+    let dir = workspace(HOSTILE_CONFIG, &profile_document(1.0, routes));
+
+    let output = suggest(dir.path(), &["--format", "json"]);
+    assert_eq!(code(&output), 0);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("json report");
+    let entry = report
+        .as_array()
+        .expect("array")
+        .iter()
+        .find(|e| e["route_id"] == "migrated")
+        .expect("migrated");
+    assert_eq!(entry["disposition"], "relay_only");
+    assert_eq!(entry["reason"], "no-success-evidence");
+
+    let draft = draft_and_validate(dir.path(), &["--adopt-suggestions"]);
+    let comments = comment_text(&draft);
+    assert!(
+        comments.contains("relay_only (no-success-evidence)"),
+        "{comments}"
+    );
+    assert!(comments.contains("no read ever succeeded"), "{comments}");
+    let routes = routes_of(&draft);
+    assert_eq!(
+        route(&routes, "migrated")["comparison"]["enabled"],
+        serde_yaml::Value::Bool(false),
+        "adoption must not promote a route that has never worked"
+    );
 }
 
 #[test]

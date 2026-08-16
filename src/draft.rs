@@ -49,7 +49,7 @@ use crate::config::model::{ComparisonConfig, Config, RouteConfig, RouteMode};
 use crate::observability::observe::{ObserveProfile, RouteProfile, OBSERVE_PROFILE_PATH};
 use crate::observability::prometheus::IN_FLIGHT;
 use crate::routing::matcher::{basis_normalizes_paths, PathMatcher};
-use crate::suggest::{self, Disposition, Reason, SuggestThresholds, Suggestion};
+use crate::suggest::{self, Disposition, Evidence, Reason, SuggestThresholds, Suggestion};
 use crate::verdict::Scrape;
 
 /// Exit code: a draft was emitted.
@@ -215,6 +215,7 @@ fn check_config_describes_the_profiled_proxy(
     config: &Config,
     profile: &ObserveProfile,
 ) -> Result<(), SuggestError> {
+    check_profile_consistency(profile)?;
     let Some(observe) = config.observe.as_ref() else {
         return Err(SuggestError::InputUnavailable(format!(
             "the configuration declares no `observe:` block, so it is not the configuration this \
@@ -236,6 +237,41 @@ fn check_config_describes_the_profiled_proxy(
         )));
     }
     check_match_bases(config, profile)
+}
+
+/// Refuse a profile whose counters could not have come from the recorder
+/// (codex review, C3). The recorder only accrues stability evidence from
+/// upstream `2xx` reads, and only counts read transport errors among reads —
+/// so a document violating either arithmetic is corrupt or hand-edited, and
+/// classifying it would decide off numbers with no recorded meaning. The live
+/// path satisfies both by construction; this guards the `--profile` door.
+///
+/// `pub(crate)` so the classifier's structural sweep can prove that every shape
+/// it enumerates is one this door would admit: a sweep asserting invariants over
+/// documents the command refuses is a sweep of shapes nobody can send.
+pub(crate) fn check_profile_consistency(profile: &ObserveProfile) -> Result<(), SuggestError> {
+    for (id, route) in &profile.routes {
+        if route.read_transport_errors > route.reads {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: read_transport_errors ({}) exceeds reads ({}) — the recorder \
+                 counts read transport errors among reads, so this profile was not produced \
+                 by it. Re-profile",
+                route.read_transport_errors, route.reads
+            )));
+        }
+        let stability = route.length_repeats + route.length_varied + route.length_missing;
+        let successes = crate::suggest::successful_reads(route);
+        if stability > successes {
+            return Err(SuggestError::InputUnavailable(format!(
+                "route {id:?}: stability counters ({} repeats + {} varied + {} missing) exceed \
+                 the {} successful reads that could have produced them — stability evidence \
+                 accrues only from 2xx reads, so this profile was not produced by the \
+                 recorder. Re-profile",
+                route.length_repeats, route.length_varied, route.length_missing, successes
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a profile whose routes were matched by a different expression than
@@ -920,6 +956,11 @@ fn headline(suggestion: &Suggestion) -> String {
             "{} distinct paths across {} reads — ids or tokens are in the path",
             e.distinct_read_paths, e.reads
         ),
+        Reason::NoSuccessEvidence => format!(
+            "no read ever succeeded ({}) — the only bodies observed were failures, so nothing \
+             here describes what the route serves",
+            status_mix(e)
+        ),
         Reason::BodyVaries => format!(
             "{} repeated request(s) came back at a different Content-Length",
             e.length_varied
@@ -943,6 +984,26 @@ fn headline(suggestion: &Suggestion) -> String {
             "stable across {} repeated request(s)",
             suggestion.evidence.length_repeats
         ),
+    }
+}
+
+/// The read status mix, as the evidence line renders it — and as R8a's headline
+/// quotes it, since "no read ever succeeded" is a claim about this map and a
+/// reader should not have to scan down to the evidence to see which failures.
+fn status_mix(e: &Evidence) -> String {
+    if e.status_classes.is_empty() {
+        "no read status recorded".to_string()
+    } else if e.status_classes.len() == 1 {
+        format!(
+            "{} only",
+            e.status_classes.keys().next().expect("one class")
+        )
+    } else {
+        e.status_classes
+            .iter()
+            .map(|(class, n)| format!("{class}×{n}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 }
 
@@ -970,20 +1031,7 @@ fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
             if e.distinct_read_paths == 1 { "" } else { "s" },
         ),
     ];
-    items.push(if e.status_classes.is_empty() {
-        "no read status recorded".to_string()
-    } else if e.status_classes.len() == 1 {
-        format!(
-            "{} only",
-            e.status_classes.keys().next().expect("one class")
-        )
-    } else {
-        e.status_classes
-            .iter()
-            .map(|(class, n)| format!("{class}×{n}"))
-            .collect::<Vec<_>>()
-            .join(" ")
-    });
+    items.push(status_mix(e));
     items.push(if e.content_types.is_empty() {
         "no content-type recorded".to_string()
     } else {
@@ -1021,7 +1069,17 @@ fn evidence_items(suggestion: &Suggestion) -> Vec<String> {
         },
     );
     if e.transport_errors > 0 {
-        items.push(format!("{} transport errors", e.transport_errors));
+        // Both numbers when they differ: R8a's carve-out is read-scoped, so a
+        // reader checking why a route with transport errors still demoted (or
+        // still did not) needs to see which of the two the rule looked at.
+        items.push(if e.read_transport_errors == e.transport_errors {
+            format!("{} transport errors", e.transport_errors)
+        } else {
+            format!(
+                "{} transport errors ({} on reads)",
+                e.transport_errors, e.read_transport_errors
+            )
+        });
     }
     if !e.one_time_token_names_configured.is_empty() {
         items.push(format!(
@@ -1684,6 +1742,48 @@ routes:
     }
 
     #[test]
+    fn an_all_error_route_names_its_status_mix_in_the_headline() {
+        // R8a's claim is about the status map, so the map is quoted where the
+        // claim is made: a reader must not have to reconcile "no read ever
+        // succeeded" against an evidence line further down to see which
+        // failures the route served.
+        let config = hostile_config();
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.status_classes = BTreeMap::from([("4xx".to_string(), 30), ("5xx".to_string(), 4)]);
+        // No successes, therefore no stability evidence — the shape a
+        // success-qualified recorder emits, and the only one this command's own
+        // door would let through to be rendered.
+        route.length_repeats = 0;
+        assert!(check_profile_consistency(&profile).is_ok());
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(
+            draft.contains("SUGGESTED: relay_only (no-success-evidence)"),
+            "{draft}"
+        );
+        assert!(draft.contains("no read ever succeeded"), "{draft}");
+        assert!(draft.contains("4xx×30 5xx×4"), "{draft}");
+    }
+
+    #[test]
+    fn transport_errors_are_reported_read_scoped_when_the_two_counts_differ() {
+        // The number R8a's carve-out actually consulted, beside the one a
+        // reader would otherwise assume it consulted.
+        let config = hostile_config();
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.writes = 20;
+        route.observations = 54;
+        route.transport_errors = 20;
+        route.read_transport_errors = 0;
+        let draft = draft_of(&config, &profile, &DraftOptions::default());
+        assert!(
+            draft.contains("20 transport errors (0 on reads)"),
+            "{draft}"
+        );
+    }
+
+    #[test]
     fn the_confirm_caveat_rides_on_narrowed_as_well_as_candidate() {
         let config = hostile_config();
         let mut profile = candidate_profile("pat-validate");
@@ -1750,6 +1850,120 @@ routes:
         assert!(
             check_config_describes_the_profiled_proxy(&hostile_config(), &empty_profile()).is_ok()
         );
+    }
+
+    /// A profile whose one route carries exactly the counters given, on top of
+    /// the candidate-shaped baseline. The consistency check reads four fields,
+    /// so the fixtures state all four rather than inheriting any of them.
+    fn profile_with(
+        reads: u64,
+        status: &[(&str, u64)],
+        read_transport_errors: u64,
+        stability: (u64, u64, u64),
+    ) -> ObserveProfile {
+        let mut profile = candidate_profile("pat-validate");
+        let route = profile.routes.get_mut("pat-validate").expect("route");
+        route.observations = reads;
+        route.reads = reads;
+        route.status_classes = status
+            .iter()
+            .map(|(class, n)| ((*class).to_string(), *n))
+            .collect();
+        route.read_transport_errors = read_transport_errors;
+        route.length_repeats = stability.0;
+        route.length_varied = stability.1;
+        route.length_missing = stability.2;
+        profile
+    }
+
+    #[test]
+    fn stability_counters_that_no_success_could_have_produced_are_refused() {
+        // Codex's shape: every read answered 5xx and every read was withheld by
+        // transport, yet the document claims eleven stable repeats. Under a
+        // success-qualified recorder those eleven cannot exist — and left to
+        // classify, the shape used the carve-out to slip past R8a and reached
+        // compare_candidate on repeats of a body no upstream ever sent. The
+        // arithmetic is the tell, so the door reads the arithmetic.
+        let profile = profile_with(12, &[("5xx", 12)], 12, (11, 0, 0));
+        let err = check_profile_consistency(&profile).expect_err("corrupt counters must refuse");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        // The operator has to be able to act on this: which route, which
+        // numbers, and which arithmetic they violated.
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("11 repeats"), "{message}");
+        assert!(message.contains("0 successful reads"), "{message}");
+        assert!(message.contains("2xx"), "{message}");
+        // And it refuses through the front door too, not merely when called
+        // directly — this is the check that has to run before classification.
+        assert!(check_config_describes_the_profiled_proxy(&hostile_config(), &profile).is_err());
+    }
+
+    #[test]
+    fn every_stability_counter_is_weighed_against_the_successes() {
+        // The sum, not any one field: three counters each individually under
+        // the success count can still describe more successful reads than the
+        // route ever served.
+        let profile = profile_with(12, &[("2xx", 4), ("4xx", 8)], 0, (2, 1, 2));
+        let err = check_profile_consistency(&profile).expect_err("the sum must be weighed");
+        assert!(err.to_string().contains("4 successful reads"), "{err}");
+    }
+
+    #[test]
+    fn more_read_transport_errors_than_reads_is_refused() {
+        // The read-scoped counter is a subset of the reads by construction, so
+        // a document where it exceeds them is one the recorder cannot have
+        // written — and the excess points the wrong way: it would arm R8a's
+        // carve-out on a route whose reads were answered.
+        let profile = profile_with(6, &[("4xx", 6)], 7, (0, 0, 0));
+        let err = check_profile_consistency(&profile).expect_err("an impossible subset refuses");
+        assert_eq!(err.exit_code(), EXIT_INPUT_UNAVAILABLE);
+        let message = err.to_string();
+        assert!(message.contains("pat-validate"), "{message}");
+        assert!(message.contains("read_transport_errors (7)"), "{message}");
+        assert!(message.contains("reads (6)"), "{message}");
+    }
+
+    #[test]
+    fn a_profile_the_recorder_could_have_written_passes() {
+        // The control the refusals need. Three shapes a real run produces: a
+        // clean candidate, a route whose reads all failed at the upstream (the
+        // R8a shape, whose stability counters are consequently zero), and one
+        // whose reads were withheld by transport.
+        for (name, profile) in [
+            (
+                "a stable candidate",
+                profile_with(12, &[("2xx", 12)], 0, (11, 0, 0)),
+            ),
+            (
+                "errors only, and therefore no stability evidence",
+                profile_with(12, &[("4xx", 12)], 0, (0, 0, 0)),
+            ),
+            (
+                "every read withheld by transport",
+                profile_with(12, &[("5xx", 12)], 12, (0, 0, 0)),
+            ),
+        ] {
+            assert!(
+                check_profile_consistency(&profile).is_ok(),
+                "{name} must classify"
+            );
+        }
+    }
+
+    #[test]
+    fn stability_exactly_accounted_for_by_the_successes_passes() {
+        // The boundary is inclusive: twelve successful reads can account for
+        // twelve counter increments — eleven repeats of one fingerprint plus
+        // one that varied, or any split summing to the successes. Refusing at
+        // equality would refuse the densest legitimate profile there is.
+        let exact = profile_with(12, &[("2xx", 12)], 0, (11, 1, 0));
+        assert!(check_profile_consistency(&exact).is_ok());
+        let split = profile_with(12, &[("2xx", 8), ("4xx", 4)], 4, (5, 1, 2));
+        assert!(check_profile_consistency(&split).is_ok());
+        // One past it is not.
+        let over = profile_with(12, &[("2xx", 12)], 0, (11, 1, 1));
+        assert!(check_profile_consistency(&over).is_err());
     }
 
     /// A one-route config whose route matches `path` written as `field`.

@@ -88,12 +88,21 @@ pub fn install() -> PrometheusHandle {
 
 // --- Emission helpers -----------------------------------------------------
 
+/// The [`status_class`] bucket a successful response lands in.
+///
+/// Named rather than spelled inline because three sites must agree on it: this
+/// module mints it, [`observe`](super::observe)'s recorder admits only this
+/// class into the stability map, and the classifier's R8a asks whether the
+/// class is absent. A literal in each place would let one be edited without the
+/// others, and all three must mean the same thing.
+pub const SUCCESS_STATUS_CLASS: &str = "2xx";
+
 /// The status *class* label for a numeric status code: `2xx`, `4xx`, etc.
 /// Bucketing keeps cardinality low (5 values, not 500).
 pub fn status_class(status: u16) -> &'static str {
     match status / 100 {
         1 => "1xx",
-        2 => "2xx",
+        2 => SUCCESS_STATUS_CLASS,
         3 => "3xx",
         4 => "4xx",
         5 => "5xx",
