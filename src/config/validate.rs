@@ -64,11 +64,27 @@ const KNOWN_METHODS: &[&str] = &[
 const NON_IDEMPOTENT_METHODS: &[&str] = &["POST", "PATCH"];
 
 /// Write methods a route may opt into shadowing via `comparison.shadow_methods`
-/// (spec §6.1). Deliberately just `POST`: shadowing a write means replaying a
-/// buffered body to a second upstream, and `POST` is the one verb the migration
-/// use case (form/JSON submissions compared read-only against new) actually
-/// needs. Reads are always eligible and are never listed here.
-const SHADOWABLE_WRITE_METHODS: &[&str] = &["POST"];
+/// (spec §6.1). `POST`, `PUT`, and `PATCH`: shadowing a write means replaying a
+/// buffered body to a second upstream, so every one of these verbs can be
+/// listed here without further runtime work — `method_is_eligible` and
+/// `prepare_request_body` are already method-agnostic (they branch on
+/// read-vs-write, not on which verb). `DELETE` is deliberately excluded: it is
+/// the verb whose shadowing is hardest to justify, and nothing in the current
+/// route set needs it, so it stays off the list as a rail.
+///
+/// This list is **not** a proof of safety on its own — with three verbs it can
+/// no longer carry the old implicit claim that "POST is the only verb we
+/// replay, and replaying it is fine." Listing a method here only makes it
+/// *eligible* to opt in via `comparison.shadow_methods`; every route that
+/// actually opts a write in still owes a recorded per-route idempotence
+/// analysis (naming the mutation, the response-visible effect of double
+/// execution, and the corpus constraint that keeps it true — see
+/// `docs/limen_spec.md` §6.1 and `docs/guides/classifying-routes.md`). Treat
+/// this constant as a reminder that the analysis is owed, not as evidence that
+/// it was done. A config-level attestation field that would enforce this
+/// mechanically is deliberately not implemented here — see `docs/limen_spec.md`
+/// §6.1 for why.
+const SHADOWABLE_WRITE_METHODS: &[&str] = &["POST", "PUT", "PATCH"];
 
 /// A single semantic validation failure.
 #[derive(Debug, Clone, PartialEq)]
@@ -1507,7 +1523,7 @@ routes:
         assert!(!demands(&post("legacy_only", "")));
     }
 
-    /// The supported opt-in: `POST` on a shadowing route with comparison on.
+    /// A supported opt-in: `POST` on a shadowing route with comparison on.
     #[test]
     fn shadow_methods_post_on_a_shadow_route_is_accepted() {
         let ok = r#"
@@ -1522,8 +1538,29 @@ routes:
         assert!(validate(&parse(ok), &base()).is_ok());
     }
 
+    /// `SHADOWABLE_WRITE_METHODS` was widened from `["POST"]` to
+    /// `["POST", "PUT", "PATCH"]` (plan 003 C5); PUT and PATCH must now be
+    /// accepted exactly like POST, provided they're also in `match.methods`.
     #[test]
-    fn shadow_methods_rejects_anything_but_post() {
+    fn shadow_methods_put_and_patch_on_a_shadow_route_are_accepted() {
+        let ok = r#"
+routes:
+  - id: r
+    match: { methods: ["GET", "PUT", "PATCH"], path_prefix: "/" }
+    legacy_upstream: "https://l"
+    new_upstream: "https://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, shadow_methods: ["PUT", "PATCH"] }
+"#;
+        assert!(validate(&parse(ok), &base()).is_ok());
+    }
+
+    /// `DELETE` is deliberately kept off `SHADOWABLE_WRITE_METHODS` even after
+    /// the PUT/PATCH widening — it is the verb whose shadowing is hardest to
+    /// justify, and nothing in scope needs it. This is the rail the widening
+    /// kept.
+    #[test]
+    fn shadow_methods_rejects_delete_and_get() {
         let errs = errors(
             r#"
 routes:

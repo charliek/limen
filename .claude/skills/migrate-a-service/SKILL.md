@@ -137,9 +137,12 @@ debug:     { sink_canary: true }         # exposes POST /debug/canary
 `min_comparisons` is an *exercise floor* (default `1`; `0` an explicit, visible exemption) read by
 `verdict` and cross-checked by `report --format html` — not a tolerance. Coverage is `sample_rate` against eligible volume, arithmetic you do
 yourself: an unsampled request appears in no skip metric. Validate the contract with `limen check-contract
-./contracts/user-service.contract.yaml`. `comparison.shadow_methods: ["POST"]` opts a write into shadowing
-— body buffered within `max_body_bytes`, replayed byte-identically to both upstreams. It exists and it is
-deliberate: the new upstream receives a *real* write. Never add it without an explicit decision.
+./contracts/user-service.contract.yaml`. `comparison.shadow_methods: ["POST"]` (also `PUT`/`PATCH`; `DELETE`
+is not eligible) opts a write into shadowing — body buffered within `max_body_bytes`, replayed
+byte-identically to both upstreams. It exists and it is deliberate: the new upstream receives a *real*
+write. Never add it without an explicit decision — and never add it without a recorded per-route
+idempotence analysis (the mutation, the response-visible effect of double execution, and the corpus
+constraint that keeps it true). The allowlist is a reminder that analysis is owed, not proof it was done.
 
 → [comparison & contracts](https://charliek.github.io/limen/guides/comparison-and-contracts/) · [`comparison` config](https://charliek.github.io/limen/reference/config-reference/#comparison) · [`shadow_methods`](https://charliek.github.io/limen/reference/config-reference/#comparisonshadow_methods-shadowing-a-write) · [contract format](https://charliek.github.io/limen/reference/contract-reference/#format)
 
@@ -278,7 +281,9 @@ Numbered to match the canonical load-bearing invariant list in limen's `CLAUDE.m
 don't recount them; a subset in a different order here previously drifted from that list.
 
 - **Invariant 3: never shadow a write without the explicit opt-in.** Only `GET`/`HEAD` are eligible unless
-  the route lists `comparison.shadow_methods: ["POST"]`; absent it, a write is never sent to `new`.
+  the route lists `comparison.shadow_methods` with `POST`, `PUT`, and/or `PATCH` (`DELETE` is not eligible);
+  absent it, a write is never sent to `new`. Listing a method is not itself a safety proof — the route still
+  needs a recorded per-route idempotence analysis before it opts in.
 - **Invariant 1: ambiguity defaults to legacy / relay-only.** Unhealthy new upstream, open breaker, stale
   flags, ambiguous config, unconfirmed candidate — all resolve toward legacy. A route whose source you have
   not read is `relay_only`.

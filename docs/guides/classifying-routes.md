@@ -145,7 +145,8 @@ issuance.
 
 **How to recognize it.** A non-`GET`/`HEAD` method is the strong signal; Limen
 itself never shadows a write by default, only `GET`/`HEAD` are eligible
-without an explicit opt-in ([`comparison.shadow_methods`](../reference/config-reference.md#comparisonshadow_methods-shadowing-a-write)).
+without an explicit opt-in ([`comparison.shadow_methods`](../reference/config-reference.md#comparisonshadow_methods-shadowing-a-write) —
+`POST`, `PUT`, or `PATCH`; `DELETE` is not eligible at all, opt-in or not).
 
 **What to do with it.** Leave unshadowed. Shadowing a write doubles its side
 effect against a system of record — a second charge, a second token, a second
@@ -153,7 +154,10 @@ revocation of state a later step still needs. The narrow exception is a write
 that is provably idempotent, whose side effect is not response-visible to
 anything the campaign observes, and whose author has made that argument
 explicitly in the config, one route at a time. That is an opt-in, never a
-default, and it belongs beside the route as a comment explaining why.
+default, and it belongs beside the route as a comment explaining why. Being
+one of the methods `shadow_methods` accepts is necessary but not
+sufficient — the allowlist only says a method is *mechanically* eligible; it
+is this per-route argument that actually justifies opting in.
 
 ## The decision questions
 

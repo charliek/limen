@@ -85,7 +85,8 @@ pub struct ShadowMeta {
     /// generated — see [`crate::observability::request_id::resolve`]).
     pub request_id: String,
     /// The request method — `GET`/`HEAD` reads, plus any write method a route
-    /// opts into via `comparison.shadow_methods` (`POST` only today, spec §6.1).
+    /// opts into via `comparison.shadow_methods` (see `SHADOWABLE_WRITE_METHODS`
+    /// for the eligible verbs, spec §6.1).
     pub method: Method,
     /// The concrete request path (not a path template) — fine for logs/sink,
     /// never a metric label.

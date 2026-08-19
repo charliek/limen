@@ -289,15 +289,18 @@ A route marked `has-external-side-effects` (email, third-party call, payment, jo
 | Method | Typical idempotency | Shadow? | Failover? |
 |---|---|---|---|
 | GET / HEAD | idempotent | yes (default) | yes |
-| PUT / DELETE | idempotent | no | yes, if configured |
-| POST | non-idempotent | no | **no** unless explicitly safe |
+| PUT / PATCH | idempotent (typically) | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | yes, if configured |
+| DELETE | idempotent | **no — not eligible for shadowing at all** | yes, if configured |
+| POST | non-idempotent | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | **no** unless explicitly safe |
 | POST-as-query (logical read, no writes) | idempotent | yes, if confirmed no side effects | yes |
 
-### 6.5 Logical reads over POST
+### 6.5 Logical reads over POST, and opted-in writes over POST/PUT/PATCH
 
 Some services use POST for complex queries that don't mutate state. If you can **confirm** (from code) that such a route is side-effect-free, it may be treated as a read for shadowing — but this requires explicit confirmation, not assumption, and should be noted in the route inventory.
 
-Limen makes that confirmation explicit in config: the route opts the method in with `comparison.shadow_methods: ["POST"]` (see the [config reference](https://charliek.github.io/limen/reference/config-reference/)). The request body is buffered within `max_body_bytes` and replayed byte-identically to both upstreams; a larger body streams to the primary and is not shadowed (`shadow_skipped{reason="request_too_large"}`). Nothing changes for routes that don't opt in.
+Limen makes that confirmation explicit in config: the route opts the method in with `comparison.shadow_methods: ["POST"]` (also eligible: `PUT`, `PATCH`; `DELETE` deliberately is not — see the [config reference](https://charliek.github.io/limen/reference/config-reference/)). The request body is buffered within `max_body_bytes` and replayed byte-identically to both upstreams; a larger body streams to the primary and is not shadowed (`shadow_skipped{reason="request_too_large"}`). Nothing changes for routes that don't opt in.
+
+Listing a method in Limen's allowlist only makes it *mechanically* eligible — it is not a safety proof for any given route. Before opting a route's write into `shadow_methods`, record a per-route idempotence analysis: name the mutation, state the response-visible effect of the shadow executing it a second time, and identify the corpus constraint (fixed key, idempotent upsert, response that doesn't expose ordering, etc.) that keeps that effect from surfacing. Treat the allowlist as a reminder that this analysis is owed, not as evidence it was done.
 
 ---
 

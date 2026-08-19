@@ -131,12 +131,16 @@ What it proves, cheaply and before any rewrite exists:
 !!! warning "A rehearsed write is a doubled write"
     Shadowing is off by default for every method but `GET`/`HEAD`, and that
     default is what keeps this stage safe. If a route opts a write in with
-    `comparison.shadow_methods: ["POST"]` while `new_upstream` points at the
-    legacy host, the second leg lands on the **same system of record** as the
-    first — the side effect is duplicated against production, not compared
-    against a replica. Rehearse writes only where the side effect is provably
-    idempotent, or do not rehearse them at all. Neither the same-upstream
-    configuration nor Limen itself can detect the difference.
+    `comparison.shadow_methods: ["POST"]` (also eligible: `PUT`, `PATCH`; not
+    `DELETE`) while `new_upstream` points at the legacy host, the second leg
+    lands on the **same system of record** as the first — the side effect is
+    duplicated against production, not compared against a replica. Rehearse
+    writes only where the side effect is provably idempotent, or do not
+    rehearse them at all. Neither the same-upstream configuration nor Limen
+    itself can detect the difference — a method's presence in
+    `shadow_methods` says it is *mechanically* eligible, not that this
+    route's mutation is safe to run twice; that argument is the operator's,
+    recorded per route.
 
 → [comparison & contracts](comparison-and-contracts.md) ·
 [`comparison.shadow_methods`](../reference/config-reference.md#comparisonshadow_methods-shadowing-a-write)

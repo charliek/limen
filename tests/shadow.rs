@@ -453,16 +453,23 @@ routes:
 /// The buffered request body must reach **both** upstreams byte-identically,
 /// framed consistently (a `Content-Length` matching the bytes, no
 /// `Transfer-Encoding`), and the comparison must run as it does for reads.
-#[tokio::test]
-async fn opted_in_post_replays_an_identical_body_to_both_upstreams() {
+/// Shared body for `opted_in_write_replays_an_identical_body_to_both_upstreams`
+/// (spec §6.1): an opted-in write's buffered body must reach both upstreams
+/// byte-identically, for every method `SHADOWABLE_WRITE_METHODS` allows
+/// (`POST`, `PUT`, `PATCH` — `DELETE` deliberately excluded, covered
+/// separately in `validate.rs`'s unit tests).
+async fn opted_in_write_replays_an_identical_body_to_both_upstreams(
+    verb: &str,
+    axum_method: Method,
+) {
     let legacy = MockServer::start().await;
     let new = MockServer::start().await;
-    Mock::given(method("POST"))
+    Mock::given(method(verb))
         .and(path("/devices"))
         .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"id":1}"#))
         .mount(&legacy)
         .await;
-    Mock::given(method("POST"))
+    Mock::given(method(verb))
         .and(path("/devices"))
         .respond_with(ResponseTemplate::new(201).set_body_string(r#"{"id":1}"#))
         .mount(&new)
@@ -473,7 +480,7 @@ async fn opted_in_post_replays_an_identical_body_to_both_upstreams() {
         r#"
 routes:
   - id: r
-    match: {{ methods: ["GET", "POST"], path_prefix: "/" }}
+    match: {{ methods: ["GET", "{verb}"], path_prefix: "/" }}
     legacy_upstream: "{}"
     new_upstream: "{}"
     mode: shadow_legacy_primary
@@ -481,7 +488,7 @@ routes:
       enabled: true
       sample_rate: 1.0
       max_body_bytes: 262144
-      shadow_methods: ["POST"]
+      shadow_methods: ["{verb}"]
 "#,
         legacy.uri(),
         new.uri()
@@ -492,7 +499,7 @@ routes:
     let resp = send(
         &app,
         Request::builder()
-            .method("POST")
+            .method(verb)
             .uri("/devices")
             .header("content-type", "application/json")
             .body(Body::from(body))
@@ -506,7 +513,7 @@ routes:
     wait_until("the comparison", || !capture.comparisons().is_empty()).await;
     let (meta, result) = capture.comparisons().pop().unwrap();
     assert!(result.is_match(), "{result:?}");
-    assert_eq!(meta.method, Method::POST);
+    assert_eq!(meta.method, axum_method);
 
     let legacy_reqs = legacy.received_requests().await.unwrap();
     let new_reqs = new.received_requests().await.unwrap();
@@ -528,6 +535,21 @@ routes:
     // The shadow copy is still marked as such; the primary never is.
     assert_eq!(new_reqs[0].headers.get("x-limen-shadow").unwrap(), "1");
     assert!(legacy_reqs[0].headers.get("x-limen-shadow").is_none());
+}
+
+#[tokio::test]
+async fn opted_in_post_replays_an_identical_body_to_both_upstreams() {
+    opted_in_write_replays_an_identical_body_to_both_upstreams("POST", Method::POST).await;
+}
+
+#[tokio::test]
+async fn opted_in_put_replays_an_identical_body_to_both_upstreams() {
+    opted_in_write_replays_an_identical_body_to_both_upstreams("PUT", Method::PUT).await;
+}
+
+#[tokio::test]
+async fn opted_in_patch_replays_an_identical_body_to_both_upstreams() {
+    opted_in_write_replays_an_identical_body_to_both_upstreams("PATCH", Method::PATCH).await;
 }
 
 /// An opted-in write whose body exceeds `max_body_bytes` is not shadowed at all
@@ -802,6 +824,64 @@ routes:
         new.received_requests().await.unwrap().len(),
         0,
         "writes are never shadowed"
+    );
+    assert_eq!(legacy.received_requests().await.unwrap().len(), 1);
+    assert!(capture.comparisons().is_empty());
+}
+
+/// Widening `SHADOWABLE_WRITE_METHODS` to include `PUT` makes it *eligible*
+/// for opt-in, but eligibility is not an opt-in: a route whose `match.methods`
+/// includes `PUT` but whose `comparison.shadow_methods` does not name it must
+/// still never shadow that write (safety invariant 3) — same as
+/// `writes_are_never_shadowed` above, for the newly-eligible verb.
+#[tokio::test]
+async fn an_unopted_put_on_a_put_matching_route_is_not_shadowed() {
+    let legacy = MockServer::start().await;
+    let new = MockServer::start().await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("updated"))
+        .mount(&legacy)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&new)
+        .await;
+
+    // A shadow route that matches PUT but does not opt it into shadow_methods:
+    // the write must NOT be shadowed even though PUT is now on the allowlist.
+    let cfg = config_from_yaml(&format!(
+        r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET", "PUT"], path_prefix: "/" }}
+    legacy_upstream: "{}"
+    new_upstream: "{}"
+    mode: shadow_legacy_primary
+    comparison: {{ enabled: true, sample_rate: 1.0, max_body_bytes: 262144 }}
+"#,
+        legacy.uri(),
+        new.uri()
+    ));
+    let capture = Capture::default();
+    let app = router_with_observer(&cfg, Arc::new(capture.clone()));
+
+    let resp = send(
+        &app,
+        Request::builder()
+            .method("PUT")
+            .uri("/devices/1")
+            .body(Body::from("{}"))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    // Give any (erroneous) shadow a chance to fire, then assert none did.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        new.received_requests().await.unwrap().len(),
+        0,
+        "un-opted PUT is never shadowed, even though PUT is shadow-eligible"
     );
     assert_eq!(legacy.received_requests().await.unwrap().len(), 1);
     assert!(capture.comparisons().is_empty());

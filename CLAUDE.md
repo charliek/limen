@@ -63,8 +63,12 @@ These are the point of the project — never regress them:
    is fire-and-forget and off the client path.
 3. **Never shadow writes by default**; only `GET`/`HEAD` reads are eligible
    unless a route explicitly opts a method into `comparison.shadow_methods`
-   (`POST` only today), which replays a bounded, buffered body to both
-   upstreams. Absent that opt-in, a write is never sent to the new upstream.
+   (`POST`, `PUT`, or `PATCH` — `DELETE` is deliberately excluded), which
+   replays a bounded, buffered body to both upstreams. Absent that opt-in, a
+   write is never sent to the new upstream. Listing a method in
+   `SHADOWABLE_WRITE_METHODS` only makes it eligible to opt in — it is a
+   reminder that a per-route idempotence analysis is owed, not a proof that
+   shadowing any given route is safe. See `docs/limen_spec.md` §6.1.
 4. **Never replay a failed in-flight request against legacy** unless the route
    is explicitly `failover_safe: true` (idempotent). Routing *subsequent*
    requests to legacy via the circuit breaker is fine; retrying *the same*
