@@ -289,7 +289,8 @@ A route marked `has-external-side-effects` (email, third-party call, payment, jo
 | Method | Typical idempotency | Shadow? | Failover? |
 |---|---|---|---|
 | GET / HEAD | idempotent | yes (default) | yes |
-| PUT / PATCH | idempotent (typically) | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | yes, if configured |
+| PUT | idempotent (typically) | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | yes, if configured |
+| PATCH | **not inherently idempotent** — `validate.rs`'s `NON_IDEMPOTENT_METHODS` lists it alongside `POST`, so a route-specific proof is required, not assumed | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | **no** unless explicitly safe — a `failover_to_legacy` route carrying `PATCH` must set `failover_safe: true` after that analysis |
 | DELETE | idempotent | **no — not eligible for shadowing at all** | yes, if configured |
 | POST | non-idempotent | no by default; opt-in possible, **with a recorded per-route idempotence analysis** | **no** unless explicitly safe |
 | POST-as-query (logical read, no writes) | idempotent | yes, if confirmed no side effects | yes |
