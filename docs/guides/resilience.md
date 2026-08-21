@@ -287,11 +287,16 @@ Limen never buffers unbounded data (spec §9.3–9.4):
 
 - **Request bodies** are buffered only when a route needs to replay them —
   `failover_safe`, up to `server.request_body_limit_bytes`, or a write method
-  the route opted into shadowing via `comparison.shadow_methods`, up to
-  `comparison.max_body_bytes` so the identical bytes reach both upstreams. The
-  default streaming path buffers nothing. A shadow-eligible write's body over
-  the limit is never fully buffered: it streams to the primary unchanged and
-  shadowing is skipped, incrementing `shadow_skipped{reason="request_too_large"}`.
+  (`POST`, `PUT`, or `PATCH` — `DELETE` is not eligible) the route opted into
+  shadowing via `comparison.shadow_methods`, up to `comparison.max_body_bytes`
+  so the identical bytes reach both upstreams. The default streaming path
+  buffers nothing. A shadow-eligible write's body over the limit is never
+  fully buffered: it streams to the primary unchanged and shadowing is
+  skipped, incrementing `shadow_skipped{reason="request_too_large"}`. Being
+  eligible only means the buffering/replay path is method-agnostic and
+  handles it identically to `POST` — it is not a claim that replaying any
+  particular route's write twice is safe; that is the per-route idempotence
+  analysis required before opting in (§6.1).
 - **Comparison buffering** for shadows is bounded per route by
   `comparison.max_body_bytes`, **and in time** by the remainder of the route's
   `primary_ms` (above); an over-limit *or* out-of-budget response is streamed to

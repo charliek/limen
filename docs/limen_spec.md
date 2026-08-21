@@ -681,7 +681,7 @@ migration.get-device.shadow_enabled: true
 - Those names are **literal decoded names**: no `%`, no `+`, no leading or trailing whitespace. The request's query is percent-decoded before comparison and config names are not, so an encoded spelling could never match — and a condition that matches nothing fails *open*, letting the traffic it was meant to except fall through to a sibling route. Rejected at startup rather than normalized (safety invariant: refuse invalid config).
 - Two query-conditioned routes sharing a `path_prefix` and at least one method must be **provably disjoint**: some parameter appears in one route's `query_present` and the other's `query_absent`, so no single request can satisfy both. The check is deliberately conservative — anything not provably disjoint (two `query_present` sets a request could carry together; a `query_present` / `query_absent` pair over unrelated names) fails validation, even where a cleverer analysis might prove it safe. Routes on different prefixes never need this: longest prefix still decides. Two conditioned routes on templates of the same shape are the template tier's twin of this rule (the identical-shape row of Section 5.2's overlap table); where one template is strictly narrower than the other, path specificity decides instead and no disjointness is required.
 - A route in `failover_to_legacy` mode whose `match.methods` include non-idempotent methods (POST, and PATCH unless declared idempotent) **must** set `failover_safe: true` explicitly, or validation fails. This forces an operator to consciously affirm that auto-failover is safe for that route (Section 6.5).
-- Validation refuses `shadow_methods` entries that could not take effect: a method other than `POST`, a mode that does not shadow, `comparison.enabled: false`, or a method `match.methods` does not carry (Section 6.1).
+- Validation refuses `shadow_methods` entries that could not take effect: a method other than `POST`/`PUT`/`PATCH` (`DELETE` is deliberately not eligible — Section 6.1), a mode that does not shadow, `comparison.enabled: false`, or a method `match.methods` does not carry (Section 6.1).
 - `budget` ratios, if present, are positive numbers; `max_mismatch_rate` is within 0–1.
 - `diff_sink.dir`, if the block is present, is non-empty. The directory (and its parent) need **not** exist — it is created on the first mismatch, so a fresh deploy is not failed for a directory nothing has written to yet.
 - A route's `match` sets **exactly one** of `path_prefix` or `path_template` — never both (two answers to the same question) and never neither (an omitted `path_prefix` defaulting to `/` would silently turn a mistyped route into a catch-all shadowing every path in the service).
@@ -714,23 +714,25 @@ Limen implements five modes. Each route declares exactly one.
 
 **Writes are never shadowed by default; a route may opt in per method.**
 
-Reads are replayed bodyless, so a body-bearing `GET`/`HEAD` is never shadowed — its body could not be reproduced faithfully. To shadow a write, a route lists the method in `comparison.shadow_methods` (only `POST` is supported today):
+Reads are replayed bodyless, so a body-bearing `GET`/`HEAD` is never shadowed — its body could not be reproduced faithfully. To shadow a write, a route lists the method in `comparison.shadow_methods` — `POST`, `PUT`, and `PATCH` are eligible; `DELETE` deliberately is not (below):
 
 ```yaml
 comparison:
   enabled: true
   sample_rate: 0.1
   max_body_bytes: 262144
-  shadow_methods: ["POST"]     # absent/empty (the default) = reads only
+  shadow_methods: ["POST"]     # absent/empty (the default) = reads only; PUT/PATCH also eligible
 ```
 
 For such a request, the body is read **once, bounded by `max_body_bytes`**, and those exact bytes are sent to the primary and replayed to the shadow — identical payload and identical framing (a matching `Content-Length`; the client's own framing headers are hop-by-hop-stripped and re-derived). Only that bounded buffering is on the client path — the same cost the failover-safe path already pays; the shadow dispatch and comparison remain fire-and-forget. A body over the limit is **never fully buffered**: it streams to the primary untouched and shadowing is skipped entirely with reason `request_too_large`.
 
 The buffering is also skipped up front when the shadow concurrency limit (Section 9.3) is *already* saturated — the shadow would be refused anyway, and shedding the preparation is the point of the limit under load. That pre-check is best-effort (the permit is still reserved authoritatively after the primary responds); a lost race costs at most one buffered body whose shadow is then refused, which is the behavior without the check.
 
-Validation refuses `shadow_methods` that could not take effect: a method other than `POST`, a mode that does not shadow, `comparison.enabled: false`, or a method the route's `match.methods` does not even carry (Section 5.3).
+Validation refuses `shadow_methods` that could not take effect: a method other than `POST`/`PUT`/`PATCH`, a mode that does not shadow, `comparison.enabled: false`, or a method the route's `match.methods` does not even carry (Section 5.3). `DELETE` is deliberately excluded from the eligible set: nothing in the shipped use cases needs it, and it is the verb whose shadowing is hardest to justify, so leaving it off keeps a rail up.
 
 The opt-in is deliberately per route and per method: shadowing a write sends a second, real request to the new upstream, so it is only safe where the operator has affirmed that handling it twice is acceptable (typically because the new implementation shares the legacy datastore, Section 2.3, and the endpoint is idempotent or the shadow's effects are inert).
+
+**`SHADOWABLE_WRITE_METHODS` is not a proof of safety.** Spanning three verbs (`POST`, `PUT`, `PATCH`), the allowlist can no longer carry the implicit claim it once did ("POST is the only verb we replay, and replaying it is fine"). Listing a method there only makes it *eligible* to appear in a route's `comparison.shadow_methods` — it says nothing about whether any particular route's mutation is safe to execute twice. **Every route that opts a write into `shadow_methods` must have a recorded per-route idempotence analysis**, in the shape used throughout this migration's route classifications: name the mutation, state the response-visible effect of executing it twice, and identify the corpus constraint that keeps that effect from occurring in practice (e.g. a fixed key that makes a second write a no-op, or a response body that doesn't expose ordering). Treat the constant as a reminder that this analysis is owed, not as evidence that it was done. A config-level idempotence-attestation field that would enforce this mechanically has been considered and deliberately deferred — it would be a schema/comparison-semantics change, out of scope for an allowlist widening.
 
 ### 6.2 `legacy_only`
 

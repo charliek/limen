@@ -322,9 +322,21 @@ comparison:
   shadow_methods: ["POST"]
 ```
 
-- Only `POST` may be listed today; `GET`/`HEAD` must **not** be listed (they are
-  always eligible, and listing one suggests you expected the field to *restrict*
-  eligibility, which it does not).
+- `POST`, `PUT`, and `PATCH` may be listed; `DELETE` deliberately may not
+  (nothing in the shipped use cases needs it, and it is the verb whose
+  shadowing is hardest to justify). `GET`/`HEAD` must **not** be listed (they
+  are always eligible, and listing one suggests you expected the field to
+  *restrict* eligibility, which it does not).
+- **Listing a method here is not a safety proof.** With three verbs eligible,
+  the allowlist can no longer carry an implicit "this one verb is always safe
+  to replay" claim. It only makes a method *eligible* to opt in — every route
+  that actually lists one in `shadow_methods` still needs a recorded per-route
+  idempotence analysis (the mutation, the response-visible effect of double
+  execution, and the corpus constraint that keeps it true; see
+  [`limen_spec.md` §6.1](../limen_spec.md#61-shadow_legacy_primary)). Treat the
+  allowlist as a reminder that the analysis is owed, not evidence that it was
+  done. A config-level attestation field that would check this mechanically has
+  been considered and deliberately deferred as a comparison-semantics change.
 - The request body is buffered **once**, bounded by `max_body_bytes`, and the
   same bytes go to the primary and the shadow — identical payload and identical
   `Content-Length`. A body over the limit is never fully buffered: it streams to
@@ -335,9 +347,9 @@ comparison:
   is already saturated, the body isn't buffered at all — the request is
   forwarded straight through and counted as
   `shadow_skipped{reason="concurrency_limit"}`.
-- Validation rejects a listing that could never take effect: a non-`POST`
-  method, a mode other than `shadow_legacy_primary`, `enabled: false`, or a
-  method missing from the route's `match.methods`.
+- Validation rejects a listing that could never take effect: a method other
+  than `POST`/`PUT`/`PATCH`, a mode other than `shadow_legacy_primary`,
+  `enabled: false`, or a method missing from the route's `match.methods`.
 
 Opt in only where handling the request twice is acceptable — the new upstream
 receives a *real* write.

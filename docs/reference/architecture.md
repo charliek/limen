@@ -71,11 +71,16 @@ Each route declares exactly one of five modes (spec §6):
 | `percentage_split` | legacy/new | deterministic per-key split by rollout percentage; breaker/fail-safe can override toward legacy. |
 | `failover_to_legacy` | new | new is primary; fall back to legacy on failure — **only retrying the in-flight request when `failover_safe: true`**. |
 
-**Shadow eligibility** (all must hold): method is `GET`/`HEAD` — or a write the
-route opted into `comparison.shadow_methods`; comparison is enabled; the body is
-within the buffer limit; shadow concurrency isn't exceeded; shutdown isn't in
-progress. Writes are never shadowed by default; an opted-in write replays a
-bounded, buffered body to both upstreams.
+**Shadow eligibility** (all must hold): method is `GET`/`HEAD` — or a write
+(`POST`, `PUT`, or `PATCH`; `DELETE` is not eligible) the route opted into
+`comparison.shadow_methods`; comparison is enabled; an opted-in write's REQUEST
+body is within `max_body_bytes` — the same `comparison.max_body_bytes` that
+also bounds response-body capture, not a separate limit; shadow concurrency
+isn't exceeded; shutdown isn't in progress.
+Writes are never shadowed by default; an opted-in write replays a bounded,
+buffered body to both upstreams. Eligibility is mechanical, not a safety
+verdict — each route that opts a write into shadowing still needs its own
+recorded idempotence analysis (see `docs/limen_spec.md` §6.1).
 
 !!! warning "Failover and idempotency"
     *Routing* the next request to legacy because the circuit is open is always
