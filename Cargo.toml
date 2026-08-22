@@ -115,4 +115,12 @@ codegen-units = 1
 strip = "debuginfo"
 
 [profile.dev]
-debug = "limited"
+# `line-tables-only` over `limited`: backtraces still name the function and
+# line, which is all this crate's debugging ever needs, at a fraction of the
+# debug-info size.
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+# Dependencies are not stepped through; their debug info is pure disk. This is
+# the load-bearing line — dependency debug info is the bulk of `target/debug`.
+debug = false
