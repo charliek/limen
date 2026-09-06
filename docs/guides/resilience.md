@@ -252,7 +252,9 @@ Each route sets `timeouts.primary_ms` and `timeouts.shadow_ms` (spec §9.2):
   `failover_safe`).
 - **`shadow_ms`** bounds the entire shadow exchange. Because the shadow runs off
   the client path, **it can never extend client-visible latency** — a slow or
-  hung shadow is abandoned without touching the client's response.
+  hung shadow is abandoned without touching the client's response, incrementing
+  `limen_shadow_failed_total{reason="timeout"}` (see below for what that means
+  at verdict time).
 
 **Unsampled traffic keeps its unbounded stream.** On the default streaming path
 the response body is relayed with no total deadline at all, so large or slow
@@ -271,6 +273,21 @@ to ≈ `primary_ms` rather than however long a trickling body cares to take. A
 response declaring `text/event-stream` skips comparison *eagerly*, before a byte
 is buffered (`reason="event_stream"`): an event stream never completes, so
 buffering one could only ever stall the first byte and then skip anyway.
+
+Both of these skips, and the timed-out shadow above, used to be purely
+informational at verdict time. On a route with `comparison.min_comparisons`
+set, `limen verdict` now fails that route's evidence (`met`, not just
+`floor_met`) the moment any of them is recorded against it — however
+comfortably its raw comparison count clears the floor. `event_stream` is the
+sharp case: a streaming route skips on content type before a byte is ever
+buffered, so *every* sampled request on it is a skip, and the floor can never
+be satisfied while one is set — the fix is to unfloor the route
+(`min_comparisons: 0`) and relay it, not to drive more traffic at it. See
+[prove your lens bites
+§4](prove-your-lens-bites.md#4-skips-prove-nothing-sampled-slipped-through-uncompared)
+for the remedy per reason — and note that the counters behind this check
+never reset within a process: after changing a knob, restart limen and
+re-drive the floors, rather than re-running `limen verdict` alone.
 
 !!! note "What a dying body costs depends on when it dies"
     A body that errors **while still being buffered** has never had a byte sent
@@ -310,6 +327,20 @@ Limen never buffers unbounded data (spec §9.3–9.4):
 
 These bounds protect the proxy's memory and shield the new upstream from a
 shadow-traffic stampede while it's still warming up.
+
+They also, now, decide the fate of a floored route's evidence. Every skip
+named above — `request_too_large`, `response_too_large` (comparison
+buffering's own over-limit case, sharing `max_body_bytes` with the
+request-buffering one), and `concurrency_limit` — counts as uncompared
+sampled work against whichever route it landed on, and a floored route
+carrying any of them fails its verdict even while sitting at or above its
+comparison floor. `concurrency_limit` is the one most likely to surprise: the
+cap is **global**, so the route that consumed the slots and the route whose
+floor comes up undermined can be two different routes entirely — raise
+`server.shadow_concurrency_limit` or lower drive concurrency, rather than
+looking for a single "guilty" route. See [prove your lens bites
+§4](prove-your-lens-bites.md#4-skips-prove-nothing-sampled-slipped-through-uncompared)
+for the full remedy table.
 
 ## Putting it together
 

@@ -136,7 +136,10 @@ debug:     { sink_canary: true }         # exposes POST /debug/canary
 
 `min_comparisons` is an *exercise floor* (default `1`; `0` an explicit, visible exemption) read by
 `verdict` and cross-checked by `report --format html` — not a tolerance. Coverage is `sample_rate` against eligible volume, arithmetic you do
-yourself: an unsampled request appears in no skip metric. Validate the contract with `limen check-contract
+yourself: an unsampled request appears in no skip metric. A *sampled* one that was not compared does —
+`response_too_large`, `request_too_large`, `concurrency_limit`, `response_buffer_timeout`, `event_stream`,
+or a failed shadow (`timeout`/`error`) — and every one of those now fails the floor of the route it
+happened on, even once that route's raw comparison count clears `min_comparisons`. Validate the contract with `limen check-contract
 ./contracts/user-service.contract.yaml`. `comparison.shadow_methods: ["POST"]` (also `PUT`/`PATCH`; `DELETE`
 is not eligible) opts a write into shadowing — body buffered within `max_body_bytes`, replayed
 byte-identically to both upstreams. It exists and it is deliberate: the new upstream receives a *real*
@@ -160,7 +163,7 @@ limen verdict -c campaign.config.yaml --canary --format json > verdict.json
 |---|---|
 | `0` | Clean — drained, floors met, sink integral, zero non-canary mismatches. |
 | `10` | Mismatches found (non-canary). |
-| `20` | Floors unmet, including a config that floors nothing at all. |
+| `20` | Floors unmet: a route below its floor (starved), or at its floor with sampled work that went uncompared — any skip reason, or a shadow that never answered (undermined) — or a config that floors nothing at all. |
 | `30` | Sink integrity: dropped records, unparseable lines, counter routes absent from the config, sink/engine disagreement — or a canary that never landed. |
 | `40` | Drain timeout — the pipeline never quiesced. |
 | `50` | Required input is unavailable: control plane unreachable, sink unreadable, a required metric series absent, a refused canary trigger. |
@@ -169,10 +172,13 @@ The **highest code wins** and every check fails closed — an input that could n
 as "0 mismatches". `--offline` skips drain, floors, integrity, and canary; an offline `0` is strictly
 weaker and only the JSON `mode` field tells them apart. Two disciplines decide whether a clean exit means
 anything. **Floors prove something was compared** — they count comparisons, not coverage, so
-`min_comparisons: 20` is met by 20 of 20 exactly as by 20 of 20,000. **The canary proves the recording
-pipeline is live**, since an empty sink and a correctly empty sink render identically; `--canary` needs
-`debug.sink_canary: true` in the **running proxy's** config or the trigger is refused (exit `50`), never
-silently skipped. Run it in *every* campaign.
+`min_comparisons: 20` is met by 20 of 20 exactly as by 20 of 20,000, provided none of those 20 went
+uncompared on a later leg (a skip or a failed shadow undermines the route regardless). **The canary proves
+the recording pipeline is live**, since an empty sink and a correctly empty sink render identically;
+`--canary` needs `debug.sink_canary: true` in the **running proxy's** config or the trigger is refused
+(exit `50`), never silently skipped. Run it in *every* campaign. An undermined route's fix is always three
+steps: change the knob the verdict names, **restart limen**, and re-drive the floors — these counters
+never reset within a process, so re-running `verdict` alone stays `20`.
 
 **Zero tolerance:** verdict compares no mismatch *rate* against a threshold — any remaining unexplained
 non-canary mismatch is exit `10`. Resolve each (fix `new`, a narrow contract rule, or an

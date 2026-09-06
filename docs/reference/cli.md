@@ -206,7 +206,7 @@ unavailable is never read as "0 mismatches."
 |---|---|
 | `0` | Clean — drained, floors met, sink integral, zero non-canary mismatches. |
 | `10` | Mismatches found (non-canary). |
-| `20` | Floors unmet, including a config that floors nothing at all. |
+| `20` | Floors unmet: a route below its floor (**starved**), or at its floor with sampled work that went uncompared — a skip of any reason, or a shadow that never answered (**undermined**) — or a config that floors nothing at all. |
 | `30` | Sink-integrity failure: dropped sink records, unparseable sink lines, counter routes absent from the config, per-route disagreement between sink and engine, or — with `--canary` — a canary that never landed or on which sink and engine disagree. |
 | `40` | Drain timeout — the pipeline never quiesced within the deadline. |
 | `50` | A required input was unavailable: control plane unreachable, sink dir unreadable, a required metric series absent, or a refused canary trigger. |
@@ -219,6 +219,17 @@ condition dominates because it makes the lower-numbered answers untrustworthy
 outranks 10 and 20). The JSON output still lists every check's individual
 outcome regardless of which code won.
 
+**A pre-fix binary is a version boundary, not a clean floor.** The floors
+check reads three metric families (`limen_shadow_skipped_total`,
+`limen_comparison_skipped_total`, `limen_shadow_failed_total`) that are
+pre-registered per configured route at zero, precisely so their *absence*
+from a scrape can never be mistaken for "recorded no skips." A proxy built
+before this gate existed never registers them at all, so scraping one trips
+the same rule every other required series already gets: exit `50`, naming the
+missing series, rather than a floors check that silently passes over evidence
+it never saw. If you see exit `50` naming one of those three families, the
+fix is to rebuild `limen`, not to chase a config problem.
+
 ### JSON output
 
 ```json
@@ -228,7 +239,7 @@ outcome regardless of which code won.
   "exit_code": 0,
   "checks": {
     "drain": { "status": "pass", "detail": "pipeline quiesced (two stable balanced scrapes)" },
-    "floors": { "status": "pass", "detail": "2 floored route(s) all at/above floor" },
+    "floors": { "status": "pass", "detail": "2 floored route(s) all at/above floor, with no uncompared sampled work" },
     "sink_integrity": { "status": "pass", "detail": "sink and engine counters agree on every route; nothing dropped" },
     "canary": { "status": "pass", "detail": "canary rode compare → sink → flush end-to-end (1 record(s), counters agree)" },
     "mismatches": { "status": "pass", "detail": "zero non-canary mismatches recorded" }
@@ -236,8 +247,10 @@ outcome regardless of which code won.
   "mismatches_total": 0,
   "canary_records": 1,
   "floors": [
-    { "route_id": "get-device", "comparisons": 14, "floor": 1, "met": true },
-    { "route_id": "list-devices", "comparisons": 6, "floor": 1, "met": true }
+    { "route_id": "get-device", "comparisons": 14, "floor": 1, "floor_met": true,
+      "skipped": 0, "shadow_failures": 0, "uncompared": [], "met": true },
+    { "route_id": "list-devices", "comparisons": 6, "floor": 1, "floor_met": true,
+      "skipped": 0, "shadow_failures": 0, "uncompared": [], "met": true }
   ],
   "sink_mismatches_by_route": {},
   "informational": []
