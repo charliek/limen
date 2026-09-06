@@ -169,7 +169,8 @@ tells you which one you have rather than collapsing both into "floors unmet."
 
 Every reason a route can be undermined has exactly one remedy, kept here in
 the same words `limen verdict` prints (`remedy_for` in `src/verdict.rs` is
-the source both the tool and this table are read from, so they cannot drift
+where the tool's copy lives; this table is transcribed from it and nothing
+enforces that, so change both together
 apart):
 
 | Reason | Family | Remedy |

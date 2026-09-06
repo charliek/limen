@@ -139,7 +139,9 @@ debug:     { sink_canary: true }         # exposes POST /debug/canary
 yourself: an unsampled request appears in no skip metric. A *sampled* one that was not compared does —
 `response_too_large`, `request_too_large`, `concurrency_limit`, `response_buffer_timeout`, `event_stream`,
 or a failed shadow (`timeout`/`error`) — and every one of those now fails the floor of the route it
-happened on, even once that route's raw comparison count clears `min_comparisons`. Validate the contract with `limen check-contract
+happened on, even once that route's raw comparison count clears `min_comparisons`. Those are the
+outcomes limen records; a few paths end a sampled plan without recording one (a read carrying a body,
+and the cases where the primary itself failed), so the floor means "nothing recorded as uncompared". Validate the contract with `limen check-contract
 ./contracts/user-service.contract.yaml`. `comparison.shadow_methods: ["POST"]` (also `PUT`/`PATCH`; `DELETE`
 is not eligible) opts a write into shadowing — body buffered within `max_body_bytes`, replayed
 byte-identically to both upstreams. It exists and it is deliberate: the new upstream receives a *real*
