@@ -59,32 +59,105 @@ routes:
 /// `prometheus::register_verdict_series` process-wide and
 /// `prometheus::register_skip_series` per route — i.e. what any live limen
 /// renders from its very first scrape, and exactly the set
-/// `verdict::REQUIRED_SERIES` refuses to read as absent. Transcribed from those
-/// functions rather than invented, so a change to either side shows up here;
-/// the per-route half is abridged to one reason per family, since presence is
-/// what the page turns on.
-const REGISTERED: &str = "\
-limen_shadow_in_flight 0
-limen_diff_sink_enqueued_total 0
-limen_diff_sink_written_total 0
-limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
-limen_diff_sink_dropped_total{reason=\"io_error\"} 0
-limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
-limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0
-limen_comparison_skipped_total{route=\"a\",reason=\"request_too_large\"} 0
-limen_shadow_failed_total{route=\"a\",reason=\"error\"} 0
-";
+/// `verdict::REQUIRED_SERIES` refuses to read as absent.
+///
+/// Transcribed from those functions rather than imported from them, so a
+/// change to either side shows up here as a failing test rather than as a
+/// fixture that silently follows. The per-route half is complete — every
+/// reason of every uncompared family for **both** routes [`CONFIG`] declares,
+/// including the `legacy_only` one, because that is what `register_skip_series`
+/// emits and, given the config, what the page requires series by series rather
+/// than family by family.
+fn registered() -> String {
+    registered_for(&["a", "b"])
+}
 
-/// A busy proxy's scrape: the registered series, plus the lazily-registered
-/// families a run that compared, skipped and shadowed would have touched.
+/// The registered set a limen serving `routes` renders: the process-wide half,
+/// then every route's twelve. The route list is the config's, because that is
+/// what the registrar walks — a scrape carrying a route the config never
+/// declared is drift, and a fixture that carried one would be pinning it.
+fn registered_for(routes: &[&str]) -> String {
+    let mut out = String::from(
+        "limen_shadow_in_flight 0\n\
+         limen_diff_sink_enqueued_total 0\n\
+         limen_diff_sink_written_total 0\n\
+         limen_diff_sink_dropped_total{reason=\"queue_full\"} 0\n\
+         limen_diff_sink_dropped_total{reason=\"io_error\"} 0\n\
+         limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0\n",
+    );
+    for route in routes {
+        out.push_str(&registered_skips(route));
+    }
+    out
+}
+
+/// The twelve series `register_skip_series` touches for one route: both skip
+/// families across every [`limen::observability::metrics::SkipReason`], and the
+/// shadow-failure family across both of its reasons. Spelled out rather than
+/// generated from those enums, so widening one shows up here.
+fn registered_skips(route: &str) -> String {
+    let mut out = String::new();
+    for reason in [
+        "concurrency_limit",
+        "response_too_large",
+        "request_too_large",
+        "event_stream",
+        "response_buffer_timeout",
+    ] {
+        for family in [
+            "limen_shadow_skipped_total",
+            "limen_comparison_skipped_total",
+        ] {
+            out.push_str(&format!(
+                "{family}{{route=\"{route}\",reason=\"{reason}\"}} 0\n"
+            ));
+        }
+    }
+    for reason in ["timeout", "error"] {
+        out.push_str(&format!(
+            "limen_shadow_failed_total{{route=\"{route}\",reason=\"{reason}\"}} 0\n"
+        ));
+    }
+    out
+}
+
+/// Raise one already-registered series off zero, the way traffic would.
+/// Substituted rather than appended: a real exporter renders one sample per
+/// series, and a fixture that appended a second would be pinning an exposition
+/// limen never emits.
+fn busy(scrape: &str, series: &str, value: u64) -> String {
+    let zero = format!("{series} 0\n");
+    assert!(
+        scrape.contains(&zero),
+        "{series} is not a registered series — the fixture and the registrar disagree"
+    );
+    scrape.replace(&zero, &format!("{series} {value}\n"))
+}
+
+/// A busy proxy's scrape: the registered series with the counters a run that
+/// compared, skipped and shadowed would have moved, plus the lazily-registered
+/// families such a run also touches.
 fn metrics() -> String {
+    metrics_for(&["a", "b"])
+}
+
+/// The same busy scrape over an arbitrary route set — the traffic all lands on
+/// route `a`, which every config in this file declares.
+fn metrics_for(routes: &[&str]) -> String {
+    let scrape = busy(
+        &registered_for(routes),
+        "limen_comparison_skipped_total{route=\"a\",reason=\"event_stream\"}",
+        2,
+    );
+    let scrape = busy(
+        &scrape,
+        "limen_comparison_skipped_total{route=\"a\",reason=\"response_buffer_timeout\"}",
+        1,
+    );
     format!(
-        "{REGISTERED}\
+        "{scrape}\
 limen_comparisons_total{{route=\"a\",result=\"match\"}} 3
-limen_comparison_skipped_total{{route=\"a\",reason=\"event_stream\"}} 2
-limen_comparison_skipped_total{{route=\"a\",reason=\"response_buffer_timeout\"}} 1
 limen_shadow_requests_total{{route=\"a\"}} 3
-limen_shadow_failed_total{{route=\"a\",reason=\"timeout\"}} 0
 "
     )
 }
@@ -104,10 +177,50 @@ fn clean_verdict() -> serde_json::Value {
         },
         "mismatches_total": 0,
         "canary_records": 0,
-        "floors": [{"route_id": "a", "comparisons": 3, "floor": 1, "met": true}],
+        "floors": [{
+            "route_id": "a",
+            "comparisons": 3,
+            "floor": 1,
+            "floor_met": true,
+            "skipped": 0,
+            "shadow_failures": 0,
+            "uncompared": [],
+            "met": true,
+        }],
         "sink_mismatches_by_route": {},
         "informational": [],
     })
+}
+
+/// The same clean campaign as a limen from before the uncompared gate recorded
+/// it: a floors row carrying `met` and the two counts, and none of the fields
+/// that split the arithmetic claim from the evidence claim.
+fn pre_gating_verdict() -> serde_json::Value {
+    let mut v = clean_verdict();
+    v["floors"] = serde_json::json!([
+        {"route_id": "a", "comparisons": 3, "floor": 1, "met": true}
+    ]);
+    v
+}
+
+/// The verdict `evaluate_floors` writes for an UNDERMINED route: at its floor,
+/// and unmet anyway because sampled work on it was never compared.
+fn undermined_verdict() -> serde_json::Value {
+    let mut v = clean_verdict();
+    v["exit_code"] = serde_json::json!(20);
+    v["verdict"] = serde_json::json!("floors-unmet");
+    v["checks"]["floors"] = serde_json::json!({
+        "status": "fail",
+        "detail": "route a UNDERMINED: at its floor with 3 uncompared",
+    });
+    v["floors"][0]["skipped"] = serde_json::json!(2);
+    v["floors"][0]["shadow_failures"] = serde_json::json!(1);
+    v["floors"][0]["uncompared"] = serde_json::json!([
+        {"metric": "limen_comparison_skipped_total", "reason": "response_too_large", "count": 2},
+        {"metric": "limen_shadow_failed_total", "reason": "timeout", "count": 1},
+    ]);
+    v["floors"][0]["met"] = serde_json::json!(false);
+    v
 }
 
 /// A profile over the same route table.
@@ -490,7 +603,7 @@ fn a_comment_only_metrics_file_is_unavailable() {
 /// limen control plane, and `limen verdict` would exit 50 on it.
 #[test]
 fn a_metrics_file_missing_a_required_family_is_unavailable() {
-    let without_in_flight: String = REGISTERED
+    let without_in_flight: String = registered()
         .lines()
         .filter(|l| !l.starts_with("limen_shadow_in_flight"))
         .map(|l| format!("{l}\n"))
@@ -518,7 +631,8 @@ fn a_metrics_file_missing_a_required_family_is_unavailable() {
 #[test]
 fn a_scrape_from_a_service_that_never_skipped_is_accepted() {
     let ws = canonical().with_metrics(&format!(
-        "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
+        "{}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n",
+        registered()
     ));
     let model = ws.model();
     assert!(
@@ -552,7 +666,7 @@ fn a_scrape_from_a_pre_gating_limen_is_refused_by_name() {
         "limen_shadow_skipped_total",
         "limen_shadow_failed_total",
     ] {
-        let pre_gating: String = REGISTERED
+        let pre_gating: String = registered()
             .lines()
             .filter(|l| !l.starts_with(family))
             .map(|l| format!("{l}\n"))
@@ -579,7 +693,7 @@ fn a_scrape_from_a_pre_gating_limen_is_refused_by_name() {
 /// `limen_comparisons_total` as zero rather than as a broken scrape.
 #[test]
 fn a_scrape_from_a_proxy_that_served_nothing_still_renders() {
-    let ws = canonical().with_metrics(REGISTERED);
+    let ws = canonical().with_metrics(&registered());
     let model = ws.model();
     assert!(!model.evidence.metrics.is_unavailable());
     assert!(ws.page().contains("reads this as zero"));
@@ -910,15 +1024,14 @@ fn an_impossibly_dated_sink_file_is_not_evidence() {
 /// a count no proxy ever emitted, on an otherwise green page.
 #[test]
 fn a_counter_too_large_for_an_f64_is_refused_not_saturated() {
-    // Prefixed with `REGISTERED` so the required families are all present and
-    // this test can only fail (or pass) on the oversized value itself, not on
-    // whichever family `FAMILIES` happens to visit first.
+    // Prefixed with the registered set so the required series are all present
+    // and this test can only fail (or pass) on the oversized value itself, not
+    // on whichever family `FAMILIES` happens to visit first.
     let ws = canonical().with_metrics(&format!(
-        "{REGISTERED}\
+        "{}\
          limen_comparisons_total{{route=\"a\",result=\"match\"}} 18446744073709551616\n\
-         limen_comparison_skipped_total{{route=\"a\",reason=\"event_stream\"}} 1\n\
-         limen_shadow_requests_total{{route=\"a\"}} 1\n\
-         limen_shadow_failed_total{{route=\"a\",reason=\"timeout\"}} 0\n",
+         limen_shadow_requests_total{{route=\"a\"}} 1\n",
+        registered()
     ));
     let model = ws.model();
     match &model.evidence.metrics {
@@ -974,6 +1087,208 @@ fn an_unmet_floors_row_for_an_unknown_route_is_still_red() {
     );
     assert_failure_naming(&model, "floor unmet");
     assert_failure_naming(&model, "not in this config");
+}
+
+/// The row this commit exists for. A floored route that reached its floor and
+/// still failed it — because a slice of the traffic it was sampled for went
+/// uncompared — is a verdict limen really writes. The page must read it as the
+/// coherent document it is: no self-contradiction finding, the standing shown
+/// as the verdict decided it, and the reason visible on the page rather than
+/// only in the JSON.
+#[test]
+fn an_undermined_floor_renders_without_a_contradiction_finding() {
+    let ws = canonical().with_verdict(&undermined_verdict());
+    let model = ws.model();
+    assert!(
+        model.evidence.verdict_violations.is_empty(),
+        "a correct verdict was called a torn artifact: {:?}",
+        model.evidence.verdict_violations
+    );
+    assert!(
+        !model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("inconsistent verdict artifact")),
+        "{}",
+        why(&model)
+    );
+    // Red, and for the right reason: the floor was reached, so "floor unmet"
+    // would send the reader to the wrong remedy.
+    assert_failure_naming(&model, "floor undermined: route a");
+    assert!(
+        !model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("floor unmet")),
+        "{}",
+        why(&model)
+    );
+    let route_a = model.routes.iter().find(|r| r.id == "a").expect("route a");
+    assert_eq!(route_a.floor_class, FloorClass::Unmet);
+    let uncompared = route_a.uncompared.as_ref().expect("an uncompared cell");
+    assert_eq!(uncompared.total, 3);
+
+    // And on the page: the count, and which reason produced it.
+    let html = ws.page();
+    assert!(html.contains("Uncompared"), "{html}");
+    assert!(html.contains("response_too_large"), "{html}");
+    assert!(html.contains("timeout"), "{html}");
+    // The cell itself: the total that decided `met`, the reasons that produced
+    // it in the cell, and the metric-qualified breakdown in the title.
+    let coverage = coverage_row_of(&html, "a");
+    assert!(
+        coverage.contains("3 <span class=\"pill bad\">response_too_large ×2, timeout ×1</span>"),
+        "{coverage}"
+    );
+    assert!(
+        coverage.contains(
+            "limen_comparison_skipped_total response_too_large ×2; \
+                           limen_shadow_failed_total timeout ×1"
+        ),
+        "{coverage}"
+    );
+    // Route b is floored by nothing, so it claims nothing here.
+    assert!(
+        coverage_row_of(&html, "b").contains("no floors row for this route"),
+        "{html}"
+    );
+}
+
+/// One route's row in the coverage table (section 4).
+fn coverage_row_of(html: &str, route: &str) -> String {
+    let start = html.find("<h2>4. Coverage").expect("the coverage section");
+    let section = &html[start..];
+    let needle = format!("title=\"route id: {route}\"");
+    let at = section
+        .find(&needle)
+        .unwrap_or_else(|| panic!("no coverage row for {route}"));
+    let row = &section[..at];
+    let row_start = row.rfind("<tr>").expect("row start");
+    let rest = &section[row_start..];
+    let end = rest.find("</tr>").expect("row end");
+    rest[..end].to_string()
+}
+
+/// Section 7 renders `informational`, which the verdict now fills with
+/// unfloored and unknown routes only — a floored route's counters were moved
+/// into its floors row, where they gate. Unsaid, that omission reads as "no
+/// floored route skipped anything": the same false green the gate exists to
+/// kill, relocated into the page's layout.
+#[test]
+fn the_non_gating_counter_table_says_whose_counters_are_missing_from_it() {
+    let mut v = undermined_verdict();
+    v["informational"] = serde_json::json!([
+        {
+            "metric": "limen_shadow_skipped_total",
+            "route": "b",
+            "reason": "event_stream",
+            "value": 7,
+        }
+    ]);
+    let html = canonical().with_verdict(&v).page();
+    let start = html
+        .find("Skip and failure counters recorded by the verdict")
+        .unwrap();
+    let section = &html[start..];
+    let end = section.find("<h2>").unwrap_or(section.len());
+    let block = &section[..end];
+    assert!(block.contains("event_stream"), "{block}");
+    assert!(block.contains("Unfloored routes only"), "{block}");
+    assert!(block.contains("floors rows"), "{block}");
+    assert!(block.contains("Nothing in this table gates."), "{block}");
+    // Route a is floored and undermined; its counters belong to section 4.
+    assert!(!block.contains("response_too_large"), "{block}");
+}
+
+/// The impossible verdict, from the other direction: a row that reached its
+/// floor, lost sampled work, and called itself met anyway. Nothing limen writes
+/// produces it, so a document carrying it has been edited or torn — and it is
+/// exactly the shape that would otherwise ride through as green.
+#[test]
+fn a_floors_row_claiming_met_over_uncompared_work_is_refused() {
+    let mut v = clean_verdict();
+    v["floors"][0]["skipped"] = serde_json::json!(3);
+    v["floors"][0]["uncompared"] = serde_json::json!([
+        {"metric": "limen_shadow_skipped_total", "reason": "concurrency_limit", "count": 3}
+    ]);
+    let model = canonical().with_verdict(&v).model();
+    assert_failure_naming(&model, "inconsistent verdict artifact");
+    assert!(
+        model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("claims met=true") && f.contains("\"a\"")),
+        "the route is named: {}",
+        why(&model)
+    );
+}
+
+/// The other half of that shape: totals of zero beside a per-reason list that
+/// says otherwise. The row would render met, and the page green, over work the
+/// same row says was never compared.
+#[test]
+fn a_floors_row_whose_breakdown_contradicts_its_totals_is_refused() {
+    let mut v = clean_verdict();
+    v["floors"][0]["uncompared"] = serde_json::json!([
+        {"metric": "limen_shadow_failed_total", "reason": "error", "count": 5}
+    ]);
+    let model = canonical().with_verdict(&v).model();
+    assert_failure_naming(&model, "do not describe the same run");
+}
+
+/// A `verdict.json` written before any of those fields existed still renders.
+/// Its zeros are the truth about a run that counted no skips anywhere, so the
+/// two new invariants collapse into the old one on it rather than being
+/// switched off for it — and the page stays as clean as it was.
+#[test]
+fn a_verdict_from_before_the_uncompared_gate_still_renders() {
+    let ws = canonical().with_verdict(&pre_gating_verdict());
+    let model = ws.model();
+    assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
+    assert!(model.evidence.verdict_violations.is_empty());
+    let route_a = model.routes.iter().find(|r| r.id == "a").expect("route a");
+    assert_eq!(route_a.floor_class, FloorClass::Met);
+    // A floored route that lost nothing reads as a quiet zero, not as noise.
+    assert_eq!(route_a.uncompared.as_ref().expect("a cell").total, 0);
+
+    // The old invariant is still enforced on the old shape.
+    let mut v = pre_gating_verdict();
+    v["floors"][0]["comparisons"] = serde_json::json!(0);
+    let model = canonical().with_verdict(&v).model();
+    assert_failure_naming(&model, "claims met=true");
+}
+
+/// The three uncompared families are registered per configured route, so a
+/// config that declares none is owed none. The page used to require them at
+/// family level whatever the config said, and called such a scrape's complete
+/// instrumentation "absent" — while `limen verdict` correctly called the same
+/// run exit 20 for flooring nothing. One input, two tools, and the page's
+/// diagnosis was the wrong one.
+#[test]
+fn a_config_that_declares_no_routes_owes_no_uncompared_series() {
+    let ws = canonical()
+        .with_config("routes: []\n")
+        .with_metrics(&registered_for(&[]));
+    let model = ws.model();
+    assert!(
+        !model.evidence.metrics.is_unavailable(),
+        "the scrape was complete for this config: {:?}",
+        model.evidence.metrics
+    );
+    assert!(
+        !model
+            .banner
+            .failures
+            .iter()
+            .any(|f| f.contains("is absent from the scrape")),
+        "{}",
+        why(&model)
+    );
+    // Still never clean — for the reason the verdict gives, not a made-up one.
+    assert_failure_naming(&model, "floors nothing");
 }
 
 #[test]
@@ -1269,6 +1584,14 @@ fn transitions(route: &str, counts: [u64; 4]) -> String {
 /// gauge that disagreed with its own transition history would be an impossible
 /// tuple — which the page now rejects, and which a fixture must not smuggle in
 /// as the shape of a healthy scrape.
+/// Everything [`rollout_metrics`] carries *except* the rollout families: the
+/// scrape a limen that predates them would export while serving
+/// [`ROLLOUT_CONFIG`] — whose route set is not [`CONFIG`]'s, so the registered
+/// half follows it rather than being reused.
+fn rollout_base() -> String {
+    metrics_for(&["a", "split", "failover"])
+}
+
 fn rollout_metrics() -> String {
     format!(
         "{}\
@@ -1285,7 +1608,7 @@ limen_requests_total{{route=\"split\",method=\"GET\",upstream=\"legacy\",status_
 limen_requests_total{{route=\"failover\",method=\"GET\",upstream=\"new\",status_class=\"2xx\"}} 9
 limen_requests_total{{route=\"failover\",method=\"GET\",upstream=\"legacy\",status_class=\"2xx\"}} 1
 ",
-        metrics(),
+        rollout_base(),
         transitions("split", [2, 2, 2, 0]),
         transitions("failover", [0, 0, 0, 0]),
     )
@@ -1556,9 +1879,9 @@ fn a_nonzero_target_under_stale_flags_is_a_contradiction() {
 /// fine; the page says the scrape cannot answer.
 #[test]
 fn a_scrape_with_no_rollout_families_at_all_is_unavailable() {
-    // `metrics()` is the pre-rollout scrape: registered series and comparison
-    // counters, nothing else.
-    let ws = rollout().with_metrics(&metrics());
+    // `rollout_base()` is the pre-rollout scrape: the series this config's
+    // routes register, plus comparison counters, and nothing else.
+    let ws = rollout().with_metrics(&rollout_base());
     let model = ws.model();
     assert_failure_naming(&model, "no rollout truth");
     assert!(model.evidence.rollout.is_unavailable());

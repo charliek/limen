@@ -83,7 +83,11 @@ const WATCHED_SERIES: [&str; 8] = [
 
 /// The families whose `{route, reason}` labels a floored route's standing is
 /// computed from: sampled work that was *not* compared.
-const UNCOMPARED_SERIES: [&str; 3] = [
+///
+/// Public so `limen report --format html` requires them the same way
+/// [`validate_scrape`] does — per configured route, not per family — rather
+/// than keeping a second copy of the list that could drift from this one.
+pub const UNCOMPARED_SERIES: [&str; 3] = [
     SHADOW_SKIPPED_TOTAL,
     COMPARISON_SKIPPED_TOTAL,
     SHADOW_FAILED_TOTAL,
