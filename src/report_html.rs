@@ -37,8 +37,10 @@
 //! - **Artifacts are cross-checked, not trusted.** Sink counts are reconciled
 //!   against the verdict's per-route map, canary records against its
 //!   `canary_records`, verdict floors against the config's
-//!   `effective_min_comparisons()`, and every route id in an artifact against
-//!   the config's route table. Any disagreement is a named drift finding and a
+//!   `effective_min_comparisons()`, a floored route's `skipped` and
+//!   `shadow_failures` against the scrape's own per-route sums of the families
+//!   they were read from, and every route id in an artifact against the
+//!   config's route table. Any disagreement is a named drift finding and a
 //!   FAILURE: two artifacts that disagree cannot both describe this campaign.
 //! - **The gate is mirrored, not re-invented.** Where this page reads the same
 //!   input `limen verdict` reads, it takes the same position — including on
@@ -752,6 +754,26 @@ impl MetricsView {
             .flat_map(|f| f.rows.iter())
             .filter_map(|r| r.route.clone())
             .collect()
+    }
+
+    /// One family's samples for one route, summed across every remaining label
+    /// — the same label-subset sum [`crate::verdict::Scrape::sum`] takes when
+    /// it computes a floors row, read back off the rows this view already
+    /// validated as exact `u64`s.
+    ///
+    /// A route with no sample under the family sums to zero, which is safe
+    /// *here* only because the answer is compared against a verdict rather than
+    /// used as evidence on its own: an absent series and a registered zero
+    /// disagree with a non-zero verdict identically, and both are drift.
+    /// Saturating for the reason [`FloorDto::uncompared_total`] is — a wrapped
+    /// sum would read as zero, and agree.
+    fn route_sum(&self, family: &str, route: &str) -> u64 {
+        self.families
+            .iter()
+            .filter(|f| f.name == family)
+            .flat_map(|f| f.rows.iter())
+            .filter(|r| r.route.as_deref() == Some(route))
+            .fold(0u64, |sum, r| sum.saturating_add(r.value))
     }
 }
 
@@ -2422,6 +2444,70 @@ fn drift_findings(
                     "route {}: comparison-enabled and floored at {}, but the verdict carries no \
                      floors row for it",
                     route.id, route.floor
+                ));
+            }
+        }
+    }
+
+    // The verdict's uncompared counts against the scrape standing beside them.
+    //
+    // This is the pair that closes the loop the two claims on a floors row
+    // opened. `met` now rests on `skipped` and `shadow_failures`, and nothing
+    // asked whether those numbers matched the counters they were read from — so
+    // a verdict saying a floored route lost nothing, beside a scrape saying it
+    // lost three comparisons, rendered CLEAN. That is the defect this gate
+    // exists to remove, one level up: not a tool reporting success over work it
+    // did not do, but a page reporting success over two artifacts that disagree
+    // about whether the work happened.
+    //
+    // **Equality, not `scrape >= verdict`,** and that is a decision rather than
+    // an oversight. Counters only rise within one process and the documented
+    // workflow takes the scrape *after* the verdict (`docs/runbook.md` §8.3:
+    // take the verdict first, then render the page from the artifacts it left
+    // behind), so a scrape reading higher could be read as nothing but the
+    // clock. It is drift anyway, on two grounds. The verdict's numbers come off
+    // a pipeline `limen verdict` itself waited to quiesce with traffic stopped,
+    // so on the documented workflow there is nothing left to move these
+    // counters between the two reads and equality is what those artifacts
+    // really produce — the neighbouring sink reconciliation is equality on
+    // exactly that ground, and the sink is likewise read later than the verdict
+    // that counted it. And the direction monotonicity would forgive is
+    // precisely the one that hides the defect: uncompared work the gate did not
+    // see is uncompared work the gate did not gate on, whether it landed before
+    // the verdict or after it. The other direction — a verdict claiming skips
+    // no scrape ever recorded — cannot happen within one process at all, so it
+    // is two, which is drift by any reading.
+    if let (Some(verdict), Some(metrics)) = (verdict, metrics) {
+        for row in &verdict.floors {
+            // A verdict written before the gate makes no claim to check: its
+            // zeros are the absence of the fields, not a count of nothing, and
+            // a current scrape beside one may legitimately carry skips it never
+            // reported. `floor_met` is the one field that cannot be defaulted
+            // (see [`FloorDto`]), which makes its absence the marker for the
+            // whole pre-gate shape.
+            if row.floor_met.is_none() {
+                continue;
+            }
+            let skipped = [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL]
+                .iter()
+                .fold(0u64, |sum, family| {
+                    sum.saturating_add(metrics.route_sum(family, &row.route_id))
+                });
+            if skipped != row.skipped {
+                out.push(format!(
+                    "route {}: the verdict's floors row counted {} skip(s) against it, but the \
+                     scrape sums {skipped} across {SHADOW_SKIPPED_TOTAL} and \
+                     {COMPARISON_SKIPPED_TOTAL} for that route",
+                    row.route_id, row.skipped
+                ));
+            }
+            let failures = metrics.route_sum(SHADOW_FAILED_TOTAL, &row.route_id);
+            if failures != row.shadow_failures {
+                out.push(format!(
+                    "route {}: the verdict's floors row counted {} shadow failure(s) against \
+                     it, but the scrape sums {failures} across {SHADOW_FAILED_TOTAL} for that \
+                     route",
+                    row.route_id, row.shadow_failures
                 ));
             }
         }
