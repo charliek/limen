@@ -691,7 +691,7 @@ Layered, later overriding earlier: defaults < config file (`pharos.config.ts`/`.
 - Output mode (`local` | `ci`) — governs **reporting and recording** conventions only (Section 11, Section 10.2). Independent of `environment`: a production smoke run driven from CI legitimately wants CI-style reporting *and* the production safety profile at once.
 - `allow_destructive_tests` (default false).
 - `allow_recording_updates` (default false).
-- `min_scenarios` — the run's scenario floor (Section 11.5), default `1`. How many scenarios must actually **execute** for `run`/`record` to be trustworthy; mirrors limen's `min_comparisons`. `0` is accepted but inert — see Section 11.5. Unlike the other environment variables below, `MIN_SCENARIOS` fails closed: an empty, negative, fractional, or non-numeric value is a hard config error rather than silently falling back to the default, because a floor that silently defaults is a fresh false-green vector.
+- `min_scenarios` — the run's scenario floor (Section 11.5), default `1`. How many scenarios must actually **execute** for `run`/`record` to be trustworthy; mirrors limen's `min_comparisons`. `0` is accepted but inert — see Section 11.5. **`run` applies this value as configured** — including on a tag- or mode-narrowed run — but **`record` does not**: its narrowing to `legacy_record` is the command's definition rather than an operator's filter, so it gates on `min(min_scenarios, 1)` unless an explicit `--min-scenarios` overrides it (Section 11.5). Unlike the other environment variables below, `MIN_SCENARIOS` fails closed: an empty, negative, fractional, non-numeric, or larger-than-`Number.MAX_SAFE_INTEGER` value is a hard config error rather than silently falling back to the default — a floor that silently defaults is a fresh false-green vector, and a floor the runtime cannot represent exactly is one the run cannot honestly count against.
 - Redaction targets (headers, JSON paths, query params).
 
 Example environment variables:
@@ -994,14 +994,25 @@ export interface RunFloorResult {
   minScenarios: number;
   /** The floor's numerator — scenarios that actually executed. */
   executed: number;
-  /** The floor actually enforced: 1 for a `--scenario <id>` run, else `minScenarios`. */
+  /**
+   * The floor actually enforced: the effective floor after Section 11.5's
+   * command-specific rules and any explicit `--min-scenarios` override — `1`
+   * for a `--scenario <id>` run, `min(min_scenarios, 1)` for `record`,
+   * otherwise `minScenarios`. Under `min_scenarios: 20`, a `run` reports
+   * `applied: 20`; the same corpus under `record` gates on `applied: 1`, and
+   * on `applied: 3` with `record --min-scenarios 3`.
+   */
   applied: number;
   met: boolean;
   reason?: string;
 }
 
 export interface RunSummary {
-  /** Scenarios with a reported result (executed + parse-failed + gated). */
+  /**
+   * Scenarios with a reported result:
+   * `total = executed + parseFailed + refused + skipped` — equivalently
+   * `passed + failed + skipped`, or `discovered - filtered`.
+   */
   total: number;
   passed: number;
   failed: number;
@@ -1027,7 +1038,14 @@ export interface TestRunReport {
 }
 ```
 
-Written to `report_dir`. Report keys are camelCase (`startedAt`, `minScenarios`) while config keys are snake_case (`min_scenarios`) — the two vocabularies coexist on purpose: the on-disk config vocabulary is the portable one shared with limen, the report is a JSON document read by CI. Every discovered scenario file gets exactly one of `parseFailed`/`filtered`/(safety-)`skipped`/`refused`/`executed`, and `discovered` always equals their sum — a tool bug, not a bad run, if it doesn't (Section 11.5).
+Written to `report_dir`. Report keys are camelCase (`startedAt`, `minScenarios`) while config keys are snake_case (`min_scenarios`) — the two vocabularies coexist on purpose: the on-disk config vocabulary is the portable one shared with limen, the report is a JSON document read by CI. Two accounting invariants hold over these counts, and the harness asserts both — a violation is a tool bug, not a bad run, so it throws rather than reporting a smaller denominator (Section 11.5):
+
+```text
+discovered = filtered + parseFailed + skipped + refused + executed
+total      = parseFailed + skipped + refused + executed   ( = passed + failed + skipped )
+```
+
+The first says every discovered scenario file received exactly one terminal classification; the second says every classification that produces a reported result produced exactly one. A safety-`skipped` scenario is therefore counted in `total` but never in `executed` — it is a reported result that never ran, which is why it cannot serve the floor's numerator (Section 11.5).
 
 ### 11.3 JUnit report
 
