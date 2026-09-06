@@ -55,10 +55,14 @@ routes:
     mode: legacy_only
 "#;
 
-/// The series `prometheus::register_verdict_series` pre-touches at startup —
-/// what any live limen renders from its very first scrape, and exactly the set
-/// `verdict::REQUIRED_SERIES` refuses to read as absent. Transcribed from that
-/// function rather than invented, so a change to either side shows up here.
+/// The series limen pre-touches before traffic —
+/// `prometheus::register_verdict_series` process-wide and
+/// `prometheus::register_skip_series` per route — i.e. what any live limen
+/// renders from its very first scrape, and exactly the set
+/// `verdict::REQUIRED_SERIES` refuses to read as absent. Transcribed from those
+/// functions rather than invented, so a change to either side shows up here;
+/// the per-route half is abridged to one reason per family, since presence is
+/// what the page turns on.
 const REGISTERED: &str = "\
 limen_shadow_in_flight 0
 limen_diff_sink_enqueued_total 0
@@ -66,6 +70,9 @@ limen_diff_sink_written_total 0
 limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
 limen_diff_sink_dropped_total{reason=\"io_error\"} 0
 limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
+limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0
+limen_comparison_skipped_total{route=\"a\",reason=\"request_too_large\"} 0
+limen_shadow_failed_total{route=\"a\",reason=\"error\"} 0
 ";
 
 /// A busy proxy's scrape: the registered series, plus the lazily-registered
@@ -502,19 +509,16 @@ fn a_metrics_file_missing_a_required_family_is_unavailable() {
     assert_eq!(model.banner.state, BannerState::Failure, "{}", why(&model));
 }
 
-/// The bug a real end-to-end run found. A service that never skipped a
-/// comparison and never failed a shadow exports neither
-/// `limen_comparison_skipped_total` nor `limen_shadow_failed_total` — those
-/// counters register on their first event. The live verdict against that same
-/// process exits 0, so a page that called it FAILURE was stricter than the gate
-/// it claims to report on.
+/// A service that never skipped a comparison is still accepted — but for a
+/// different reason than it used to be. Those counters no longer register on
+/// their first event: they gate a floored route now, so limen pre-touches them
+/// per route at zero, and the page reads a real zero instead of tolerating an
+/// absence. `limen_shadow_requests_total` is the family that kept the old
+/// tolerance, and a quiet, healthy proxy still depends on it.
 #[test]
 fn a_scrape_from_a_service_that_never_skipped_is_accepted() {
     let ws = canonical().with_metrics(&format!(
-        "{REGISTERED}\
-limen_comparisons_total{{route=\"a\",result=\"match\"}} 3
-limen_shadow_requests_total{{route=\"a\"}} 3
-"
+        "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
     ));
     let model = ws.model();
     assert!(
@@ -524,11 +528,50 @@ limen_shadow_requests_total{{route=\"a\"}} 3
     );
     assert_eq!(model.banner.state, BannerState::Clean, "{}", why(&model));
 
-    // The absent families are named on the page, not passed over in silence.
+    // The one absent family is named on the page, not passed over in silence.
     let html = ws.page();
-    assert!(html.contains("limen_comparison_skipped_total"));
+    assert!(html.contains("limen_shadow_requests_total"));
     assert!(html.contains("ABSENT"));
     assert!(html.contains("first event of its kind"));
+}
+
+/// The version boundary. A scrape captured from a limen older than the gating
+/// change carries none of the three uncompared families, and the page must not
+/// read three absent gating counters as three zeros: it refuses the artifact
+/// and names what is missing, so the operator knows to rebuild rather than to
+/// trust the page.
+///
+/// Pinned here at the standing this commit gives it — refused, named, and not
+/// a clean result. (The FloorDto fields, the Uncompared column, and softening
+/// this particular refusal from FAILURE to INCOMPLETE are the status page's own
+/// commit; this test exists so that commit cannot silently drop the refusal.)
+#[test]
+fn a_scrape_from_a_pre_gating_limen_is_refused_by_name() {
+    for family in [
+        "limen_comparison_skipped_total",
+        "limen_shadow_skipped_total",
+        "limen_shadow_failed_total",
+    ] {
+        let pre_gating: String = REGISTERED
+            .lines()
+            .filter(|l| !l.starts_with(family))
+            .map(|l| format!("{l}\n"))
+            .collect();
+        let ws = canonical().with_metrics(&format!(
+            "{pre_gating}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
+        ));
+        let model = ws.model();
+        match &model.evidence.metrics {
+            Section::Unavailable(reason) => assert!(reason.contains(family), "{reason}"),
+            other => panic!("expected {family} to be required, got {other:?}"),
+        }
+        assert_ne!(
+            model.banner.state,
+            BannerState::Clean,
+            "a scrape that cannot show the gating counters is never clean: {}",
+            why(&model)
+        );
+    }
 }
 
 /// Even a proxy that has served nothing at all renders: only the four series

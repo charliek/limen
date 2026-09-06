@@ -80,26 +80,31 @@ use crate::verdict::{Sample, Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
 /// what an *absent* family is allowed to mean — mirroring
 /// [`crate::verdict`]'s contract exactly rather than restating it:
 ///
-/// - [`Absence::Required`] is [`crate::verdict::REQUIRED_SERIES`], the four
-///   series `register_verdict_series` pre-touches at startup. Absent, a verdict
-///   is exit 50; absent, this section is unavailable.
+/// - [`Absence::Required`] is [`crate::verdict::REQUIRED_SERIES`], the series
+///   limen pre-touches before traffic. Absent, a verdict is exit 50; absent,
+///   this section is unavailable.
 /// - [`Absence::ReadsAsZero`] is what `verdict::evaluate_floors` does with an
 ///   absent `limen_comparisons_total`: reads it as zero, which is fail-closed
 ///   only because a floored route needs at least one comparison to pass.
 /// - [`Absence::Informational`] is what `verdict::collect_informational` does:
 ///   iterate whatever is there and gate on none of it.
 ///
-/// Every family but the required four is registered *lazily*, on the first
-/// event of its kind, so a proxy that never skipped a comparison exports no
-/// `limen_comparison_skipped_total` at all. Requiring those families made this
-/// page stricter than the gate it claims to mirror — every quiet, healthy
-/// service rendered FAILURE.
+/// The three uncompared families moved from `Informational` to `Required` when
+/// they started gating a floored route: they are now pre-registered per route
+/// at zero, so their absence is a scrape from a limen older than this tool.
+/// The page refuses such a scrape by name — the metrics section reads
+/// `UNAVAILABLE` and the banner is never CLEAN, which is the property that
+/// matters. The refusal currently lands as FAILURE, the same standing as a
+/// scrape that could not be parsed at all; separating a version boundary from
+/// a corrupt artifact would want its own banner state. The lazily-registered remainder
+/// keeps its tolerance: requiring a family a healthy quiet proxy never touches
+/// made this page stricter than the gate it claims to mirror.
 const FAMILIES: [(&str, Absence); 9] = [
     (COMPARISONS_TOTAL, Absence::ReadsAsZero),
-    (COMPARISON_SKIPPED_TOTAL, Absence::Informational),
+    (COMPARISON_SKIPPED_TOTAL, Absence::Required),
     (SHADOW_TOTAL, Absence::Informational),
-    (SHADOW_SKIPPED_TOTAL, Absence::Informational),
-    (SHADOW_FAILED_TOTAL, Absence::Informational),
+    (SHADOW_SKIPPED_TOTAL, Absence::Required),
+    (SHADOW_FAILED_TOTAL, Absence::Required),
     (SHADOW_IN_FLIGHT, Absence::Required),
     (DIFF_SINK_ENQUEUED_TOTAL, Absence::Required),
     (DIFF_SINK_WRITTEN_TOTAL, Absence::Required),
@@ -530,8 +535,9 @@ impl Absence {
             // Unreachable in a rendered section — a required family absent
             // makes the whole section unavailable — but stated for symmetry.
             Absence::Required => {
-                "absent — this series is registered at startup, so its absence means the \
-                 scrape did not come from a limen control plane"
+                "absent — this series is registered before traffic, so its absence means the \
+                 scrape did not come from a limen control plane, or came from one older than \
+                 this tool"
             }
             Absence::ReadsAsZero => {
                 "absent from the scrape. `limen verdict` reads this as zero comparisons, which \
@@ -592,8 +598,8 @@ impl MetricsView {
             if !present && absence == Absence::Required {
                 return Err(format!(
                     "required metric family {name} is absent from the scrape — limen registers \
-                     it at startup, so its absence is a scrape of something else, never a zero \
-                     count"
+                     it before serving traffic, so its absence is a scrape of something else \
+                     (or of a limen older than this tool), never a zero count"
                 ));
             }
             let mut rows = Vec::new();
@@ -3732,8 +3738,10 @@ mod tests {
         assert!(serde_json::from_value::<VerdictDto>(serde_json::json!({"hello": 1})).is_err());
     }
 
-    /// The four series `register_verdict_series` pre-touches at startup — the
-    /// exposition any live limen renders from its very first scrape.
+    /// The series limen pre-touches before traffic — `register_verdict_series`
+    /// process-wide, `register_skip_series` per route — i.e. the exposition any
+    /// live limen renders from its very first scrape. Abridged to one reason
+    /// per uncompared family: presence is what the page tests turn on.
     const REGISTERED: &str = "\
 limen_shadow_in_flight 0
 limen_diff_sink_enqueued_total 0
@@ -3741,6 +3749,9 @@ limen_diff_sink_written_total 0
 limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
 limen_diff_sink_dropped_total{reason=\"io_error\"} 0
 limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
+limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0
+limen_comparison_skipped_total{route=\"a\",reason=\"response_too_large\"} 0
+limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0
 ";
 
     /// The page must require exactly what `limen verdict` requires — no more,
@@ -3764,6 +3775,9 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             "limen_shadow_in_flight 0\n\
              limen_diff_sink_enqueued_total 0\n\
              limen_diff_sink_written_total 0\n\
+             limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0\n\
+             limen_comparison_skipped_total{route=\"a\",reason=\"event_stream\"} 0\n\
+             limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0\n\
              limen_comparisons_total{route=\"a\",result=\"match\"} 1\n",
         )
         .unwrap();
@@ -3772,15 +3786,16 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
         assert!(err.contains("never a zero count"), "{err}");
     }
 
-    /// The bug a real run found: a service that never skipped a comparison
-    /// exports no `limen_comparison_skipped_total` at all, because that
-    /// counter is registered on its first event. The live verdict against that
-    /// same process exits 0, so the page must render it too.
+    /// A family still registered on its first event may legitimately be
+    /// absent, and says so on the page rather than reading as a silent zero.
+    /// The three uncompared families no longer qualify — they gate now, so
+    /// they are pre-registered per route and required — but
+    /// `limen_shadow_requests_total` is untouched by that change, and its
+    /// tolerance is the property a quiet, healthy proxy still depends on.
     #[test]
     fn a_lazily_registered_family_may_be_absent() {
         let scrape = Scrape::parse(&format!(
-            "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n\
-             limen_shadow_requests_total{{route=\"a\"}} 3\n"
+            "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
         ))
         .unwrap();
         let view = MetricsView::from_scrape(&scrape).expect("a quiet proxy is still a proxy");
@@ -3792,18 +3807,34 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             .collect();
         assert_eq!(
             absent,
-            [
-                COMPARISON_SKIPPED_TOTAL,
-                SHADOW_SKIPPED_TOTAL,
-                SHADOW_FAILED_TOTAL
-            ],
+            [SHADOW_TOTAL],
             "only the lazily-registered families are absent"
         );
-        // …and every one of them says so on the page rather than reading as a
-        // silent zero.
         for family in view.families.iter().filter(|f| !f.present) {
             assert_eq!(family.absence, Absence::Informational);
             assert!(family.absence.note().contains("first event of its kind"));
+        }
+    }
+
+    /// The version boundary, on the page's own read: a scrape from a limen
+    /// older than the gating change carries none of the three uncompared
+    /// families, and the page refuses it by name rather than reading three
+    /// absent gating counters as three zeros.
+    #[test]
+    fn a_scrape_without_the_uncompared_families_is_refused_by_name() {
+        for family in [
+            COMPARISON_SKIPPED_TOTAL,
+            SHADOW_SKIPPED_TOTAL,
+            SHADOW_FAILED_TOTAL,
+        ] {
+            let text: String = REGISTERED
+                .lines()
+                .filter(|l| !l.starts_with(family))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let scrape = Scrape::parse(&text).unwrap();
+            let err = MetricsView::from_scrape(&scrape).unwrap_err();
+            assert!(err.contains(family), "{err}");
         }
     }
 

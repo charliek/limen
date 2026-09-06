@@ -48,8 +48,9 @@ use tokio::time::Instant;
 
 use crate::config::model::Config;
 use crate::observability::prometheus::{
-    COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL,
-    DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT, SHADOW_SKIPPED_TOTAL,
+    expected_skip_series, COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL,
+    DIFF_SINK_ENQUEUED_TOTAL, DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT,
+    SHADOW_SKIPPED_TOTAL,
 };
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
 
@@ -65,12 +66,27 @@ pub const RESERVED_ROUTE_ID_PREFIX: &str = "__";
 /// The series whose values this verdict's math rests on: watched for
 /// stability by the drain loop and validated as exact integers before any
 /// comparison trusts them.
-const WATCHED_SERIES: [&str; 5] = [
+const WATCHED_SERIES: [&str; 8] = [
     SHADOW_IN_FLIGHT,
     DIFF_SINK_ENQUEUED_TOTAL,
     DIFF_SINK_WRITTEN_TOTAL,
     DIFF_SINK_DROPPED_TOTAL,
     COMPARISONS_TOTAL,
+    // The three gating families: a skip landing between two scrapes is exactly
+    // the mid-flight state the drain loop must not conclude over, and their
+    // counts now decide a floor, so they get the same exact-integer validation
+    // as the counts they sit beside.
+    SHADOW_SKIPPED_TOTAL,
+    COMPARISON_SKIPPED_TOTAL,
+    SHADOW_FAILED_TOTAL,
+];
+
+/// The families whose `{route, reason}` labels a floored route's standing is
+/// computed from: sampled work that was *not* compared.
+const UNCOMPARED_SERIES: [&str; 3] = [
+    SHADOW_SKIPPED_TOTAL,
+    COMPARISON_SKIPPED_TOTAL,
+    SHADOW_FAILED_TOTAL,
 ];
 
 // ---------------------------------------------------------------------------
@@ -85,8 +101,10 @@ pub enum VerdictCode {
     Clean,
     /// Non-canary mismatches were recorded (and the pipeline is trustworthy).
     Mismatches,
-    /// At least one floored route compared fewer times than its floor — or
-    /// the config floors nothing at all.
+    /// A floored route did not produce trustworthy evidence: it compared fewer
+    /// times than its floor (*starved*), or it met its floor but some of its
+    /// sampled work went uncompared — skipped or failed on the shadow leg
+    /// (*undermined*) — or the config floors nothing at all.
     FloorsUnmet,
     /// The sink and the engine's counters disagree: drops, torn lines,
     /// per-route divergence, an unknown counter route, or a bad canary.
@@ -208,6 +226,24 @@ impl Scrape {
     /// Whether the family has at least one sample (zero-registered counts).
     pub fn has_family(&self, name: &str) -> bool {
         self.family(name).next().is_some()
+    }
+
+    /// Whether one *series* — a family plus an exact label subset — has at
+    /// least one sample.
+    ///
+    /// Deliberately not [`Scrape::sum`] with the same labels. `sum` reports
+    /// absence for the whole *family*: it sets its "anything here?" flag while
+    /// iterating, before the label filter, so a route with no sample under a
+    /// family some *other* route populated sums to `Some(0.0)` — a zero
+    /// indistinguishable from a registered one. That is exactly the hole a
+    /// per-route gate falls into, so presence is proved here first and `sum`'s
+    /// semantics are left untouched for the callers that depend on them.
+    pub fn has_series(&self, name: &str, labels: &[(&str, &str)]) -> bool {
+        self.family(name).any(|s| {
+            labels
+                .iter()
+                .all(|(k, v)| s.labels.get(*k).map(String::as_str) == Some(*v))
+        })
     }
 
     /// Sum a family's samples, optionally constrained to label subset matches.
@@ -359,19 +395,48 @@ impl Check {
     }
 }
 
-/// One floored route's standing.
+/// Sampled work on a floored route that never became a comparison, keyed by
+/// the counter family that recorded it and its reason.
+#[derive(Debug, Clone, Serialize)]
+pub struct Uncompared {
+    pub metric: String,
+    pub reason: String,
+    pub count: u64,
+}
+
+/// One floored route's standing: the arithmetic claim (`floor_met`) and the
+/// evidence claim (`met`), which are not the same question.
+///
+/// A skip is always *sampled-then-not-compared* work — every skip site sits
+/// downstream of the sampling gate — so a route can sit at its floor while a
+/// slice of the traffic it was asked to vouch for went unexamined. `met` stays
+/// the "this route's evidence is good" flag, which is what an older HTML reader
+/// that knows only `met` reads: it fails closed on an undermined route rather
+/// than rendering it clean.
 #[derive(Debug, Clone, Serialize)]
 pub struct RouteFloor {
     pub route_id: String,
     pub comparisons: u64,
     pub floor: u64,
+    /// `comparisons >= floor` — the count alone.
+    pub floor_met: bool,
+    /// `limen_shadow_skipped_total` + `limen_comparison_skipped_total` on this
+    /// route, across every reason.
+    pub skipped: u64,
+    /// `limen_shadow_failed_total` on this route (timeout + error) — a finding
+    /// about the new upstream, not about this tool.
+    pub shadow_failures: u64,
+    /// The per-reason breakdown behind those two totals.
+    pub uncompared: Vec<Uncompared>,
+    /// `floor_met && skipped == 0 && shadow_failures == 0`.
     pub met: bool,
 }
 
-/// An informational (non-gating) counter surfaced for inspection: shadows and
-/// comparisons that were skipped or failed. Gating these is deliberately
-/// staged for a later phase; a verdict still shows them so starvation causes
-/// are diagnosable from its output alone.
+/// A non-gating counter surfaced for inspection: shadows and comparisons that
+/// were skipped or failed on a route with **no floor** (`min_comparisons: 0`),
+/// or on a route the config does not declare. A floored route's counts are not
+/// here — they are in its [`RouteFloor`], where they gate — so the same number
+/// is never printed twice under two contradictory framings.
 #[derive(Debug, Clone, Serialize)]
 pub struct InfoCounter {
     pub metric: String,
@@ -544,7 +609,7 @@ pub fn evaluate(
         canary_records,
         floors,
         sink_mismatches_by_route,
-        informational: collect_informational(scrape),
+        informational: collect_informational(config, scrape),
     };
     let code = verdict.code(drain);
     verdict.verdict = code.name();
@@ -552,14 +617,66 @@ pub fn evaluate(
     verdict
 }
 
-/// The floors check: every enabled route with a non-zero floor must have
-/// recorded at least that many comparisons; a config that floors nothing
-/// fails outright (a verdict over it would prove nothing).
-fn evaluate_floors(config: &Config, scrape: &Scrape) -> (Check, Vec<RouteFloor>) {
-    let floored: Vec<&crate::config::model::RouteConfig> = config
+/// The set of route ids this config floors — comparison-enabled with a
+/// non-zero effective floor. The one definition of "floored", shared by the
+/// floors check and by [`collect_informational`], which partitions on it.
+fn floored_route_ids(config: &Config) -> BTreeSet<&str> {
+    config
         .routes
         .iter()
         .filter(|r| r.comparison.enabled && r.comparison.effective_min_comparisons() > 0)
+        .map(|r| r.id.as_str())
+        .collect()
+}
+
+/// What an operator should change, keyed on the reason the work went
+/// uncompared. Every line names a knob (or, for a shadow failure, says the
+/// finding is about `new` and not about limen), because "N skipped" without a
+/// remedy is a dead end at exactly the moment a campaign is blocked.
+fn remedy_for(metric: &str, reason: &str, count: u64) -> String {
+    if metric == SHADOW_FAILED_TOTAL {
+        return format!(
+            "the new upstream failed to answer {count} shadow(s) ({reason}) — a finding \
+             about `new`, not tooling noise; read its logs before re-running"
+        );
+    }
+    match reason {
+        "response_too_large" => "raise `comparison.max_body_bytes` on this route (default \
+             262144); the largest bodies are the ones that went uncompared"
+            .to_string(),
+        "request_too_large" => "only on routes with `shadow_methods`: the opted-in write's \
+             request body exceeded `comparison.max_body_bytes`; raise it or drop the opt-in"
+            .to_string(),
+        "concurrency_limit" => "`server.shadow_concurrency_limit` is GLOBAL; a slow-on-`new` \
+             route holds a slot until its shadow completes or `shadow_ms` expires, so the \
+             route that consumed the slots may be a different one — raise the cap or lower \
+             drive concurrency"
+            .to_string(),
+        "response_buffer_timeout" => "the primary answered too slowly to buffer within \
+             `timeouts.primary_ms`; raise the budget or lower the load"
+            .to_string(),
+        // Unsatisfiable by construction: every sampled request on this route
+        // skips on content type before a byte is buffered, so no amount of
+        // driving can move the comparison count off zero while it is floored.
+        "event_stream" => "this route streams, so it can never meet a floor while it has \
+             one — every sampled request is skipped on content type before a byte is \
+             buffered; unfloor it (`min_comparisons: 0`) and relay it (`legacy_only`)"
+            .to_string(),
+        other => format!("uncompared sampled work on this route ({other})"),
+    }
+}
+
+/// The floors check: every enabled route with a non-zero floor must have
+/// recorded at least that many comparisons **and** have left no sampled work
+/// uncompared; a config that floors nothing fails outright (a verdict over it
+/// would prove nothing — and, now that skips gate, unflooring is the tempting
+/// way to silence this check).
+fn evaluate_floors(config: &Config, scrape: &Scrape) -> (Check, Vec<RouteFloor>) {
+    let floored = floored_route_ids(config);
+    let floored: Vec<&crate::config::model::RouteConfig> = config
+        .routes
+        .iter()
+        .filter(|r| floored.contains(r.id.as_str()))
         .collect();
     if floored.is_empty() {
         return (
@@ -572,37 +689,119 @@ fn evaluate_floors(config: &Config, scrape: &Scrape) -> (Check, Vec<RouteFloor>)
     }
     let mut rows = Vec::with_capacity(floored.len());
     let mut starved = Vec::new();
+    let mut undermined = Vec::new();
+    let mut remedies = Vec::new();
     for route in floored {
         // Absent-from-scrape deliberately reads as 0 here: with a floor >= 1
-        // that is fail-closed (the whole point of the floor).
+        // that is fail-closed (the whole point of the floor). The uncompared
+        // sums below are a different matter — a zero there is *permissive*, so
+        // it has to be earned: `validate_scrape` has already required this
+        // exact route's series under each of the three families, one series at
+        // a time, so their zero is a fact rather than an assumption. Nothing
+        // weaker would do: `sum` answers `Some(0.0)` for a route with no
+        // sample as soon as any other route has one.
         let comparisons = scrape
             .sum(COMPARISONS_TOTAL, &[("route", &route.id)])
             .unwrap_or(0.0) as u64;
         let floor = route.comparison.effective_min_comparisons();
-        let met = comparisons >= floor;
-        if !met {
+        let floor_met = comparisons >= floor;
+
+        // `sum` matches a label subset, so this adds every reason (and every
+        // duplicate sample) the family carries for this route.
+        let skipped = [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL]
+            .iter()
+            .map(|m| scrape.sum(m, &[("route", &route.id)]).unwrap_or(0.0) as u64)
+            .sum::<u64>();
+        let shadow_failures = scrape
+            .sum(SHADOW_FAILED_TOTAL, &[("route", &route.id)])
+            .unwrap_or(0.0) as u64;
+        let uncompared = uncompared_rows(scrape, &route.id);
+        let met = floor_met && skipped == 0 && shadow_failures == 0;
+
+        if !floor_met {
             starved.push(route.id.clone());
+        } else if !met {
+            undermined.push(route.id.clone());
         }
+        // Emitted for any route carrying uncompared work, starved or not: a
+        // route can be both, and the operator needs the knob either way.
+        for row in &uncompared {
+            remedies.push(format!(
+                "   {} [{}={} ×{}]: {}",
+                route.id,
+                row.metric,
+                row.reason,
+                row.count,
+                remedy_for(&row.metric, &row.reason, row.count)
+            ));
+        }
+
         rows.push(RouteFloor {
             route_id: route.id.clone(),
             comparisons,
             floor,
+            floor_met,
+            skipped,
+            shadow_failures,
+            uncompared,
             met,
         });
     }
-    let check = if starved.is_empty() {
+    let check = if rows.iter().all(|r| r.met) {
         Check::pass(format!(
-            "{} floored route(s) all at/above floor",
+            "{} floored route(s) all at/above floor, with no uncompared sampled work",
             rows.len()
         ))
     } else {
-        Check::fail(format!(
-            "route(s) below their comparison floor: {} — a route that never compared \
-             cannot contribute a mismatch, so a clean total proves nothing about it",
-            starved.join(", ")
-        ))
+        let mut problems = Vec::new();
+        if !starved.is_empty() {
+            problems.push(format!(
+                "starved — below their comparison floor: {} — a route that never compared \
+                 cannot contribute a mismatch, so a clean total proves nothing about it",
+                starved.join(", ")
+            ));
+        }
+        if !undermined.is_empty() {
+            problems.push(format!(
+                "undermined — at their floor but with sampled work that was never compared: \
+                 {} — the count overstates what was actually verified",
+                undermined.join(", ")
+            ));
+        }
+        let mut detail = problems.join("; ");
+        for remedy in &remedies {
+            detail.push('\n');
+            detail.push_str(remedy);
+        }
+        Check::fail(detail)
     };
     (check, rows)
+}
+
+/// One route's uncompared work, per `{metric, reason}`, zeros omitted.
+/// Duplicate samples of the same pair are summed rather than listed twice —
+/// the exposition may legally repeat a series, and two rows saying `×1` would
+/// misrepresent one count as two findings.
+fn uncompared_rows(scrape: &Scrape, route_id: &str) -> Vec<Uncompared> {
+    let mut totals: BTreeMap<(&str, String), u64> = BTreeMap::new();
+    for metric in UNCOMPARED_SERIES {
+        for sample in scrape.family(metric) {
+            if sample.labels.get("route").map(String::as_str) != Some(route_id) {
+                continue;
+            }
+            let reason = sample.labels.get("reason").cloned().unwrap_or_default();
+            *totals.entry((metric, reason)).or_default() += sample.value as u64;
+        }
+    }
+    totals
+        .into_iter()
+        .filter(|(_, count)| *count > 0)
+        .map(|((metric, reason), count)| Uncompared {
+            metric: metric.to_string(),
+            reason,
+            count,
+        })
+        .collect()
 }
 
 /// The sink-integrity check: drops, torn lines, per-route counter/sink
@@ -624,13 +823,39 @@ fn evaluate_integrity(config: &Config, scrape: &Scrape, report: &Report) -> Chec
     }
 
     // Counter routes the config has never heard of: a config edited after the
-    // proxy started, or a scrape aimed at a different limen instance.
+    // proxy started, or a scrape aimed at a different limen instance. The
+    // uncompared families are read with the same suspicion as the comparison
+    // counter now that a floor turns on them — a skip attributed to a route
+    // this config does not declare is the same drift, told by a different
+    // series, and reading it as "not my route, therefore harmless" would let a
+    // wrong-instance scrape pass the very check it should trip.
     let known: BTreeSet<&str> = config.routes.iter().map(|r| r.id.as_str()).collect();
-    let unknown: Vec<String> = scrape
-        .label_values(COMPARISONS_TOTAL, "route")
-        .into_iter()
-        .filter(|r| !r.starts_with(RESERVED_ROUTE_ID_PREFIX) && !known.contains(r.as_str()))
-        .collect();
+    let mut unknown: BTreeSet<String> = BTreeSet::new();
+    // `limen_comparisons_total` keeps the reserved-namespace exemption: the
+    // sink canary is a real, legitimate producer there, and every campaign
+    // scrape carries its row.
+    unknown.extend(
+        scrape
+            .label_values(COMPARISONS_TOTAL, "route")
+            .into_iter()
+            .filter(|r| !r.starts_with(RESERVED_ROUTE_ID_PREFIX) && !known.contains(r.as_str())),
+    );
+    // The uncompared families get **no** such exemption. The reserved
+    // namespace exists for limen's own canary, which rides the compare → sink
+    // path and produces sink records and comparison counters — it never skips
+    // and never fails a shadow, so under these three families there is nothing
+    // legitimate to exempt. Exempting it anyway would leave one namespace in
+    // which a whole route's uncompared work is invisible to this check while
+    // the config has never heard of it, which is the drift the check is for.
+    for metric in UNCOMPARED_SERIES {
+        unknown.extend(
+            scrape
+                .label_values(metric, "route")
+                .into_iter()
+                .filter(|r| !known.contains(r.as_str())),
+        );
+    }
+    let unknown: Vec<String> = unknown.into_iter().collect();
     if !unknown.is_empty() {
         problems.push(format!(
             "counter route(s) not in this config: {} — config drift or wrong instance",
@@ -709,8 +934,16 @@ fn evaluate_canary(scrape: &Scrape, canary_records: u64, requested: bool) -> Che
 }
 
 /// Skip/failure counters surfaced for inspection (non-gating; see
-/// [`InfoCounter`]).
-fn collect_informational(scrape: &Scrape) -> Vec<InfoCounter> {
+/// [`InfoCounter`]) — the unfloored routes only, plus any route the config
+/// does not declare (which the integrity check is failing anyway, and which
+/// must not vanish from the output on its way there).
+///
+/// Filtered on the **config's** floored set rather than on the `floors` rows:
+/// `--offline` produces no floor rows at all, and partitioning on those would
+/// silently widen the offline listing to every route while claiming to be the
+/// same rule.
+fn collect_informational(config: &Config, scrape: &Scrape) -> Vec<InfoCounter> {
+    let floored = floored_route_ids(config);
     let mut rows = Vec::new();
     for metric in [
         SHADOW_SKIPPED_TOTAL,
@@ -719,6 +952,12 @@ fn collect_informational(scrape: &Scrape) -> Vec<InfoCounter> {
     ] {
         for s in scrape.family(metric) {
             if s.value == 0.0 {
+                continue;
+            }
+            if s.labels
+                .get("route")
+                .is_some_and(|r| floored.contains(r.as_str()))
+            {
                 continue;
             }
             rows.push(InfoCounter {
@@ -736,23 +975,134 @@ fn collect_informational(scrape: &Scrape) -> Vec<InfoCounter> {
 // The online run: canary trigger, drain loop, sink read
 // ---------------------------------------------------------------------------
 
-/// Series whose presence in the scrape is mandatory: their absence means the
+/// Families whose presence in the scrape is mandatory: their absence means the
 /// instrumentation the whole verdict rests on is missing (a proxy older than
 /// the verdict tool, or a renderer regression) — never "zero events".
 ///
-/// These four and no others, because these four and no others are pre-touched
-/// at startup by [`crate::observability::prometheus::register_verdict_series`].
-/// Every other family limen exports is registered lazily, on the first event of
-/// its kind, so a proxy that has never skipped a comparison genuinely exports
-/// no `limen_comparison_skipped_total` — requiring it would fail every quiet,
-/// healthy run. Public so `limen report --format html` can mirror this contract
-/// rather than restate it (see [`crate::report_html`]).
-pub const REQUIRED_SERIES: [&str; 4] = [
+/// These seven and no others, because these seven and no others are pre-touched
+/// before traffic: the four process-wide pipeline series by
+/// [`crate::observability::prometheus::register_verdict_series`], and the three
+/// route-labelled uncompared families by
+/// [`crate::observability::prometheus::register_skip_series`]. The uncompared
+/// families joined the set when they started gating a floor — a check may not
+/// rest on a family it cannot tell "absent" from "zero" on — and their absence
+/// is now a *version boundary*: a proxy older than this tool exports none of
+/// them, and says so as exit 50 rather than as a green run over evidence
+/// nobody could see. Every other family limen exports is still registered
+/// lazily, on the first event of its kind. Public so `limen report --format
+/// html` can mirror this contract rather than restate it (see
+/// [`crate::report_html`]).
+///
+/// This list is the *family*-level contract, which is all a reader holding a
+/// scrape and no config can check. [`validate_scrape`] holds the config, so it
+/// requires the three uncompared families one series at a time — every
+/// configured route × every reason, from
+/// [`crate::observability::prometheus::expected_skip_series`] — and skips them
+/// here. A family-level check alone would let one route's skips vouch for
+/// every other route.
+pub const REQUIRED_SERIES: [&str; 7] = [
     SHADOW_IN_FLIGHT,
     DIFF_SINK_ENQUEUED_TOTAL,
     DIFF_SINK_WRITTEN_TOTAL,
     DIFF_SINK_DROPPED_TOTAL,
+    SHADOW_SKIPPED_TOTAL,
+    COMPARISON_SKIPPED_TOTAL,
+    SHADOW_FAILED_TOTAL,
 ];
+
+/// Everything a scrape must satisfy before any check reads a number off it:
+/// the required series are present, every watched count is an exact integer,
+/// and every sample under a gating family carries the labels the gate reads.
+///
+/// Pure and public so the drain loop and a test can hold the same contract:
+/// each failure is [`InputUnavailable`] (exit 50), never a downgraded verdict,
+/// because a scrape limen cannot read is a fact about the tooling and not about
+/// the migration.
+///
+/// Takes the config because the uncompared families are required **per
+/// series**, not per family: see the loop below.
+pub fn validate_scrape(config: &Config, scrape: &Scrape) -> Result<(), InputUnavailable> {
+    for series in REQUIRED_SERIES {
+        // The uncompared families are required route by route just below,
+        // which is strictly stronger — and which, unlike a family-level check,
+        // demands nothing of a config that declares no routes (where the
+        // registrar emits nothing either, so the honest answer is "no
+        // instrumentation was owed", not "older binary").
+        if UNCOMPARED_SERIES.contains(&series) {
+            continue;
+        }
+        if !scrape.has_family(series) {
+            return Err(InputUnavailable(format!(
+                "required series {series} absent from the scrape — the proxy is not \
+                 exporting the verdict instrumentation (older binary?)"
+            )));
+        }
+    }
+    // The route-labelled half of the version boundary, and the reason the
+    // floors check may read a route's zero as a fact.
+    //
+    // A family-level "is this metric here at all?" check does not survive
+    // contact with a real campaign: `Scrape::sum` reports absence per *family*
+    // (it sets `any` while iterating, before the label filter), so one route
+    // that skipped once makes every other route's `sum(.., route=..)` return
+    // `Some(0.0)`. Against an older, lazily-registering proxy that recorded a
+    // skip somewhere — a long campaign always does — all three families exist,
+    // a family-level check passes, and a floored route with no samples at all
+    // reads `skipped = 0, shadow_failures = 0` and is declared met. That is the
+    // false green this gate exists to kill, wearing the gate's own colours.
+    //
+    // So require exactly what `register_skip_series` registers, from the same
+    // enumeration it registers from: every configured route × every uncompared
+    // family × every reason of that family.
+    for (route_id, family, reason) in
+        expected_skip_series(config.routes.iter().map(|r| r.id.as_str()))
+    {
+        if !scrape.has_series(family, &[("route", route_id), ("reason", reason)]) {
+            return Err(InputUnavailable(format!(
+                "required series {family}{{route=\"{route_id}\",reason=\"{reason}\"}} \
+                 absent from the scrape — this proxy predates the gate that reads it \
+                 (older binary?): it registers this family lazily, so a route it never \
+                 skipped on says nothing where a current limen says zero, and nothing \
+                 cannot be gated on"
+            )));
+        }
+    }
+    // Every count this verdict compares must be an exact integer: past 2^53 an
+    // f64 `==` can equate values that differ by one, which is precisely the
+    // discrepancy the integrity checks exist to catch (adversarial review).
+    // Validated once here so every downstream comparison and cast works on
+    // exact values.
+    for name in WATCHED_SERIES {
+        for sample in scrape.family(name) {
+            let v = sample.value;
+            if v.fract() != 0.0 || !(0.0..9_007_199_254_740_992.0).contains(&v) {
+                return Err(InputUnavailable(format!(
+                    "series {name} carries a non-exact count ({v}) — refusing \
+                     float-imprecise integrity math"
+                )));
+            }
+        }
+    }
+    // A gating family's labels are limen's own exposition, not operator input:
+    // a sample without a `route` cannot be attributed to a floor, and one
+    // without a `reason` cannot be given a remedy. Either means the renderer
+    // regressed, so it fails closed rather than being silently attributed to
+    // the empty route.
+    for name in UNCOMPARED_SERIES {
+        for sample in scrape.family(name) {
+            for label in ["route", "reason"] {
+                if !sample.labels.contains_key(label) {
+                    return Err(InputUnavailable(format!(
+                        "series {name} carries a sample with no `{label}` label — limen \
+                         labels every sample of this family, so this is a renderer \
+                         regression, not a quiet zero"
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
 
 /// Run the full verdict. `Err` is always [`InputUnavailable`] → exit 50.
 pub async fn run_verdict(
@@ -781,7 +1131,7 @@ pub async fn run_verdict(
         trigger_canary(&client, &opts.control_base).await?;
     }
 
-    let (scrape, drain) = drain(&client, opts).await?;
+    let (scrape, drain) = drain(&client, config, opts).await?;
     let report = read_sink(&opts.sink_dir)?;
     Ok(evaluate(config, &scrape, &report, opts.canary, drain))
 }
@@ -827,36 +1177,14 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
 /// passes. See the module doc for why one scrape is not enough.
 async fn drain(
     client: &reqwest::Client,
+    config: &Config,
     opts: &VerdictOptions,
 ) -> Result<(Scrape, DrainStatus), InputUnavailable> {
     let deadline = Instant::now() + opts.drain_deadline;
     let mut prev: Option<BTreeMap<(String, String), f64>> = None;
     loop {
         let scrape = fetch_scrape(client, opts).await?;
-        for series in REQUIRED_SERIES {
-            if !scrape.has_family(series) {
-                return Err(InputUnavailable(format!(
-                    "required series {series} absent from the scrape — the proxy is not \
-                     exporting the verdict instrumentation (older binary?)"
-                )));
-            }
-        }
-        // Every count this verdict compares must be an exact integer: past
-        // 2^53 an f64 `==` can equate values that differ by one, which is
-        // precisely the discrepancy the integrity checks exist to catch
-        // (adversarial review). Validated once here so every downstream
-        // comparison and cast works on exact values.
-        for name in WATCHED_SERIES {
-            for sample in scrape.family(name) {
-                let v = sample.value;
-                if v.fract() != 0.0 || !(0.0..9_007_199_254_740_992.0).contains(&v) {
-                    return Err(InputUnavailable(format!(
-                        "series {name} carries a non-exact count ({v}) — refusing \
-                         float-imprecise integrity math"
-                    )));
-                }
-            }
-        }
+        validate_scrape(config, &scrape)?;
         // Absence handled above, so these sums are all present.
         let in_flight = scrape.sum(SHADOW_IN_FLIGHT, &[]).unwrap_or(0.0);
         let enqueued = scrape.sum(DIFF_SINK_ENQUEUED_TOTAL, &[]).unwrap_or(0.0);
@@ -973,22 +1301,37 @@ pub fn render_human(v: &VerdictReport) -> String {
             CheckStatus::Fail => "FAIL",
             CheckStatus::Skipped => "SKIP",
         };
-        let _ = writeln!(out, " {name:<15} {status:<4}  {}", check.detail);
+        // A detail may carry remedy lines (the floors check does); they are
+        // written as their own lines rather than run together, so the operator
+        // reads route, reason and knob without opening the JSON.
+        let mut lines = check.detail.split('\n');
+        let head = lines.next().unwrap_or_default();
+        let _ = writeln!(out, " {name:<15} {status:<4}  {head}");
+        for line in lines {
+            let _ = writeln!(out, "{line}");
+        }
     }
     if !v.floors.is_empty() {
         let _ = writeln!(out, "{THIN_RULE}");
-        let _ = writeln!(out, " comparisons by floored route (floor in parentheses):");
+        let _ = writeln!(
+            out,
+            " comparisons by floored route (floor in parentheses, then work never compared):"
+        );
         for f in &v.floors {
             let mark = if f.met { "OK " } else { "!! " };
+            let uncompared = f.skipped + f.shadow_failures;
             let _ = writeln!(
                 out,
-                "   {mark}{:<28} {} ({})",
-                f.route_id, f.comparisons, f.floor
+                "   {mark}{:<28} {} ({}) uncompared={}",
+                f.route_id, f.comparisons, f.floor, uncompared
             );
         }
     }
     if !v.informational.is_empty() {
-        let _ = writeln!(out, " skip/failure counters (inspected, not gating):");
+        let _ = writeln!(
+            out,
+            " skip/failure counters (inspected, not gating — routes with no floor):"
+        );
         for i in &v.informational {
             let _ = writeln!(
                 out,
@@ -1007,6 +1350,7 @@ pub fn render_human(v: &VerdictReport) -> String {
 mod tests {
     use super::*;
     use crate::observability::sink::RouteReport;
+    use crate::observability::{ShadowFailure, SkipReason};
 
     fn config(yaml: &str) -> Config {
         serde_yaml::from_str(yaml).expect("test config")
@@ -1498,5 +1842,552 @@ limen_comparisons_total{route="a",result="mismatch"} 2
             assert!(json["checks"][check]["status"].is_string(), "{check}");
         }
         assert_eq!(json["mismatches_total"], 1);
+    }
+    // -- uncompared sampled work: the gate (limen#23, limen#24) --
+
+    /// A drained, balanced scrape for route `a` sitting **five comparisons
+    /// above** its floor of 1, plus whatever the case under test adds.
+    ///
+    /// Every fixture in this section starts here on purpose: a route below its
+    /// floor already fails through the *starvation* branch, so a case built on
+    /// a starved route would pass whether or not skips gate at all — the
+    /// mutation these tests exist to kill would survive it.
+    fn at_floor_with(extra: &str) -> Scrape {
+        scrape(&format!(
+            r#"
+limen_shadow_in_flight 0
+limen_diff_sink_enqueued_total 0
+limen_diff_sink_written_total 0
+limen_diff_sink_dropped_total{{reason="io_error"}} 0
+limen_comparisons_total{{route="a",result="match"}} 5
+{extra}
+"#
+        ))
+    }
+
+    /// `evaluate` over [`at_floor_with`], with the default two-route config.
+    fn verdict_at_floor_with(extra: &str) -> VerdictReport {
+        evaluate(
+            &two_route_config(),
+            &at_floor_with(extra),
+            &report_with(vec![]),
+            false,
+            DrainStatus::Drained,
+        )
+    }
+
+    /// The knob each reason's remedy line must name, so an operator reads what
+    /// to change out of the verdict itself rather than out of the source.
+    fn knob_for(reason: SkipReason) -> &'static str {
+        match reason {
+            SkipReason::ConcurrencyLimit => "server.shadow_concurrency_limit",
+            SkipReason::ResponseTooLarge | SkipReason::RequestTooLarge => {
+                "comparison.max_body_bytes"
+            }
+            SkipReason::EventStream => "min_comparisons: 0",
+            SkipReason::ResponseBufferTimeout => "timeouts.primary_ms",
+        }
+    }
+
+    #[test]
+    fn every_skip_reason_undermines_a_floored_route_that_met_its_floor() {
+        for metric in [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL] {
+            for reason in SkipReason::ALL {
+                let v = verdict_at_floor_with(&format!(
+                    r#"{metric}{{route="a",reason="{}"}} 3"#,
+                    reason.as_str()
+                ));
+                let detail = &v.checks.floors.detail;
+                assert_eq!(v.exit_code, 20, "{metric}/{}: {v:?}", reason.as_str());
+                assert!(
+                    detail.contains("undermined — at their floor"),
+                    "{metric}/{}: starvation wording would mean the fixture never \
+                     reached its floor: {detail}",
+                    reason.as_str()
+                );
+                assert!(detail.contains("a ["), "{detail}");
+                assert!(
+                    detail.contains(&format!("{metric}={} \u{d7}3", reason.as_str())),
+                    "{detail}"
+                );
+                assert!(detail.contains(knob_for(reason)), "{detail}");
+
+                let row = v.floors.iter().find(|f| f.route_id == "a").unwrap();
+                assert!(row.floor_met, "the fixture must sit above its floor");
+                assert!(!row.met);
+                assert_eq!(row.skipped, 3);
+                assert_eq!(row.shadow_failures, 0);
+                assert_eq!(row.uncompared.len(), 1);
+                assert_eq!(row.uncompared[0].reason, reason.as_str());
+                assert_eq!(row.uncompared[0].count, 3);
+            }
+        }
+    }
+
+    #[test]
+    fn every_shadow_failure_undermines_a_floored_route_that_met_its_floor() {
+        for failure in ShadowFailure::ALL {
+            let v = verdict_at_floor_with(&format!(
+                r#"{SHADOW_FAILED_TOTAL}{{route="a",reason="{}"}} 7"#,
+                failure.as_str()
+            ));
+            let detail = &v.checks.floors.detail;
+            assert_eq!(v.exit_code, 20, "{}: {v:?}", failure.as_str());
+            assert!(detail.contains("undermined — at their floor"), "{detail}");
+            assert!(
+                detail.contains(&format!(
+                    "{SHADOW_FAILED_TOTAL}={} \u{d7}7",
+                    failure.as_str()
+                )),
+                "{detail}"
+            );
+            // The remedy points at `new`, not at a limen knob: a shadow that
+            // failed is a finding about the upstream being migrated to.
+            assert!(detail.contains("a finding about `new`"), "{detail}");
+            assert!(detail.contains("read its logs"), "{detail}");
+
+            let row = v.floors.iter().find(|f| f.route_id == "a").unwrap();
+            assert!(row.floor_met);
+            assert!(!row.met);
+            assert_eq!(row.shadow_failures, 7);
+            assert_eq!(row.skipped, 0);
+        }
+    }
+
+    /// A floored route that streams can never pass while it is floored, and
+    /// the remedy says so — otherwise an operator drives a whole campaign to
+    /// discover it.
+    #[test]
+    fn the_event_stream_remedy_says_the_floor_is_unsatisfiable() {
+        let v = verdict_at_floor_with(
+            r#"limen_comparison_skipped_total{route="a",reason="event_stream"} 1"#,
+        );
+        let detail = &v.checks.floors.detail;
+        assert!(
+            detail.contains("can never meet a floor while it has one"),
+            "{detail}"
+        );
+        assert!(detail.contains("legacy_only"), "{detail}");
+    }
+
+    #[test]
+    fn several_reasons_and_duplicate_samples_sum_into_one_route() {
+        let v = verdict_at_floor_with(
+            r#"limen_shadow_skipped_total{route="a",reason="concurrency_limit"} 2
+limen_shadow_skipped_total{route="a",reason="concurrency_limit"} 3
+limen_comparison_skipped_total{route="a",reason="response_too_large"} 4
+limen_shadow_failed_total{route="a",reason="timeout"} 6"#,
+        );
+        assert_eq!(v.exit_code, 20, "{v:?}");
+        let row = v.floors.iter().find(|f| f.route_id == "a").unwrap();
+        assert_eq!(row.skipped, 9, "2 + 3 duplicates + 4");
+        assert_eq!(row.shadow_failures, 6);
+        // Two rows, not three: the duplicated series is one count.
+        assert_eq!(
+            row.uncompared
+                .iter()
+                .map(|u| (u.metric.as_str(), u.reason.as_str(), u.count))
+                .collect::<Vec<_>>(),
+            vec![
+                (COMPARISON_SKIPPED_TOTAL, "response_too_large", 4),
+                (SHADOW_FAILED_TOTAL, "timeout", 6),
+                (SHADOW_SKIPPED_TOTAL, "concurrency_limit", 5),
+            ]
+        );
+    }
+
+    /// Per route, not per process: `b`'s skips say nothing about whether `a`'s
+    /// evidence is good. (`b` is `min_comparisons: 0` here, so its own skips
+    /// are informational — see the next test.)
+    #[test]
+    fn a_skip_on_another_route_does_not_undermine_a_floored_route() {
+        let v = verdict_at_floor_with(
+            r#"limen_shadow_skipped_total{route="b",reason="concurrency_limit"} 11
+limen_shadow_failed_total{route="b",reason="error"} 4"#,
+        );
+        assert_eq!(v.exit_code, 0, "{v:?}");
+        let row = v.floors.iter().find(|f| f.route_id == "a").unwrap();
+        assert!(row.met);
+        assert_eq!(row.skipped, 0);
+        assert_eq!(row.shadow_failures, 0);
+        assert!(row.uncompared.is_empty());
+    }
+
+    #[test]
+    fn an_unfloored_routes_skips_are_informational_and_do_not_gate() {
+        let v = verdict_at_floor_with(
+            r#"limen_comparison_skipped_total{route="b",reason="event_stream"} 9"#,
+        );
+        assert_eq!(v.exit_code, 0, "{v:?}");
+        let row = v
+            .informational
+            .iter()
+            .find(|i| i.route == "b")
+            .expect("an unfloored route's skips stay visible");
+        assert_eq!(row.metric, COMPARISON_SKIPPED_TOTAL);
+        assert_eq!(row.reason, "event_stream");
+        assert_eq!(row.value, 9);
+        let text = render_human(&v);
+        assert!(text.contains("routes with no floor"), "{text}");
+    }
+
+    /// The same number must never be printed twice under two contradictory
+    /// framings: a floored route's skips gate, so they belong to its floor row
+    /// and nowhere else.
+    #[test]
+    fn a_floored_routes_skips_are_not_repeated_as_informational() {
+        let v = verdict_at_floor_with(
+            r#"limen_comparison_skipped_total{route="a",reason="response_too_large"} 2
+limen_comparison_skipped_total{route="b",reason="response_too_large"} 2"#,
+        );
+        assert_eq!(v.exit_code, 20, "{v:?}");
+        assert!(
+            v.informational.iter().all(|i| i.route != "a"),
+            "a floored route's counts gate in its floor row; listing them as \
+             'inspected, not gating' contradicts the exit code: {:?}",
+            v.informational
+        );
+        assert_eq!(v.informational.iter().filter(|i| i.route == "b").count(), 1);
+    }
+
+    /// A skip attributed to a route this config never declared is the same
+    /// drift an unknown comparisons route is — a config edited after start, or
+    /// a scrape of the wrong instance.
+    #[test]
+    fn a_skip_series_for_an_undeclared_route_is_exit_30() {
+        let v =
+            verdict_at_floor_with(r#"limen_shadow_failed_total{route="ghost",reason="timeout"} 1"#);
+        assert_eq!(v.exit_code, 30, "{v:?}");
+        assert!(v.checks.sink_integrity.detail.contains("ghost"), "{v:?}");
+    }
+
+    /// The reserved namespace buys no exemption under the uncompared families.
+    ///
+    /// It exists for limen's own sink canary, which rides compare → sink and
+    /// shows up in `limen_comparisons_total` — it never skips and never fails a
+    /// shadow, so nothing legitimate produces these three series under a `__`
+    /// route id. Exempting the prefix here (as the comparison counter must)
+    /// would leave one namespace where a whole route's uncompared work is
+    /// merely informational while the config has never heard of it.
+    #[test]
+    fn a_reserved_namespace_skip_series_for_an_undeclared_route_is_still_exit_30() {
+        for line in [
+            r#"limen_shadow_skipped_total{route="__ghost",reason="concurrency_limit"} 1"#,
+            r#"limen_comparison_skipped_total{route="__ghost",reason="event_stream"} 1"#,
+            r#"limen_shadow_failed_total{route="__ghost",reason="error"} 1"#,
+            // The canary's own id, which the comparison counter does exempt.
+            &format!(
+                r#"limen_shadow_skipped_total{{route="{CANARY_ROUTE_ID}",reason="event_stream"}} 1"#
+            ),
+        ] {
+            let v = verdict_at_floor_with(line);
+            assert_eq!(v.exit_code, 30, "{line}: {v:?}");
+            assert!(
+                v.checks
+                    .sink_integrity
+                    .detail
+                    .contains("not in this config"),
+                "{line}: {v:?}"
+            );
+        }
+    }
+
+    /// ...while the comparison counter's exemption is untouched: the canary is
+    /// a real producer there, and every campaign scrape carries its row.
+    #[test]
+    fn the_canarys_comparison_counter_is_still_exempt() {
+        let v = verdict_at_floor_with(&format!(
+            r#"limen_comparisons_total{{route="{CANARY_ROUTE_ID}",result="match"}} 1"#
+        ));
+        assert_eq!(v.exit_code, 0, "{v:?}");
+    }
+
+    /// Unflooring every route is the tempting way to silence this gate, and it
+    /// has always been refused: a config that floors nothing proves nothing.
+    /// Pinned so the gate cannot quietly acquire an escape hatch.
+    #[test]
+    fn unflooring_every_route_is_not_an_escape_hatch() {
+        let cfg = config(
+            r#"
+routes:
+  - id: a
+    match: { methods: ["GET"], path_prefix: "/a" }
+    legacy_upstream: "http://l"
+    new_upstream: "http://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, min_comparisons: 0 }
+  - id: b
+    match: { methods: ["GET"], path_prefix: "/b" }
+    legacy_upstream: "http://l"
+    new_upstream: "http://n"
+    mode: shadow_legacy_primary
+    comparison: { enabled: true, sample_rate: 1.0, min_comparisons: 0 }
+"#,
+        );
+        let v = evaluate(
+            &cfg,
+            &at_floor_with(r#"limen_shadow_skipped_total{route="a",reason="concurrency_limit"} 3"#),
+            &report_with(vec![]),
+            false,
+            DrainStatus::Drained,
+        );
+        assert_eq!(v.exit_code, 20, "{v:?}");
+        assert!(v.checks.floors.detail.contains("compares nothing"), "{v:?}");
+        assert!(v.floors.is_empty());
+    }
+
+    #[test]
+    fn floor_met_and_met_stay_consistent_on_a_starved_and_skipped_route() {
+        // Route `a` floored at 1, zero comparisons, and a skip on top: starved
+        // *and* undermined. It is reported as starved, but it still gets the
+        // remedy line — the knob is what unblocks the next drive.
+        let v = evaluate(
+            &two_route_config(),
+            &scrape(
+                r#"
+limen_shadow_in_flight 0
+limen_diff_sink_enqueued_total 0
+limen_diff_sink_written_total 0
+limen_diff_sink_dropped_total{reason="io_error"} 0
+limen_shadow_skipped_total{route="a",reason="concurrency_limit"} 4
+"#,
+            ),
+            &report_with(vec![]),
+            false,
+            DrainStatus::Drained,
+        );
+        assert_eq!(v.exit_code, 20, "{v:?}");
+        let row = v.floors.iter().find(|f| f.route_id == "a").unwrap();
+        assert_eq!(row.comparisons, 0);
+        assert!(!row.floor_met);
+        assert!(!row.met, "met can never be true where floor_met is false");
+        assert_eq!(row.skipped, 4);
+        let detail = &v.checks.floors.detail;
+        assert!(
+            detail.contains("starved — below their comparison floor"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("server.shadow_concurrency_limit"),
+            "{detail}"
+        );
+    }
+
+    #[test]
+    fn json_output_carries_the_uncompared_fields() {
+        let v = verdict_at_floor_with(
+            r#"limen_comparison_skipped_total{route="a",reason="response_too_large"} 2
+limen_shadow_failed_total{route="a",reason="error"} 1"#,
+        );
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&v).unwrap()).unwrap();
+        assert_eq!(json["exit_code"], 20);
+        let row = &json["floors"][0];
+        assert_eq!(row["route_id"], "a");
+        assert_eq!(row["floor_met"], true);
+        assert_eq!(row["met"], false);
+        assert_eq!(row["skipped"], 2);
+        assert_eq!(row["shadow_failures"], 1);
+        assert_eq!(row["uncompared"][0]["metric"], COMPARISON_SKIPPED_TOTAL);
+        assert_eq!(row["uncompared"][0]["reason"], "response_too_large");
+        assert_eq!(row["uncompared"][0]["count"], 2);
+        assert_eq!(row["uncompared"][1]["metric"], SHADOW_FAILED_TOTAL);
+    }
+
+    #[test]
+    fn the_human_render_shows_the_uncompared_count_and_the_remedy() {
+        let v = verdict_at_floor_with(
+            r#"limen_comparison_skipped_total{route="a",reason="response_too_large"} 2"#,
+        );
+        let text = render_human(&v);
+        assert!(text.contains("uncompared=2"), "{text}");
+        assert!(text.contains("comparison.max_body_bytes"), "{text}");
+        assert!(text.contains("exit 20 \u{2014} floors-unmet"), "{text}");
+    }
+
+    // -- validate_scrape: what a verdict requires of an exposition --
+
+    /// The four process-wide required families, at zero.
+    const PROCESS_WIDE: &str = "\
+limen_shadow_in_flight 0
+limen_diff_sink_enqueued_total 0
+limen_diff_sink_written_total 0
+limen_diff_sink_dropped_total{reason=\"io_error\"} 0
+";
+
+    /// Every uncompared series a route carries once `register_skip_series` has
+    /// run, at zero.
+    ///
+    /// Written out from the reason enums here rather than from
+    /// `expected_skip_series`, so this fixture is a second opinion about what a
+    /// live limen renders rather than a restatement of what the validator
+    /// asks for. (The two are tied together for real, through the actual
+    /// recorder, by `a_scrape_of_exactly_what_the_registrar_renders_validates`.)
+    fn registered_for(route_id: &str) -> String {
+        let mut out = String::new();
+        for reason in SkipReason::ALL {
+            for family in [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL] {
+                out.push_str(&format!(
+                    "{family}{{route=\"{route_id}\",reason=\"{}\"}} 0\n",
+                    reason.as_str()
+                ));
+            }
+        }
+        for failure in ShadowFailure::ALL {
+            out.push_str(&format!(
+                "{SHADOW_FAILED_TOTAL}{{route=\"{route_id}\",reason=\"{}\"}} 0\n",
+                failure.as_str()
+            ));
+        }
+        out
+    }
+
+    /// Exactly what a live limen renders before any traffic, for the two-route
+    /// config: every required series present at zero, per route and per reason.
+    fn registered() -> String {
+        format!(
+            "{PROCESS_WIDE}{}{}",
+            registered_for("a"),
+            registered_for("b")
+        )
+    }
+
+    /// `validate_scrape`'s refusal as the CLI reports it: exit 50, never a
+    /// downgraded verdict.
+    fn exit_code_of(text: &str) -> u8 {
+        match validate_scrape(&two_route_config(), &scrape(text)) {
+            Ok(()) => 0,
+            Err(_) => EXIT_INPUT_UNAVAILABLE,
+        }
+    }
+
+    #[test]
+    fn a_fully_registered_scrape_validates() {
+        validate_scrape(&two_route_config(), &scrape(&registered())).expect("registered scrape");
+    }
+
+    /// The registrar and the validator must want the same series, and the only
+    /// way to know is to render one and hand it to the other: a local recorder
+    /// runs the real registration, the real Prometheus exporter renders it, and
+    /// the real validator reads it. Enumerating the series twice — once to
+    /// touch, once to require — is what let a route go unregistered and still
+    /// pass; this test fails the moment the two lists part company.
+    #[test]
+    fn a_scrape_of_exactly_what_the_registrar_renders_validates() {
+        use metrics_exporter_prometheus::PrometheusBuilder;
+
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || {
+            crate::observability::prometheus::register_verdict_series();
+            crate::observability::prometheus::register_skip_series(
+                two_route_config().routes.iter().map(|r| r.id.as_str()),
+            );
+        });
+        let rendered = handle.render();
+        validate_scrape(&two_route_config(), &scrape(&rendered))
+            .expect("a scrape of exactly what limen registers must satisfy what limen requires");
+    }
+
+    /// The version boundary: a limen older than this gate exports none of the
+    /// three uncompared families, and that is a tooling failure rather than
+    /// three quiet zeros over work nobody could see.
+    #[test]
+    fn an_absent_gating_family_is_exit_50() {
+        for family in UNCOMPARED_SERIES {
+            let full = registered();
+            let text: String = full
+                .lines()
+                .filter(|l| !l.starts_with(family))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            assert_eq!(exit_code_of(&text), EXIT_INPUT_UNAVAILABLE, "{family}");
+            let err = validate_scrape(&two_route_config(), &scrape(&text)).unwrap_err();
+            assert!(err.0.contains(family), "{err}");
+            assert!(err.0.contains("older binary?"), "{err}");
+        }
+    }
+
+    /// The per-route hole a family-level check leaves open, and the reason this
+    /// validator takes a config.
+    ///
+    /// An older, lazily-registering proxy that skipped *somewhere* exports all
+    /// three families — every long campaign produces at least one skip, one
+    /// comparison skip and one shadow failure. Under a family-level check the
+    /// scrape validates, and floored route `a`, which has no sample in any of
+    /// them, sums to `skipped = 0, shadow_failures = 0` and is declared met:
+    /// exit 0 over evidence nobody could see. The series must be required for
+    /// the route whose floor turns on them.
+    #[test]
+    fn a_floored_route_with_no_registered_series_is_exit_50_even_when_another_route_has_them() {
+        // Route `b` alone carries the families — and carries them non-zero, so
+        // the family exists by having been used, exactly as on an old proxy.
+        let text = format!(
+            "{PROCESS_WIDE}\
+limen_shadow_skipped_total{{route=\"b\",reason=\"concurrency_limit\"}} 1
+limen_comparison_skipped_total{{route=\"b\",reason=\"response_too_large\"}} 1
+limen_shadow_failed_total{{route=\"b\",reason=\"timeout\"}} 1
+limen_comparisons_total{{route=\"a\",result=\"match\"}} 5
+"
+        );
+        assert_eq!(exit_code_of(&text), EXIT_INPUT_UNAVAILABLE, "{text}");
+        let err = validate_scrape(&two_route_config(), &scrape(&text)).unwrap_err();
+        assert!(err.0.contains(SHADOW_SKIPPED_TOTAL), "{err}");
+        assert!(err.0.contains(r#"route="a""#), "{err}");
+        assert!(err.0.contains("predates the gate"), "{err}");
+
+        // And the mutation this test exists to catch: with the series merely
+        // *present* for `b`, `sum` reports zero for `a` rather than absence, so
+        // nothing downstream could have noticed.
+        let s = scrape(&text);
+        assert_eq!(s.sum(SHADOW_SKIPPED_TOTAL, &[("route", "a")]), Some(0.0));
+        assert!(!s.has_series(SHADOW_SKIPPED_TOTAL, &[("route", "a")]));
+    }
+
+    /// A config with no routes is valid, and a current limen renders none of
+    /// the three families for it — there is no route to register one against.
+    /// That must not be read as an old binary: the run is already failed, by
+    /// the older and more precise "this config compares nothing" arm.
+    #[test]
+    fn a_config_with_no_routes_is_not_a_version_boundary() {
+        let empty = config("routes: []\n");
+        assert!(empty.routes.is_empty());
+        validate_scrape(&empty, &scrape(PROCESS_WIDE))
+            .expect("nothing is registered for a route set that is empty, so nothing is required");
+        let v = evaluate(
+            &empty,
+            &scrape(PROCESS_WIDE),
+            &report_with(vec![]),
+            false,
+            DrainStatus::Drained,
+        );
+        assert_eq!(v.exit_code, 20, "{v:?}");
+        assert!(v.checks.floors.detail.contains("compares nothing"), "{v:?}");
+    }
+
+    #[test]
+    fn a_gating_sample_missing_route_or_reason_is_exit_50() {
+        for line in [
+            r#"limen_shadow_skipped_total{reason="concurrency_limit"} 1"#,
+            r#"limen_comparison_skipped_total{route="a"} 1"#,
+            r#"limen_shadow_failed_total{route="a"} 1"#,
+            "limen_shadow_failed_total 1",
+        ] {
+            let text = format!("{}{line}\n", registered());
+            assert_eq!(exit_code_of(&text), EXIT_INPUT_UNAVAILABLE, "{line}");
+            let err = validate_scrape(&two_route_config(), &scrape(&text)).unwrap_err();
+            assert!(err.0.contains("renderer regression"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_non_exact_gating_count_is_exit_50() {
+        for value in ["1.5", "9007199254740993", "-1"] {
+            let text = format!(
+                "{}limen_shadow_skipped_total{{route=\"a\",reason=\"event_stream\"}} {value}\n",
+                registered()
+            );
+            assert_eq!(exit_code_of(&text), EXIT_INPUT_UNAVAILABLE, "{value}");
+        }
     }
 }
