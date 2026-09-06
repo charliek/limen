@@ -302,6 +302,10 @@ pub fn diff_sink_dropped(reason: SinkDropReason) {
 /// missing input, an un-touched series would turn every clean, quiet run into a
 /// tooling failure. Registering at zero makes the honest answer the one that
 /// renders.
+///
+/// The route-labelled half of that contract lives in [`register_skip_series`],
+/// which needs the config's route ids and so runs at state build rather than
+/// here.
 pub fn register_verdict_series() {
     counter!(DIFF_SINK_ENQUEUED_TOTAL).increment(0);
     counter!(DIFF_SINK_WRITTEN_TOTAL).increment(0);
@@ -317,6 +321,64 @@ pub fn register_verdict_series() {
     // so a proxy that has served no request yet must still render it. Same
     // startup-ordering argument — nothing can hold the guard this early.
     gauge!(IN_FLIGHT).set(0.0);
+}
+
+/// Every `(route, family, reason)` series a configured route can produce under
+/// the three families a campaign verdict gates a floored route on: both skip
+/// families across all of [`SkipReason::ALL`], and the shadow-failure family
+/// across all of [`ShadowFailure::ALL`] — twelve series per route.
+///
+/// **One enumeration, two consumers, on purpose.** [`register_skip_series`]
+/// walks it to touch each series at zero; `verdict::validate_scrape` walks the
+/// same list to *require* each series in a scrape. The two claims are one
+/// claim — a verdict may read a route's zero as a fact only for a series that
+/// was registered — and a family-level "is this metric here at all?" check
+/// cannot carry it: under such a check one busy route's skips vouch for every
+/// other route, and a floored route with nothing registered sums to a
+/// trustworthy-looking zero (`Scrape::sum` reports absence per family, not per
+/// series). Sharing the enumeration is what stops the registrar and the
+/// requirement from drifting apart into that hole again.
+pub fn expected_skip_series<'a>(
+    route_ids: impl IntoIterator<Item = &'a str> + 'a,
+) -> impl Iterator<Item = (&'a str, &'static str, &'static str)> + 'a {
+    route_ids.into_iter().flat_map(|route_id| {
+        SkipReason::ALL
+            .into_iter()
+            .flat_map(move |reason| {
+                [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL]
+                    .map(|family| (route_id, family, reason.as_str()))
+            })
+            .chain(
+                ShadowFailure::ALL
+                    .into_iter()
+                    .map(move |failure| (route_id, SHADOW_FAILED_TOTAL, failure.as_str())),
+            )
+    })
+}
+
+/// Touch every series [`expected_skip_series`] enumerates, so all of them
+/// render from the first scrape.
+///
+/// Same absence≠zero reasoning as [`register_verdict_series`], but the stakes
+/// changed: these three families now *gate*. A campaign verdict fails a floored
+/// route whose sampled work went uncompared, so it must be able to tell "this
+/// route skipped nothing" from "this binary has no such instrumentation" — and
+/// lazily-registered counters render those two states identically, as an absent
+/// series. With the families required by `verdict::validate_scrape`, an
+/// untouched one turns every clean run into a tooling failure; without
+/// pre-registration, a verdict reading absence as zero would pass a run it
+/// could not see.
+///
+/// Every configured route, not only the compared ones: the verdict's
+/// unknown-route integrity check reads the `route` labels of these families
+/// against the config's route set, and an operator reading the scrape needs
+/// each declared route to say zero rather than say nothing. All labels are
+/// route ids and a closed reason enum — within the cardinality doctrine at the
+/// top of this module.
+pub fn register_skip_series<'a>(route_ids: impl IntoIterator<Item = &'a str> + 'a) {
+    for (route_id, family, reason) in expected_skip_series(route_ids) {
+        counter!(family, "route" => route_id.to_string(), "reason" => reason).increment(0);
+    }
 }
 
 /// One request was observed by observe mode (after its sampling gate), so this
@@ -486,6 +548,46 @@ mod tests {
             r#"limen_observe_observations_total{route="alpha"} 0"#,
             r#"limen_observe_observations_total{route="beta"} 0"#,
         ] {
+            assert!(
+                rendered.lines().any(|l| l == line),
+                "expected `{line}` in the exposition:\n{rendered}"
+            );
+        }
+    }
+
+    /// The three families a verdict gates a floored route on must render at
+    /// zero for every route × reason before any traffic — absence≠zero, with
+    /// the sharper consequence that `verdict::validate_scrape` refuses a scrape
+    /// missing any one of these twelve series *for any configured route*.
+    ///
+    /// Written out from the reason enums rather than from
+    /// [`expected_skip_series`], so this stays an independent statement of what
+    /// a route must render rather than a restatement of the enumeration under
+    /// test.
+    #[test]
+    fn registration_renders_the_skip_series_at_zero_per_route() {
+        let recorder = PrometheusBuilder::new().build_recorder();
+        let handle = recorder.handle();
+        metrics::with_local_recorder(&recorder, || register_skip_series(["alpha"]));
+        let rendered = handle.render();
+
+        let mut expected = Vec::new();
+        for reason in SkipReason::ALL {
+            for family in [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL] {
+                expected.push(format!(
+                    r#"{family}{{route="alpha",reason="{}"}} 0"#,
+                    reason.as_str()
+                ));
+            }
+        }
+        for failure in ShadowFailure::ALL {
+            expected.push(format!(
+                r#"{SHADOW_FAILED_TOTAL}{{route="alpha",reason="{}"}} 0"#,
+                failure.as_str()
+            ));
+        }
+        assert_eq!(expected.len(), 12);
+        for line in expected {
             assert!(
                 rendered.lines().any(|l| l == line),
                 "expected `{line}` in the exposition:\n{rendered}"

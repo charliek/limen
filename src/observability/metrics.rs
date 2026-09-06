@@ -37,6 +37,18 @@ pub enum SkipReason {
 }
 
 impl SkipReason {
+    /// Every reason, so the label set can be registered up front
+    /// ([`crate::observability::prometheus::register_skip_series`]). A verdict
+    /// gates on these counters, so it must be able to read a zero rather than
+    /// an absence — and it can only do that if every reason is pre-touched.
+    pub const ALL: [SkipReason; 5] = [
+        SkipReason::ConcurrencyLimit,
+        SkipReason::ResponseTooLarge,
+        SkipReason::RequestTooLarge,
+        SkipReason::EventStream,
+        SkipReason::ResponseBufferTimeout,
+    ];
+
     /// A stable, lowercase label.
     pub fn as_str(self) -> &'static str {
         match self {
@@ -59,6 +71,10 @@ pub enum ShadowFailure {
 }
 
 impl ShadowFailure {
+    /// Every failure mode, for the same pre-registration reason as
+    /// [`SkipReason::ALL`].
+    pub const ALL: [ShadowFailure; 2] = [ShadowFailure::Timeout, ShadowFailure::Error];
+
     /// A stable, lowercase label.
     pub fn as_str(self) -> &'static str {
         match self {

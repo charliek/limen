@@ -84,10 +84,16 @@ make a finished pipeline look like one still draining. `written_total`
 increments after a record is durably appended to its daily file;
 `dropped_total` increments per drop reason.
 
-!!! note "These four series are zero-registered at startup"
+!!! note "These series are zero-registered at startup"
     `limen run` touches `limen_shadow_in_flight` and the three
     `limen_diff_sink_*` counters to zero immediately after installing the
-    Prometheus recorder — before any traffic has produced a sample. A
+    Prometheus recorder — before any traffic has produced a sample. The three
+    families that record uncompared sampled work —
+    `limen_shadow_skipped_total`, `limen_comparison_skipped_total` and
+    `limen_shadow_failed_total` — are registered the same way, but **per
+    configured route and per reason**, because a verdict reads them per route:
+    a family that exists somewhere tells you nothing about the route you are
+    asking about. A
     lazily-registered metric renders "nothing happened" and "this binary has
     no such instrumentation" identically: an absent series. Zero-registering
     them means their **absence from a scrape is itself meaningful** — it

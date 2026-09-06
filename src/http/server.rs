@@ -193,6 +193,11 @@ pub fn build_state_with_observer(
     // reason `ObserveRecorder::new` registers its per-route counter (absence is
     // not zero, and a review cannot tell the difference after the fact).
     prometheus::register_rollout_series(&routes);
+    // The three families a verdict now gates a floored route on. Registered
+    // here for the same reason as the rollout series — and with a sharper
+    // consequence, since `verdict::REQUIRED_SERIES` refuses to read any of them
+    // as absent: a proxy that has skipped nothing must still say so out loud.
+    prometheus::register_skip_series(routes.iter().map(|route| route.id.as_str()));
     // Built from the *compiled* route table, so the profile's key set is
     // exactly the routes that can match traffic — "never observed" and "no such
     // route" stay distinguishable, and traffic can never add a key. The
