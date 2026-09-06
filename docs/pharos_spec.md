@@ -691,6 +691,7 @@ Layered, later overriding earlier: defaults < config file (`pharos.config.ts`/`.
 - Output mode (`local` | `ci`) — governs **reporting and recording** conventions only (Section 11, Section 10.2). Independent of `environment`: a production smoke run driven from CI legitimately wants CI-style reporting *and* the production safety profile at once.
 - `allow_destructive_tests` (default false).
 - `allow_recording_updates` (default false).
+- `min_scenarios` — the run's scenario floor (Section 11.5), default `1`. How many scenarios must actually **execute** for `run`/`record` to be trustworthy; mirrors limen's `min_comparisons`. `0` is accepted but inert — see Section 11.5. Unlike the other environment variables below, `MIN_SCENARIOS` fails closed: an empty, negative, fractional, or non-numeric value is a hard config error rather than silently falling back to the default, because a floor that silently defaults is a fresh false-green vector.
 - Redaction targets (headers, JSON paths, query params).
 
 Example environment variables:
@@ -706,6 +707,7 @@ PHAROS_MODE=local
 PHAROS_ENVIRONMENT=local
 ALLOW_DESTRUCTIVE_TESTS=false
 ALLOW_RECORDING_UPDATES=false
+MIN_SCENARIOS=1
 AUTH_TOKEN=...
 ```
 
@@ -983,21 +985,49 @@ Replay loads the recording for its **response** only — the legacy side of the 
 
 ### 11.1 Console reporter (developer mode)
 
-Prints: total scenarios run; pass/fail/skip counts; failed scenario IDs and names; per-step failure summary; status/header/body diffs; normalization rules applied; artifact paths; and suggested debugging pointers where possible.
+Prints: total scenarios run; pass/fail/skip counts; failed scenario IDs and names; per-step failure summary; status/header/body diffs; normalization rules applied; artifact paths; and suggested debugging pointers where possible. The summary line leads with `discovered` — the run's real denominator (Section 11.5) — followed by `executed`, `passed`, `failed`, `skipped`, and, only when non-zero, `filtered (…)` (naming the narrowing in effect), `parse-failed N`, and `refused N`. When the scenario floor (Section 11.5) is not met, an additional line names it and why.
 
 ### 11.2 JSON report (CI)
 
 ```ts
+export interface RunFloorResult {
+  minScenarios: number;
+  /** The floor's numerator — scenarios that actually executed. */
+  executed: number;
+  /** The floor actually enforced: 1 for a `--scenario <id>` run, else `minScenarios`. */
+  applied: number;
+  met: boolean;
+  reason?: string;
+}
+
+export interface RunSummary {
+  /** Scenarios with a reported result (executed + parse-failed + gated). */
+  total: number;
+  passed: number;
+  failed: number;
+  skipped: number;
+  /** Scenario files found on disk — the run's real denominator. */
+  discovered: number;
+  /** Dropped by mode or `--scenario`/`--include-tag`/`--exclude-tag` filtering. */
+  filtered: number;
+  parseFailed: number;
+  refused: number;
+  executed: number;
+  /** The explicit narrowing in effect, e.g. `['--exclude-tag jwt']`. */
+  narrowed: string[];
+  floor: RunFloorResult;
+}
+
 export interface TestRunReport {
   startedAt: string;
   finishedAt: string;
   durationMs: number;
-  summary: { total: number; passed: number; failed: number; skipped: number };
+  summary: RunSummary;
   scenarios: ScenarioResult[];
 }
 ```
 
-Written to `report_dir`.
+Written to `report_dir`. Report keys are camelCase (`startedAt`, `minScenarios`) while config keys are snake_case (`min_scenarios`) — the two vocabularies coexist on purpose: the on-disk config vocabulary is the portable one shared with limen, the report is a JSON document read by CI. Every discovered scenario file gets exactly one of `parseFailed`/`filtered`/(safety-)`skipped`/`refused`/`executed`, and `discovered` always equals their sum — a tool bug, not a bad run, if it doesn't (Section 11.5).
 
 ### 11.3 JUnit report
 
@@ -1016,7 +1046,65 @@ reports/artifacts/<scenario-id>/<step-id>/request.json
 
 ### 11.5 Exit codes
 
-Exit `1` when any required scenario fails; exit `0` when all selected required scenarios pass. A **skipped** scenario increments only the `skipped` counter — **never** `passed` — and never fails the run by itself; it is reported separately and is not counted as coverage. A **refusal** (Section 12) is reported as a failing scenario result, distinct from a skip, and behaves like any other failure for exit-code purposes.
+| Exit | Meaning |
+|---|---|
+| `0` | All selected required scenarios passed, and the run's scenario floor was met. |
+| `1` | At least one required scenario failed. A **refusal** (Section 12) is reported as a failing scenario result, distinct from a skip, and behaves like any other failure here. |
+| `20` | The run's scenario floor (`min_scenarios`) was not met — the same number limen uses for the same idea (insufficient evidence), so a wrapper driving both tools carries one vocabulary. |
+
+Precedence is **20 > 1 > 0**: insufficient evidence makes a lower finding
+incomplete, so a floor miss outranks a scenario failure even when scenarios
+also failed.
+
+A **skipped** scenario increments only the `skipped` counter — **never**
+`passed` — and never fails the run by itself; it is reported separately, is
+not counted as coverage, and does not count toward the floor's numerator
+below.
+
+**The scenario floor.** `min_scenarios` (config field, `MIN_SCENARIOS` env,
+`--min-scenarios <n>` CLI; default `1`) is evaluated on `summary.executed` —
+never `passed + failed` — because a parse failure and a refusal are both
+reported results that never ran, and letting either prop up the numerator
+would defeat the floor's purpose. Every discovered scenario file gets exactly
+one terminal classification (`parseFailed`, `filteredByMode`,
+`filteredByFilter`, safety-`skipped`, `refused`, `executed`), counted where the
+decision is made rather than derived afterward; `buildReport` asserts the
+counts sum to `discovered`, throwing an internal tool-bug error on a mismatch
+rather than silently reporting a smaller denominator. Rules, most specific
+first:
+
+1. **Zero scenarios executed is unconditionally unmet**, whatever
+   `min_scenarios` says. The reported reason names why: the resolved
+   `scenario_dir` does not exist, is not a directory, is unreadable, or holds
+   no scenario files — or, when discovery found files, the classification
+   that emptied the run (a filter, a safety gate, or every file failing to
+   parse).
+2. **`--scenario <id>`** (exactly one named scenario) sets the floor to `1`:
+   naming a scenario is itself the statement that it must run. A named
+   scenario a safety gate skipped is unmet, with the gate's reason in the
+   message.
+3. **Otherwise** — unnarrowed, or narrowed by tag or mode — the configured
+   `min_scenarios` applies as-is. Narrowing does not suspend the floor: the
+   documented CI gate (`--include-tag migration-ready`, the reporting-and-CI
+   guide) is itself a narrowed run, and a renamed or emptied tag must not
+   silently shrink the suite to nothing and still exit 0.
+4. **`min_scenarios: 0` is accepted but inert, not an opt-out.** Rule 1
+   already forces `executed >= 1` unconditionally, so a floor of `0` and a
+   floor of `1` are satisfied by identical inputs — `0` reads as "I am not
+   asserting a size" and nothing more. This is deliberate, not an oversight:
+   do not "restore" a meaning to `0`.
+
+**`record`'s floor.** `record` always narrows a run to `legacy_record`
+scenarios, so every other scenario in the corpus is `filteredByMode` by
+construction and can never be `executed`. That narrowing is the command's
+definition, not an operator's filter — unlike a tag or mode filter someone
+chose, a hardcoded one cannot drift — so rule 3 above does not apply to it.
+`record` instead evaluates the same rules against its **own** floor of at most
+`1` (`min(min_scenarios, 1)`), unless an explicit `--min-scenarios` overrides
+it: a repository gating CI at `min_scenarios: 20` does not get exit 20 from
+every `pharos record` merely because the corpus has fewer than 20
+`legacy_record` scenarios. Recording zero scenarios is still exit 20 (rule 1
+still applies), and a named `--scenario` still has to execute (rule 2).
 
 ---
 
