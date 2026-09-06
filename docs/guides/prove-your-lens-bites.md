@@ -138,6 +138,61 @@ rule kind, a change to how normalization or redaction works, a new mismatch
 caught it" means. A campaign whose contracts haven't changed since the last
 falsification pass is still covered by it.
 
+### 4. Skips: prove nothing sampled slipped through uncompared
+
+The first three disciplines all assume that once a request is selected for
+comparison, `limen verdict` can tell whether it actually got compared. That
+assumption used to be optimistic. A response over `comparison.max_body_bytes`,
+a shadow the global `server.shadow_concurrency_limit` had no room for, an
+event-stream response, a primary that answered too slowly to finish
+buffering, a shadow that never answered at all — every one of these is
+sampled work that never reached the comparison engine, and `limen verdict`
+printed all of them under "inspected, not gating." A route could clear its
+floor on the comparisons it did make while the campaign quietly lost an
+arbitrary share of the ones it planned, and the exit code never moved. A
+floor met alongside hundreds of shadow timeouts on the new upstream is not
+evidence either — it's a coincidence wearing evidence's clothes.
+
+The rule this closes, stated once so it generalizes past this specific list:
+
+> **A skip must either count against the gate or appear in the verdict —
+> never neither.**
+
+For a floored route, "count against the gate" is now literal. `floor_met` still
+answers the old, narrower question — did the comparison count reach the
+floor. `met` is the one the exit code reads, and it additionally requires that
+**no sampled work on the route went uncompared**, for any reason. The check's
+detail names a route **starved** when it never reached its floor and
+**undermined** when it reached the floor but lost sampled work along the way.
+They are different failures with different fixes, which is why the verdict
+tells you which one you have rather than collapsing both into "floors unmet."
+
+Every reason a route can be undermined has exactly one remedy, kept here in
+the same words `limen verdict` prints (`remedy_for` in `src/verdict.rs` is
+the source both the tool and this table are read from, so they cannot drift
+apart):
+
+| Reason | Family | Remedy |
+|---|---|---|
+| `response_too_large` | `limen_comparison_skipped_total` | Raise `comparison.max_body_bytes` on this route (default `262144`); the largest bodies are the ones that went uncompared. |
+| `request_too_large` | `limen_shadow_skipped_total` | Only on routes with `shadow_methods`: the opted-in write's request body exceeded `comparison.max_body_bytes`; raise it or drop the opt-in. |
+| `concurrency_limit` | `limen_shadow_skipped_total` | `server.shadow_concurrency_limit` is **global**: a slow-on-`new` route can hold a slot until its shadow completes or `shadow_ms` expires, so the route that consumed the slots may not be the route the skip is charged against — raise the cap or lower drive concurrency. |
+| `response_buffer_timeout` | `limen_comparison_skipped_total` | The primary answered too slowly to buffer within `timeouts.primary_ms`; raise the budget or lower the load. |
+| `event_stream` | `limen_comparison_skipped_total` | **This route can never meet a floor while it has one.** Every sampled request skips on content type before a byte is buffered, so the floor is unsatisfiable by construction — unfloor it (`min_comparisons: 0`) and relay it (`legacy_only`), rather than burning a campaign discovering this the hard way. |
+| `timeout` / `error` | `limen_shadow_failed_total` | The new upstream failed to answer N shadow(s) — a finding about `new`, not tooling noise; read its logs before re-running. |
+
+One rule sits underneath every remedy in that table and is easy to get wrong
+under pressure: **the counters behind this check are cumulative for the life
+of the process — they never reset, and `limen verdict` reads their absolute
+value from a single scrape.** A single skip recorded an hour into a campaign
+fails every verdict you take for the rest of that process's life, however
+clean the traffic has been since. The fix is therefore always three steps,
+not two: change the knob that caused the skip, **restart limen**, and
+re-drive the floors from zero. "Change the knob and re-run `limen verdict`"
+against the same running process stays exit `20` forever — the skip already
+happened, and the counter that recorded it is still there to fail the next
+scrape, and the one after that.
+
 ## Why exit codes are typed, not prose
 
 Before `limen verdict` existed, campaign wrappers parsed `limen report`'s
@@ -147,8 +202,10 @@ codes (`0/10/20/30/40/50`, documented in the [CLI reference](../reference/cli.md
 turn "did this campaign prove anything" into a value a shell `case` statement
 can branch on directly, and — because the codes are distinct per failure
 class — into something a wrapper can *react* to differently: a `20` (floors
-unmet) might mean "extend the test corpus," while a `30` (sink integrity)
-means "stop and investigate the sink, don't trust any of these numbers."
+unmet) might mean "extend the test corpus" for a starved route or "raise
+`max_body_bytes` and re-drive" for an undermined one (§4, above), while a `30`
+(sink integrity) means "stop and investigate the sink, don't trust any of
+these numbers."
 Collapsing every failure into a generic non-zero exit would throw that
 distinction away at exactly the boundary where a human has to decide what to
 do next.

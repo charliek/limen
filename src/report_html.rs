@@ -37,8 +37,10 @@
 //! - **Artifacts are cross-checked, not trusted.** Sink counts are reconciled
 //!   against the verdict's per-route map, canary records against its
 //!   `canary_records`, verdict floors against the config's
-//!   `effective_min_comparisons()`, and every route id in an artifact against
-//!   the config's route table. Any disagreement is a named drift finding and a
+//!   `effective_min_comparisons()`, a floored route's `skipped` and
+//!   `shadow_failures` against the scrape's own per-route sums of the families
+//!   they were read from, and every route id in an artifact against the
+//!   config's route table. Any disagreement is a named drift finding and a
 //!   FAILURE: two artifacts that disagree cannot both describe this campaign.
 //! - **The gate is mirrored, not re-invented.** Where this page reads the same
 //!   input `limen verdict` reads, it takes the same position — including on
@@ -65,41 +67,65 @@ use serde::Deserialize;
 use crate::config::load::{load as load_config, ConfigOverrides};
 use crate::config::model::{Config, FailSafeMode, RouteMode};
 use crate::observability::prometheus::{
-    BREAKER_TRANSITIONS_TOTAL, CIRCUIT_BREAKER_STATE, COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL,
-    DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL, DIFF_SINK_WRITTEN_TOTAL,
-    FLAG_CONSECUTIVE_FAILURES, FLAG_PROVIDER_STALE, FLAG_STALENESS_SECONDS, REQUESTS_TOTAL,
-    ROLLOUT_RESOLVED_TARGET_PERCENTAGE, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT,
-    SHADOW_SKIPPED_TOTAL, SHADOW_TOTAL,
+    expected_skip_series, BREAKER_TRANSITIONS_TOTAL, CIRCUIT_BREAKER_STATE, COMPARISONS_TOTAL,
+    COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL,
+    DIFF_SINK_WRITTEN_TOTAL, FLAG_CONSECUTIVE_FAILURES, FLAG_PROVIDER_STALE,
+    FLAG_STALENESS_SECONDS, REQUESTS_TOTAL, ROLLOUT_RESOLVED_TARGET_PERCENTAGE,
+    SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT, SHADOW_SKIPPED_TOTAL, SHADOW_TOTAL,
 };
 use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER_ROUTE};
 use crate::resilience::BreakerState;
 use crate::routing::Upstream;
-use crate::verdict::{Sample, Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX};
+use crate::verdict::{
+    Sample, Scrape, CANARY_ROUTE_ID, RESERVED_ROUTE_ID_PREFIX, UNCOMPARED_SERIES,
+};
 
 /// The metric families the runtime-counters section renders, each tagged with
 /// what an *absent* family is allowed to mean — mirroring
 /// [`crate::verdict`]'s contract exactly rather than restating it:
 ///
-/// - [`Absence::Required`] is [`crate::verdict::REQUIRED_SERIES`], the four
-///   series `register_verdict_series` pre-touches at startup. Absent, a verdict
-///   is exit 50; absent, this section is unavailable.
+/// - [`Absence::Required`] is [`crate::verdict::REQUIRED_SERIES`], the series
+///   limen pre-touches before traffic. Absent, a verdict is exit 50; absent,
+///   this section is unavailable.
 /// - [`Absence::ReadsAsZero`] is what `verdict::evaluate_floors` does with an
 ///   absent `limen_comparisons_total`: reads it as zero, which is fail-closed
 ///   only because a floored route needs at least one comparison to pass.
 /// - [`Absence::Informational`] is what `verdict::collect_informational` does:
 ///   iterate whatever is there and gate on none of it.
 ///
-/// Every family but the required four is registered *lazily*, on the first
-/// event of its kind, so a proxy that never skipped a comparison exports no
-/// `limen_comparison_skipped_total` at all. Requiring those families made this
-/// page stricter than the gate it claims to mirror — every quiet, healthy
-/// service rendered FAILURE.
+/// The three uncompared families moved from `Informational` to `Required` when
+/// they started gating a floored route: they are pre-registered per route at
+/// zero, so their absence is a scrape from a limen older than this tool. The
+/// page refuses such a scrape by name — the metrics section reads
+/// `UNAVAILABLE` and the banner is never CLEAN. Their `Required` marking here
+/// is the *family*-level fallback, all a reader holding a scrape and no config
+/// can check; given a config, [`MetricsView::from_scrape`] asks the stricter
+/// per-route question [`crate::verdict::validate_scrape`] asks, and a config
+/// declaring no routes is owed nothing under them at all.
+///
+/// That refusal lands as **FAILURE**, not INCOMPLETE, and that is a decision
+/// rather than an oversight. INCOMPLETE reads truer in isolation — the scrape
+/// parses, and it is required *evidence* that is missing rather than the
+/// artifact — but it does not survive the artifact combinations. A verdict
+/// taken against the same old proxy is itself exit 50, which this page renders
+/// as FAILURE, so downgrading the scrape would have one version boundary land
+/// on two banners depending on which artifact was handed over; and a *current*
+/// verdict beside a pre-gating scrape is two artifacts from two processes —
+/// drift, which no cross-check on this page would catch once the metrics
+/// refusal stopped being a failure. The banner state that would change is
+/// therefore only the one where no verdict was provided at all, which is
+/// already INCOMPLETE on that ground. The property the gate needs — refused,
+/// named, never CLEAN — holds either way.
+///
+/// The lazily-registered remainder keeps its tolerance: requiring a family a
+/// healthy quiet proxy never touches made this page stricter than the gate it
+/// claims to mirror.
 const FAMILIES: [(&str, Absence); 9] = [
     (COMPARISONS_TOTAL, Absence::ReadsAsZero),
-    (COMPARISON_SKIPPED_TOTAL, Absence::Informational),
+    (COMPARISON_SKIPPED_TOTAL, Absence::Required),
     (SHADOW_TOTAL, Absence::Informational),
-    (SHADOW_SKIPPED_TOTAL, Absence::Informational),
-    (SHADOW_FAILED_TOTAL, Absence::Informational),
+    (SHADOW_SKIPPED_TOTAL, Absence::Required),
+    (SHADOW_FAILED_TOTAL, Absence::Required),
     (SHADOW_IN_FLIGHT, Absence::Required),
     (DIFF_SINK_ENQUEUED_TOTAL, Absence::Required),
     (DIFF_SINK_WRITTEN_TOTAL, Absence::Required),
@@ -315,14 +341,63 @@ impl CheckDto {
     }
 }
 
-/// One floored route's standing.
+/// One floored route's standing, as [`crate::verdict::RouteFloor`] wrote it:
+/// the arithmetic claim (`floor_met`) and the evidence claim (`met`), which are
+/// not the same question once sampled work can go uncompared.
+///
+/// `floor_met` is an `Option` on purpose, and it is the only field here that
+/// needs to be. Every other new field defaults to zero, which is also what a
+/// verdict written before the gate existed *means* — it counted no skips
+/// because it counted no skips anywhere. `floor_met` has no such reading:
+/// `false` is a real value a current verdict emits for a starved route, so
+/// `#[serde(default)]` would turn every old row into "the floor was missed".
+/// `None` is instead read as the arithmetic itself (`comparisons >= floor`),
+/// which is what the field records — and with that substitution the new
+/// consistency invariants reduce to the old one on an old document rather than
+/// being switched off for it. See [`semantic_violations`].
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct FloorDto {
     pub route_id: String,
     pub comparisons: u64,
     pub floor: u64,
+    /// `comparisons >= floor` — the count alone. Absent before the gate.
+    pub floor_met: Option<bool>,
+    /// Sampled work on this route that was skipped instead of compared, across
+    /// both skip families and every reason.
+    pub skipped: u64,
+    /// Shadows on this route that failed instead of answering.
+    pub shadow_failures: u64,
+    /// The per-`{metric, reason}` breakdown behind those two totals.
+    pub uncompared: Vec<UncomparedDto>,
+    /// `floor_met && skipped == 0 && shadow_failures == 0` — the evidence
+    /// claim, and the only field an older reader of this document knows.
     pub met: bool,
+}
+
+impl FloorDto {
+    /// The arithmetic claim, taken from the document when it carries one and
+    /// recomputed when it does not (see the struct docs).
+    fn floor_met(&self) -> bool {
+        self.floor_met.unwrap_or(self.comparisons >= self.floor)
+    }
+
+    /// Sampled work on this route that produced no comparison. Saturating
+    /// because these are two independent numbers off an artifact this tool did
+    /// not write, and a wrapped sum would read as zero — the one answer a
+    /// fail-closed page may never invent.
+    fn uncompared_total(&self) -> u64 {
+        self.skipped.saturating_add(self.shadow_failures)
+    }
+}
+
+/// One `{metric, reason}` pair behind a floors row's uncompared work.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct UncomparedDto {
+    pub metric: String,
+    pub reason: String,
+    pub count: u64,
 }
 
 /// One informational counter row.
@@ -530,8 +605,9 @@ impl Absence {
             // Unreachable in a rendered section — a required family absent
             // makes the whole section unavailable — but stated for symmetry.
             Absence::Required => {
-                "absent — this series is registered at startup, so its absence means the \
-                 scrape did not come from a limen control plane"
+                "absent — this series is registered before traffic, so its absence means the \
+                 scrape did not come from a limen control plane, or came from one older than \
+                 this tool"
             }
             Absence::ReadsAsZero => {
                 "absent from the scrape. `limen verdict` reads this as zero comparisons, which \
@@ -581,19 +657,56 @@ impl MetricsView {
     /// Build the view, or say why the scrape cannot be rendered.
     ///
     /// Absence is tolerated exactly where `limen verdict` tolerates it (see
-    /// [`FAMILIES`]) and rendered as an explicit note rather than passed over
-    /// in silence. Values are *not* tolerated the same way: a count that is not
-    /// an exact non-negative integer is never a normal state of a limen
-    /// exporter, and rounding one would be fabricating a number.
-    fn from_scrape(scrape: &Scrape) -> Result<MetricsView, String> {
+    /// [`FAMILIES`], and [`crate::verdict::validate_scrape`] for the per-route
+    /// half a config unlocks) and rendered as an explicit note rather than
+    /// passed over in silence. Values are *not* tolerated the same way: a
+    /// count that is not an exact non-negative integer is never a normal state
+    /// of a limen exporter, and rounding one would be fabricating a number.
+    fn from_scrape(scrape: &Scrape, config: Option<&ConfigView>) -> Result<MetricsView, String> {
+        // The three uncompared families are registered per configured route, so
+        // what is owed depends on the config — exactly as it does for
+        // `verdict::validate_scrape`, which is why this walks the registrar's
+        // own enumeration rather than a family-level approximation of it.
+        //
+        // Requiring them at family level with a config in hand is wrong in both
+        // directions. Too lax: one busy route's skips make the family present
+        // and vouch for every other route (`Scrape::sum` reports absence per
+        // family, not per series). Too strict: a config that declares no routes
+        // owes no series at all, because the registrar emits none — and the
+        // page said "required metric family ... is absent" over a scrape whose
+        // instrumentation was complete, while `limen verdict` correctly called
+        // the same run exit 20 for flooring nothing. Two tools, one input, two
+        // diagnoses, and the page's was the wrong one.
+        //
+        // With no config the page cannot ask the per-route question and falls
+        // back to the family-level contract in `verdict::REQUIRED_SERIES` —
+        // all a reader holding a scrape and no config can check.
+        if let Some(config) = config {
+            for (route_id, family, reason) in
+                expected_skip_series(config.routes.iter().map(|r| r.id.as_str()))
+            {
+                if !scrape.has_series(family, &[("route", route_id), ("reason", reason)]) {
+                    return Err(format!(
+                        "required series {family}{{route=\"{route_id}\",reason=\"{reason}\"}} is \
+                         absent from the scrape — limen registers one at zero for every \
+                         configured route before serving traffic, so its absence is a scrape of \
+                         something else (or of a limen older than this tool), never a zero count"
+                    ));
+                }
+            }
+        }
         let mut families = Vec::with_capacity(FAMILIES.len());
         for (name, absence) in FAMILIES {
             let present = scrape.has_family(name);
-            if !present && absence == Absence::Required {
+            // Required, unless the per-route loop above already asked a
+            // stricter question about this family.
+            let required = absence == Absence::Required
+                && !(config.is_some() && UNCOMPARED_SERIES.contains(&name));
+            if !present && required {
                 return Err(format!(
                     "required metric family {name} is absent from the scrape — limen registers \
-                     it at startup, so its absence is a scrape of something else, never a zero \
-                     count"
+                     it before serving traffic, so its absence is a scrape of something else \
+                     (or of a limen older than this tool), never a zero count"
                 ));
             }
             let mut rows = Vec::new();
@@ -641,6 +754,26 @@ impl MetricsView {
             .flat_map(|f| f.rows.iter())
             .filter_map(|r| r.route.clone())
             .collect()
+    }
+
+    /// One family's samples for one route, summed across every remaining label
+    /// — the same label-subset sum [`crate::verdict::Scrape::sum`] takes when
+    /// it computes a floors row, read back off the rows this view already
+    /// validated as exact `u64`s.
+    ///
+    /// A route with no sample under the family sums to zero, which is safe
+    /// *here* only because the answer is compared against a verdict rather than
+    /// used as evidence on its own: an absent series and a registered zero
+    /// disagree with a non-zero verdict identically, and both are drift.
+    /// Saturating for the reason [`FloorDto::uncompared_total`] is — a wrapped
+    /// sum would read as zero, and agree.
+    fn route_sum(&self, family: &str, route: &str) -> u64 {
+        self.families
+            .iter()
+            .filter(|f| f.name == family)
+            .flat_map(|f| f.rows.iter())
+            .filter(|r| r.route.as_deref() == Some(route))
+            .fold(0u64, |sum, r| sum.saturating_add(r.value))
     }
 }
 
@@ -1776,6 +1909,50 @@ pub struct RouteRow {
     pub floor_class: FloorClass,
     pub comparisons: Option<u64>,
     pub floor: Option<u64>,
+    /// Sampled work on this route the verdict could not compare, when a floors
+    /// row said. `None` where no floors row did — a route with no floor is not
+    /// a route with nothing uncompared, and this column may not say it was.
+    pub uncompared: Option<UncomparedCell>,
+}
+
+/// The Uncompared column's contents for one route: the total that decided the
+/// row's `met`, and the reasons behind it.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct UncomparedCell {
+    /// `skipped + shadow_failures` — what the verdict gated on.
+    pub total: u64,
+    /// `reason ×n` in reason order, aggregated across the two skip families —
+    /// which share one reason vocabulary, so a `response_too_large` under each
+    /// of them is one thing that went wrong twice, not two.
+    pub reasons: String,
+    /// The same breakdown, metric-qualified, for the cell's `title`: which
+    /// family a reason arrived under is the difference between "the shadow
+    /// never ran" and "it ran and could not be compared".
+    pub detail: String,
+}
+
+impl UncomparedCell {
+    fn from_row(row: &FloorDto) -> UncomparedCell {
+        let mut by_reason: BTreeMap<&str, u64> = BTreeMap::new();
+        for entry in &row.uncompared {
+            let slot = by_reason.entry(entry.reason.as_str()).or_default();
+            *slot = slot.saturating_add(entry.count);
+        }
+        UncomparedCell {
+            total: row.uncompared_total(),
+            reasons: by_reason
+                .into_iter()
+                .map(|(reason, count)| format!("{reason} ×{count}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+            detail: row
+                .uncompared
+                .iter()
+                .map(|u| format!("{} {} ×{}", u.metric, u.reason, u.count))
+                .collect::<Vec<_>>()
+                .join("; "),
+        }
+    }
 }
 
 /// Where the banner landed, and why.
@@ -1958,7 +2135,7 @@ struct MetricsRead {
     scrape: Option<Scrape>,
 }
 
-fn read_metrics(path: Option<&PathBuf>) -> MetricsRead {
+fn read_metrics(path: Option<&PathBuf>, config: Option<&ConfigView>) -> MetricsRead {
     let unavailable = |why: String| MetricsRead {
         view: Section::Unavailable(why),
         scrape: None,
@@ -1977,7 +2154,7 @@ fn read_metrics(path: Option<&PathBuf>) -> MetricsRead {
         Ok(scrape) => scrape,
         Err(e) => return unavailable(format!("metrics artifact is not a scrape: {e}")),
     };
-    match MetricsView::from_scrape(&scrape) {
+    match MetricsView::from_scrape(&scrape, config) {
         Ok(view) => MetricsRead {
             view: Section::Ok(view),
             scrape: Some(scrape),
@@ -2117,12 +2294,55 @@ fn semantic_violations(v: &VerdictDto) -> Vec<String> {
         }
     }
 
+    // A floors row makes two claims, and they answer different questions: the
+    // count reached the floor (`floor_met`), and nothing the route was sampled
+    // for went uncompared (`met`). Checking `met` against the count alone —
+    // which is what this did while `met` *was* the count — turns a correct
+    // UNDERMINED row (at its floor, unmet because work was skipped) into a
+    // self-contradiction finding, and prints "floor unmet" over a floor that
+    // was met. Both claims are checked, neither is assumed.
+    //
+    // On a verdict written before the gate, `floor_met` is absent and reads as
+    // the arithmetic while `skipped`/`shadow_failures` read as zero, so the
+    // second invariant collapses to `met == (comparisons >= floor)`: the old
+    // check, recovered rather than special-cased.
     for row in &v.floors {
-        if row.met != (row.comparisons >= row.floor) {
+        let floor_met = row.floor_met();
+        if floor_met != (row.comparisons >= row.floor) {
+            out.push(format!(
+                "floors row for route {:?} claims floor_met={floor_met} with {} comparison(s) \
+                 against a floor of {}",
+                row.route_id, row.comparisons, row.floor
+            ));
+        }
+        // The breakdown against the two totals it is the breakdown *of*. A row
+        // whose `uncompared` list contradicts them is torn — and in the one
+        // direction that matters (zero totals beside a non-empty list) it would
+        // otherwise render met, and green, over work the same row says was
+        // never compared.
+        let breakdown = row
+            .uncompared
+            .iter()
+            .fold(0u64, |sum, u| sum.saturating_add(u.count));
+        if breakdown != row.uncompared_total() {
+            out.push(format!(
+                "floors row for route {:?} breaks {} skip(s) and {} shadow failure(s) down \
+                 into {breakdown} — the per-reason list and the totals it explains do not \
+                 describe the same run",
+                row.route_id, row.skipped, row.shadow_failures
+            ));
+        }
+        // Both directions, deliberately. The `met: true` direction is the one
+        // that matters most — a row that reached its floor, lost sampled work
+        // and called itself met is a false green the page must never carry —
+        // and the `met: false` direction is what stops the fix from being "call
+        // everything unmet".
+        if row.met != (floor_met && row.uncompared_total() == 0) {
             out.push(format!(
                 "floors row for route {:?} claims met={} with {} comparison(s) against a floor \
-                 of {}",
-                row.route_id, row.met, row.comparisons, row.floor
+                 of {}, {} skip(s) and {} shadow failure(s) — a route's evidence is good only \
+                 when it reached its floor and no sampled work on it went uncompared",
+                row.route_id, row.met, row.comparisons, row.floor, row.skipped, row.shadow_failures
             ));
         }
     }
@@ -2224,6 +2444,70 @@ fn drift_findings(
                     "route {}: comparison-enabled and floored at {}, but the verdict carries no \
                      floors row for it",
                     route.id, route.floor
+                ));
+            }
+        }
+    }
+
+    // The verdict's uncompared counts against the scrape standing beside them.
+    //
+    // This is the pair that closes the loop the two claims on a floors row
+    // opened. `met` now rests on `skipped` and `shadow_failures`, and nothing
+    // asked whether those numbers matched the counters they were read from — so
+    // a verdict saying a floored route lost nothing, beside a scrape saying it
+    // lost three comparisons, rendered CLEAN. That is the defect this gate
+    // exists to remove, one level up: not a tool reporting success over work it
+    // did not do, but a page reporting success over two artifacts that disagree
+    // about whether the work happened.
+    //
+    // **Equality, not `scrape >= verdict`,** and that is a decision rather than
+    // an oversight. Counters only rise within one process and the documented
+    // workflow takes the scrape *after* the verdict (`docs/runbook.md` §8.3:
+    // take the verdict first, then render the page from the artifacts it left
+    // behind), so a scrape reading higher could be read as nothing but the
+    // clock. It is drift anyway, on two grounds. The verdict's numbers come off
+    // a pipeline `limen verdict` itself waited to quiesce with traffic stopped,
+    // so on the documented workflow there is nothing left to move these
+    // counters between the two reads and equality is what those artifacts
+    // really produce — the neighbouring sink reconciliation is equality on
+    // exactly that ground, and the sink is likewise read later than the verdict
+    // that counted it. And the direction monotonicity would forgive is
+    // precisely the one that hides the defect: uncompared work the gate did not
+    // see is uncompared work the gate did not gate on, whether it landed before
+    // the verdict or after it. The other direction — a verdict claiming skips
+    // no scrape ever recorded — cannot happen within one process at all, so it
+    // is two, which is drift by any reading.
+    if let (Some(verdict), Some(metrics)) = (verdict, metrics) {
+        for row in &verdict.floors {
+            // A verdict written before the gate makes no claim to check: its
+            // zeros are the absence of the fields, not a count of nothing, and
+            // a current scrape beside one may legitimately carry skips it never
+            // reported. `floor_met` is the one field that cannot be defaulted
+            // (see [`FloorDto`]), which makes its absence the marker for the
+            // whole pre-gate shape.
+            if row.floor_met.is_none() {
+                continue;
+            }
+            let skipped = [SHADOW_SKIPPED_TOTAL, COMPARISON_SKIPPED_TOTAL]
+                .iter()
+                .fold(0u64, |sum, family| {
+                    sum.saturating_add(metrics.route_sum(family, &row.route_id))
+                });
+            if skipped != row.skipped {
+                out.push(format!(
+                    "route {}: the verdict's floors row counted {} skip(s) against it, but the \
+                     scrape sums {skipped} across {SHADOW_SKIPPED_TOTAL} and \
+                     {COMPARISON_SKIPPED_TOTAL} for that route",
+                    row.route_id, row.skipped
+                ));
+            }
+            let failures = metrics.route_sum(SHADOW_FAILED_TOTAL, &row.route_id);
+            if failures != row.shadow_failures {
+                out.push(format!(
+                    "route {}: the verdict's floors row counted {} shadow failure(s) against \
+                     it, but the scrape sums {failures} across {SHADOW_FAILED_TOTAL} for that \
+                     route",
+                    row.route_id, row.shadow_failures
                 ));
             }
         }
@@ -2340,6 +2624,7 @@ fn join_routes(
                 floor: row
                     .map(|r| r.floor)
                     .or_else(|| configured.filter(|c| c.expects_floor_row).map(|c| c.floor)),
+                uncompared: row.map(UncomparedCell::from_row),
                 floor_class,
                 id,
             }
@@ -2421,11 +2706,25 @@ pub fn decide_banner(evidence: &Evidence) -> Banner {
                         .to_string(),
                 );
             }
+            // STARVED and UNDERMINED are the verdict's own two words for the
+            // two ways a row lands unmet, and they take different remedies:
+            // one wants more traffic, the other wants a knob changed and a
+            // re-drive. Printing "floor unmet" over a route sitting at its
+            // floor sends the reader to the wrong one.
             for row in v.floors.iter().filter(|r| !r.met) {
-                failures.push(format!(
-                    "floor unmet: route {} compared {} time(s) against a floor of {}",
-                    row.route_id, row.comparisons, row.floor
-                ));
+                if row.floor_met() && row.uncompared_total() > 0 {
+                    failures.push(format!(
+                        "floor undermined: route {} reached its floor of {} with {} \
+                         comparison(s), but {} skip(s) and {} shadow failure(s) of sampled \
+                         work on it were never compared",
+                        row.route_id, row.floor, row.comparisons, row.skipped, row.shadow_failures
+                    ));
+                } else {
+                    failures.push(format!(
+                        "floor unmet: route {} compared {} time(s) against a floor of {}",
+                        row.route_id, row.comparisons, row.floor
+                    ));
+                }
             }
         }
     }
@@ -2520,7 +2819,9 @@ pub fn analyze(inputs: &Inputs) -> PageModel {
     let config = read_config(inputs.config.as_ref());
     let verdict = read_verdict(inputs.verdict.as_ref());
     let profile = read_profile(inputs.profile.as_ref());
-    let metrics_read = read_metrics(inputs.metrics.as_ref());
+    // After the config, which decides how much of the uncompared
+    // instrumentation this scrape owes.
+    let metrics_read = read_metrics(inputs.metrics.as_ref(), config.get());
     let rollout = read_rollout(&metrics_read, config.get());
     let metrics = metrics_read.view;
 
@@ -2968,19 +3269,26 @@ fn render_coverage(out: &mut String, model: &PageModel) {
         return;
     }
     out.push_str(
+        "<p class=\"note\">A floored route is met only when it reached its floor \
+         <em>and</em> nothing it was sampled for went uncompared, so the Uncompared column \
+         is the second half of the Floors column: a non-zero there is why a row at its \
+         floor still reads UNMET.</p>\n",
+    );
+    out.push_str(
         "<table>\n<tr><th>Route</th><th>Floors</th><th class=\"num\">Comparisons</th>\
-         <th class=\"num\">Floor</th><th>Config</th><th>Verdict</th><th>Sink</th>\
-         <th>Metrics</th><th>Profile</th></tr>\n",
+         <th class=\"num\">Floor</th><th>Uncompared</th><th>Config</th><th>Verdict</th>\
+         <th>Sink</th><th>Metrics</th><th>Profile</th></tr>\n",
     );
     for row in &model.routes {
         let _ = writeln!(
             out,
-            "<tr>{}<td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td>{}</td>\
+            "<tr>{}<td>{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>{}<td>{}</td>\
              <td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             route_cell(&row.id),
             pill(row.floor_class.class(), row.floor_class.word()),
             num(row.comparisons),
             num(row.floor),
+            uncompared_cell(row.uncompared.as_ref()),
             present(row.in_config),
             present(row.in_verdict),
             present(row.in_sink),
@@ -2989,6 +3297,38 @@ fn render_coverage(out: &mut String, model: &PageModel) {
         );
     }
     out.push_str("</table>\n");
+}
+
+/// The Uncompared cell. A floored route that lost nothing reads as a plain
+/// zero — it is the common case and must not look like a finding — and a route
+/// with no floors row reads as an em dash, because "no floor" is not "nothing
+/// uncompared". A non-zero names its reasons in the cell, so the operator sees
+/// *which* knob to change without opening the verdict JSON; the `title` adds
+/// which metric family each reason arrived under.
+fn uncompared_cell(cell: Option<&UncomparedCell>) -> String {
+    let Some(cell) = cell else {
+        return "<td title=\"no floors row for this route\">—</td>".to_string();
+    };
+    if cell.total == 0 {
+        return "<td>0</td>".to_string();
+    }
+    format!(
+        "<td title=\"{}\">{} {}</td>",
+        esc(if cell.detail.is_empty() {
+            "no per-reason breakdown was recorded"
+        } else {
+            &cell.detail
+        }),
+        cell.total,
+        pill(
+            "bad",
+            if cell.reasons.is_empty() {
+                "reason not recorded"
+            } else {
+                &cell.reasons
+            }
+        ),
+    )
 }
 
 /// A percentage, printed the way the scrape carried it: no invented precision,
@@ -3503,6 +3843,18 @@ fn render_counters(out: &mut String, model: &PageModel) {
     if let Some(v) = model.evidence.full_verdict() {
         if !v.informational.is_empty() {
             out.push_str("<h3>Skip and failure counters recorded by the verdict</h3>\n");
+            // The verdict filters a floored route's counters out of this block
+            // and into that route's floors row, where they gate. Without this
+            // sentence the omission reads as "no floored route skipped
+            // anything" — the exact false green the gate exists to kill,
+            // relocated into the page's own layout.
+            out.push_str(
+                "<p class=\"note\">Unfloored routes only, plus any route this config does \
+                 not declare. A <em>floored</em> route's skips and shadow failures are not \
+                 listed here: they decide that route's standing, so the verdict reports them \
+                 in its floors rows — the Uncompared column of section 4 — rather \
+                 than twice under two framings. Nothing in this table gates.</p>\n",
+            );
             out.push_str(
                 "<table>\n<tr><th>Metric</th><th>Route</th><th>Reason</th>\
                  <th class=\"num\">Count</th></tr>\n",
@@ -3634,10 +3986,29 @@ mod tests {
             },
             "mismatches_total": 0,
             "canary_records": 0,
-            "floors": [{"route_id": "a", "comparisons": 3, "floor": 1, "met": true}],
+            "floors": [{
+                "route_id": "a",
+                "comparisons": 3,
+                "floor": 1,
+                "floor_met": true,
+                "skipped": 0,
+                "shadow_failures": 0,
+                "uncompared": [],
+                "met": true,
+            }],
             "sink_mismatches_by_route": {},
             "informational": [],
         })
+    }
+
+    /// The same document as a limen from before the uncompared gate wrote it:
+    /// a floors row with `met` and the two counts, and nothing else.
+    fn pre_gating_verdict() -> serde_json::Value {
+        let mut v = clean_verdict();
+        v["floors"] = serde_json::json!([
+            {"route_id": "a", "comparisons": 3, "floor": 1, "met": true}
+        ]);
+        v
     }
 
     #[test]
@@ -3685,11 +4056,75 @@ mod tests {
     fn a_met_flag_must_follow_from_the_counts() {
         let mut v = clean_verdict();
         v["floors"][0]["comparisons"] = serde_json::json!(0);
+        v["floors"][0]["floor_met"] = serde_json::json!(false);
         // met:true with 0 comparisons against a floor of 1 is a contradiction.
         let violations = semantic_violations(&dto(v));
         assert!(
             violations.iter().any(|s| s.contains("claims met=true")),
             "{violations:?}"
+        );
+
+        // STARVED: the row's own two claims disagree. `floor_met` is the
+        // arithmetic and nothing else, so it cannot be true under the floor.
+        let mut v = clean_verdict();
+        v["floors"][0]["comparisons"] = serde_json::json!(0);
+        v["floors"][0]["met"] = serde_json::json!(false);
+        let violations = semantic_violations(&dto(v));
+        assert!(
+            violations
+                .iter()
+                .any(|s| s.contains("claims floor_met=true")),
+            "{violations:?}"
+        );
+
+        // UNDERMINED, and correct: at its floor, unmet because sampled work on
+        // it went uncompared. This is a verdict `evaluate_floors` really emits,
+        // and the page must read it as the coherent document it is rather than
+        // as a contradiction — the failure mode the old `met == (comparisons >=
+        // floor)` predicate had, which called a right answer a torn artifact.
+        let mut v = clean_verdict();
+        v["exit_code"] = serde_json::json!(20);
+        v["verdict"] = serde_json::json!("floors-unmet");
+        v["checks"]["floors"] = serde_json::json!({"status": "fail", "detail": "undermined"});
+        v["floors"][0]["skipped"] = serde_json::json!(2);
+        v["floors"][0]["uncompared"] = serde_json::json!([
+            {"metric": "limen_comparison_skipped_total", "reason": "response_too_large", "count": 2}
+        ]);
+        v["floors"][0]["met"] = serde_json::json!(false);
+        assert_eq!(
+            semantic_violations(&dto(v)),
+            Vec::<String>::new(),
+            "an undermined row is a coherent verdict, not a self-contradiction"
+        );
+
+        // The impossible verdict: at its floor, work uncompared, and `met`
+        // anyway. Nothing produces this but a hand-edited or half-written
+        // artifact, and it is the one shape that would ride through as green.
+        let mut v = clean_verdict();
+        v["floors"][0]["shadow_failures"] = serde_json::json!(4);
+        v["floors"][0]["uncompared"] = serde_json::json!([
+            {"metric": "limen_shadow_failed_total", "reason": "timeout", "count": 4}
+        ]);
+        let violations = semantic_violations(&dto(v));
+        assert!(
+            violations
+                .iter()
+                .any(|s| s.contains("claims met=true") && s.contains("\"a\"")),
+            "{violations:?}"
+        );
+
+        // A verdict written before any of those fields existed still reads.
+        // Its zeros are the truth about a run that counted no skips anywhere,
+        // and `floor_met` — absent, and never legitimately false-by-default —
+        // is read as the arithmetic, so the two new invariants collapse into
+        // the old one rather than being switched off.
+        assert!(semantic_violations(&dto(pre_gating_verdict())).is_empty());
+        let mut v = pre_gating_verdict();
+        v["floors"][0]["comparisons"] = serde_json::json!(0);
+        let violations = semantic_violations(&dto(v));
+        assert!(
+            violations.iter().any(|s| s.contains("claims met=true")),
+            "the old invariant still holds on an old document: {violations:?}"
         );
     }
 
@@ -3699,6 +4134,7 @@ mod tests {
         v["exit_code"] = serde_json::json!(20);
         v["verdict"] = serde_json::json!("floors-unmet");
         v["floors"][0]["met"] = serde_json::json!(false);
+        v["floors"][0]["floor_met"] = serde_json::json!(false);
         v["floors"][0]["comparisons"] = serde_json::json!(0);
         // The rows say unmet but the check still reports pass.
         let violations = semantic_violations(&dto(v));
@@ -3732,8 +4168,10 @@ mod tests {
         assert!(serde_json::from_value::<VerdictDto>(serde_json::json!({"hello": 1})).is_err());
     }
 
-    /// The four series `register_verdict_series` pre-touches at startup — the
-    /// exposition any live limen renders from its very first scrape.
+    /// The series limen pre-touches before traffic — `register_verdict_series`
+    /// process-wide, `register_skip_series` per route — i.e. the exposition any
+    /// live limen renders from its very first scrape. Abridged to one reason
+    /// per uncompared family: presence is what the page tests turn on.
     const REGISTERED: &str = "\
 limen_shadow_in_flight 0
 limen_diff_sink_enqueued_total 0
@@ -3741,6 +4179,9 @@ limen_diff_sink_written_total 0
 limen_diff_sink_dropped_total{reason=\"queue_full\"} 0
 limen_diff_sink_dropped_total{reason=\"io_error\"} 0
 limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
+limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0
+limen_comparison_skipped_total{route=\"a\",reason=\"response_too_large\"} 0
+limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0
 ";
 
     /// The page must require exactly what `limen verdict` requires — no more,
@@ -3764,26 +4205,30 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             "limen_shadow_in_flight 0\n\
              limen_diff_sink_enqueued_total 0\n\
              limen_diff_sink_written_total 0\n\
+             limen_shadow_skipped_total{route=\"a\",reason=\"concurrency_limit\"} 0\n\
+             limen_comparison_skipped_total{route=\"a\",reason=\"event_stream\"} 0\n\
+             limen_shadow_failed_total{route=\"a\",reason=\"timeout\"} 0\n\
              limen_comparisons_total{route=\"a\",result=\"match\"} 1\n",
         )
         .unwrap();
-        let err = MetricsView::from_scrape(&scrape).unwrap_err();
+        let err = MetricsView::from_scrape(&scrape, None).unwrap_err();
         assert!(err.contains(DIFF_SINK_DROPPED_TOTAL), "{err}");
         assert!(err.contains("never a zero count"), "{err}");
     }
 
-    /// The bug a real run found: a service that never skipped a comparison
-    /// exports no `limen_comparison_skipped_total` at all, because that
-    /// counter is registered on its first event. The live verdict against that
-    /// same process exits 0, so the page must render it too.
+    /// A family still registered on its first event may legitimately be
+    /// absent, and says so on the page rather than reading as a silent zero.
+    /// The three uncompared families no longer qualify — they gate now, so
+    /// they are pre-registered per route and required — but
+    /// `limen_shadow_requests_total` is untouched by that change, and its
+    /// tolerance is the property a quiet, healthy proxy still depends on.
     #[test]
     fn a_lazily_registered_family_may_be_absent() {
         let scrape = Scrape::parse(&format!(
-            "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n\
-             limen_shadow_requests_total{{route=\"a\"}} 3\n"
+            "{REGISTERED}limen_comparisons_total{{route=\"a\",result=\"match\"}} 3\n"
         ))
         .unwrap();
-        let view = MetricsView::from_scrape(&scrape).expect("a quiet proxy is still a proxy");
+        let view = MetricsView::from_scrape(&scrape, None).expect("a quiet proxy is still a proxy");
         let absent: Vec<&str> = view
             .families
             .iter()
@@ -3792,18 +4237,34 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             .collect();
         assert_eq!(
             absent,
-            [
-                COMPARISON_SKIPPED_TOTAL,
-                SHADOW_SKIPPED_TOTAL,
-                SHADOW_FAILED_TOTAL
-            ],
+            [SHADOW_TOTAL],
             "only the lazily-registered families are absent"
         );
-        // …and every one of them says so on the page rather than reading as a
-        // silent zero.
         for family in view.families.iter().filter(|f| !f.present) {
             assert_eq!(family.absence, Absence::Informational);
             assert!(family.absence.note().contains("first event of its kind"));
+        }
+    }
+
+    /// The version boundary, on the page's own read: a scrape from a limen
+    /// older than the gating change carries none of the three uncompared
+    /// families, and the page refuses it by name rather than reading three
+    /// absent gating counters as three zeros.
+    #[test]
+    fn a_scrape_without_the_uncompared_families_is_refused_by_name() {
+        for family in [
+            COMPARISON_SKIPPED_TOTAL,
+            SHADOW_SKIPPED_TOTAL,
+            SHADOW_FAILED_TOTAL,
+        ] {
+            let text: String = REGISTERED
+                .lines()
+                .filter(|l| !l.starts_with(family))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let scrape = Scrape::parse(&text).unwrap();
+            let err = MetricsView::from_scrape(&scrape, None).unwrap_err();
+            assert!(err.contains(family), "{err}");
         }
     }
 
@@ -3812,7 +4273,7 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
     #[test]
     fn an_absent_comparisons_family_is_noted_as_verdicts_zero() {
         let scrape = Scrape::parse(REGISTERED).unwrap();
-        let view = MetricsView::from_scrape(&scrape).expect("a proxy that served nothing");
+        let view = MetricsView::from_scrape(&scrape, None).expect("a proxy that served nothing");
         let comparisons = view
             .families
             .iter()
@@ -3826,8 +4287,8 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
     #[test]
     fn an_empty_scrape_is_unavailable() {
         let scrape = Scrape::parse("# HELP nothing\n# TYPE nothing counter\n").unwrap();
-        assert!(MetricsView::from_scrape(&scrape).is_err());
-        assert!(MetricsView::from_scrape(&Scrape::default()).is_err());
+        assert!(MetricsView::from_scrape(&scrape, None).is_err());
+        assert!(MetricsView::from_scrape(&Scrape::default(), None).is_err());
     }
 
     #[test]
@@ -3851,7 +4312,7 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
             "NaN",
         ] {
             let scrape = Scrape::parse(&text(bad)).unwrap();
-            let err = MetricsView::from_scrape(&scrape).unwrap_err();
+            let err = MetricsView::from_scrape(&scrape, None).unwrap_err();
             assert!(err.contains("exact non-negative integer"), "{bad}: {err}");
             assert!(err.contains(bad), "{bad}: {err} does not quote the value");
         }
@@ -3860,11 +4321,11 @@ limen_diff_sink_dropped_total{reason=\"writer_gone\"} 0
         // the float path, and `u64::MAX` its last.
         for exact in [9_007_199_254_740_993u64, u64::MAX] {
             let scrape = Scrape::parse(&text(&exact.to_string())).unwrap();
-            let view = MetricsView::from_scrape(&scrape).unwrap();
+            let view = MetricsView::from_scrape(&scrape, None).unwrap();
             assert_eq!(view.families[0].rows[0].value, exact);
         }
         let scrape = Scrape::parse(&text("2")).unwrap();
-        let view = MetricsView::from_scrape(&scrape).unwrap();
+        let view = MetricsView::from_scrape(&scrape, None).unwrap();
         assert_eq!(view.families.len(), FAMILIES.len());
         assert_eq!(view.families[0].rows[0].value, 2);
         assert_eq!(view.families[0].rows[0].route.as_deref(), Some("a"));
