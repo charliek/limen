@@ -738,6 +738,8 @@ Substitution works in `path`, `query`, `headers`, and `body`. A missing variable
 
 Its scope also reaches the `explicit_expectations` `expect` block (Section 4.7): every string leaf there except `expect.status` is substituted too, evaluated at expectation time — after this step's own extraction, so an assertion can reference a value the same step just captured, not only ones from earlier steps.
 
+It reaches `compare.args` as well, under `strategy: custom` only: every string anywhere inside it is substituted at the same point, after the step's own extraction, so a comparator can receive a value captured earlier (an id, a legacy read-back assigned by a hook). A whole-string template keeps the resolved value's type. Substituted `args` are not masked by `redact_paths` (only the `{{ env.X }}` values they read are registered as sensitive), so a comparator must not echo values captured from a redacted path.
+
 ### 7.2 Hook registry
 
 A `hooks/index.ts` exports named hooks; scenarios reference them by name; the harness imports the registry from a configured path.
@@ -782,6 +784,8 @@ All transforms are driven by the merged contract (or inline) rules and must be d
 - **Normalize timestamps** to a configured precision (`normalize_timestamps`). The precision field accepts both `milliseconds` and `millis` (Limen's historical spelling) — a deliberate lockstep accommodation (Section 13); `milliseconds` is canonical and what tooling documents/emits.
 - **Map enum aliases** (`enum_aliases`).
 - Apply **custom normalizers** by name (from the hook registry).
+
+This feeds the two-sided strategies (`exact`, `json_semantic`, `subset`). `explicit_expectations` asserts the response as received, with only redacted paths masked, and a `custom` comparator receives redacted but un-normalized response views (Section 4.7) plus the merged rules, and normalizes itself if it needs to.
 
 ### 8.3 Comparison result model
 
