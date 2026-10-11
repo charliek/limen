@@ -49,10 +49,38 @@ the offending field and route. Exits non-zero on any error.
 limen print-routes --config limen.config.yaml
 ```
 
-Prints the resolved routing table — each route's id, match (methods +
-path-prefix), mode, upstreams, and effective comparison policy — after layering
-and contract merge. Useful for confirming what Limen will actually do before
-starting it.
+Validates the configuration (exactly as `validate-config` does, so a contract
+reference that prints has already resolved and loaded), then prints one block
+per route, in config order:
+
+```text
+get-user
+  match:      GET  /users/{id}
+  mode:       shadow_legacy_primary
+  legacy:     https://legacy.internal
+  new:        https://new.internal
+  comparison: enabled, sample_rate=0.10, max_body_bytes=262144
+  behavioral: contract ./contracts/user-service.contract.yaml#get-user
+```
+
+`match` is the methods plus the `path_prefix` or `path_template`, followed by
+`query_present`/`query_absent` lines when the route conditions on the query.
+`comparison` is the operational gate only, plus a `shadow_methods` line when a
+write is opted in. `behavioral` names where the comparison rules come from —
+`contract <reference>` (as written), `inline`, or `none` — not the rules
+themselves. Use it to confirm routing — which route, which mode, which
+upstreams — before starting the proxy.
+
+It does **not** print the merged contract rules (read the contract; `limen
+check-contract` validates it), timeouts, rollout, breaker, or any floor.
+**Floors** (`comparison.min_comparisons`, unset = `1`) are visible before a run
+only in the config file — `validate-config` enforces the one rule about them
+(no positive floor on a comparison-disabled route) but prints only `OK`. After
+a run they surface in [`limen verdict`](#verdict): the JSON `.floors[]`, one
+row per floored route with its `floor` and `comparisons`; the human verdict's
+per-route floor list; and [the HTML status page](#the-html-status-page)'s Floor
+column. A route with no floor — comparison disabled, or `min_comparisons: 0` —
+has no `.floors[]` row at all; the page marks it NOT APPLICABLE.
 
 ## `check-contract`
 
@@ -109,6 +137,36 @@ get-device — 2 most recent:
   2026-07-28T10:00:05Z  GET  /devices/42  0f2c…  body,set_cookie.value
   2026-07-28T10:00:00Z  GET  /devices/7   9ab1…  body
 ```
+
+**Which field differed is not in any report format.** `human`, `json`, and
+`html` all stop at counts, kinds, and the three most recent examples per route
+(timestamp, method, path, request id, kinds) — enough to size a divergence and
+pick a request, never enough to resolve it. The differing paths and values are
+in the sink records themselves, one JSON object per line in
+`<dir>/mismatches-<YYYY-MM-DD>.jsonl` (UTC date; record shape and the
+`differences[].kind` vocabulary in [observability → durable mismatch
+diffs](../guides/observability.md#durable-mismatch-diffs)), and in each
+mismatch's `limen.response_mismatch` WARN log line. Read the sink with `jq`:
+
+```bash
+# which body paths differ, per route, and how often (the canary excluded)
+jq -r 'select(.route_id != "__limen_canary__") | .route_id as $r
+       | .differences[] | "\($r)\t\(.kind)\t\(.path)"' \
+  ./limen-diffs/mismatches-????-??-??.jsonl | sort | uniq -c
+
+# everything recorded for one request id taken from the report
+jq 'select(.request_id == "0f2c…")' ./limen-diffs/mismatches-????-??-??.jsonl
+```
+
+The `????-??-??` glob only approximates the files `report` reads: `report`
+additionally requires those characters to be digits forming a real calendar
+date, so a stray file whose name merely has the shape (an operator's
+`mismatches-yyyy-mm-dd.jsonl`) is tallied by `jq` while `report` ignores it —
+keep copies out of the sink directory. A looser `mismatches-*.jsonl` also
+picks up copies such as `mismatches-backup.jsonl`. A mismatch *only* in
+`status`, `header`, `set_cookie.*`, or `location.*` has an empty
+`differences` array — its evidence is in `legacy_status`/`new_status` or the
+matching `*_mismatches` list.
 
 ### The HTML status page
 
@@ -257,6 +315,20 @@ fix is to rebuild `limen`, not to chase a config problem.
 }
 ```
 
+`floors` has one row per **floored** route — comparison enabled and an
+effective floor above zero; a route with `enabled: false` or
+`min_comparisons: 0` has no row. `informational` is where such an unfloored
+route's uncompared work goes instead of vanishing: one `{"metric", "route",
+"reason", "value"}` entry for each non-zero `limen_shadow_skipped_total`,
+`limen_shadow_failed_total`, or `limen_comparison_skipped_total` series on a
+route with no floor — for example `{"metric":
+"limen_comparison_skipped_total", "route": "list-users", "reason":
+"response_too_large", "value": 5}` — plus any such series on a route the
+config does not declare, which separately fails `sink_integrity` (exit `30`).
+An entry never moves the exit code on its own, and a floored route's skips are
+never repeated here: they are in its `floors` row, where they gate. `--offline`
+reads no scrape, so its `informational` is always `[]`.
+
 An input-unavailable verdict (exit 50) is a shorter, distinct document —
 `{"mode": "unavailable", "verdict": "input-unavailable", "exit_code": 50,
 "error": "…"}` — so a wrapper can tell a refused/impossible verdict from a
@@ -358,7 +430,7 @@ the proxy that recorded it is the only authority on whether it is complete.
 | `0` | Draft emitted. |
 | `20` | Nothing was profiled: no observations at all, or every route's reason is `no-observations`/`insufficient-reads`/`partial-sample`. A sampled profile counts here too — R0 already refused to classify every route, so a draft resting on it rests on no evidence. A draft nobody's traffic informed is not evidence. |
 | `40` | The profile never quiesced within `--drain-deadline-ms`. |
-| `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy — including a **stale profile** (a route's recorded `match_basis` disagrees with the matcher the config now compiles for it — see [Preconditions](#preconditions)) and a **consistency refusal** (the profile's own counters could not have come from the recorder, e.g. more `read_transport_errors` than `reads`). |
+| `50` | A required input was unavailable: control plane unreachable, the running proxy has no `observe:` block (its profile endpoint 404s), an unreadable/unparseable `--profile` file, or a config that does not describe the profiled proxy — including a **stale profile** (a route's recorded `match_basis` disagrees with the matcher the config now compiles for it — see [Preconditions](#preconditions_1)) and a **consistency refusal** (the profile's own counters could not have come from the recorder, e.g. more `read_transport_errors` than `reads`). |
 | `1` | Unexpected tooling error (anyhow). |
 | `2` | CLI usage error (clap). |
 
@@ -413,7 +485,7 @@ and the traffic shapes the reasons name are catalogued in [classifying
 routes](../guides/classifying-routes.md). `match_basis` is copied verbatim
 from the profile (`prefix:…` or `template:…`) — it is what a stale profile is
 checked against before classification ever runs (see
-[Preconditions](#preconditions)), and it says which question
+[Preconditions](#preconditions_1)), and it says which question
 `distinct_read_paths` answers for this route. `read_transport_errors` is the
 read-scoped subset of `transport_errors` that R8a's carve-out reads.
 `narrowing_matches` lists **every** narrowing rule that matched, not just the
@@ -434,6 +506,26 @@ only the first.
   `shadow_legacy_primary` — doing so would move live client traffic back to
   legacy, not just reformat a file. Only `legacy_only` and
   `shadow_legacy_primary` routes with a `legacy_upstream` are re-moded.
+- **Every re-moded route becomes `shadow_legacy_primary`, whatever its
+  disposition** — `relay_only` included: write routes, the `/` catch-all,
+  anything a danger rule demoted. The only exception is a route with no `new`
+  upstream (none configured, no `--new-upstream`), which drafts `legacy_only`.
+  As drafted this is inert: comparison is disabled, and "comparison is enabled
+  for the route" is one of the shadow-eligibility conditions in [spec
+  §6.1](../limen_spec.md#61-shadow_legacy_primary), so no request is ever sent
+  to `new`. Promoting one takes more than flipping `enabled`: the drafted
+  block also carries `sample_rate: 0.0` and no `shadow_methods`, so a read is
+  shadowed only once `enabled: true` meets a non-zero `sample_rate`, and a
+  write additionally needs its method in
+  [`shadow_methods`](config-reference.md#comparisonshadow_methods-shadowing-a-write)
+  (`POST`/`PUT`/`PATCH` after a recorded idempotence analysis; never
+  `DELETE`). `--adopt-suggestions` sets `enabled` and `sample_rate` only on
+  `compare_candidate`/`compare_narrowed` routes, never on `relay_only` ones —
+  but two hand edits is still close. For routes that must never touch `new` —
+  writes you are not opting in, the catch-all, [class
+  C/D](../guides/classifying-routes.md#the-class-taxonomy) routes — write
+  `mode: legacy_only` (and drop `new_upstream`) explicitly in the campaign
+  config.
 - **The `comparison` block is replaced wholesale, never edited in place**, and
   `contract` is dropped whenever inline narrowing is emitted — both are what
   keep the draft from carrying a shape (`shadow_methods` on a disabled route;

@@ -147,6 +147,13 @@ issuance.
 itself never shadows a write by default, only `GET`/`HEAD` are eligible
 without an explicit opt-in ([`comparison.shadow_methods`](../reference/config-reference.md#comparisonshadow_methods-shadowing-a-write) —
 `POST`, `PUT`, or `PATCH`; `DELETE` is not eligible at all, opt-in or not).
+Observe mode cannot assign this class. With a positive (the default) read
+floor, once the earlier rules pass (`partial-sample`, `catch-all`,
+`no-observations`), a write-only route drafts `relay_only (insufficient-reads)`
+at any volume. A zero floor changes that
+([why](observe-mode.md#2-drive-representative-traffic)). That label means the
+classifier had nothing to read, not that a danger fired. The method and the
+handler source assign class F.
 
 **What to do with it.** Leave unshadowed. Shadowing a write doubles its side
 effect against a system of record — a second charge, a second token, a second
@@ -273,6 +280,19 @@ constant. That signal is honest about its own limits:
   fingerprint never includes header or cookie values), so a genuinely safe,
   per-user response can look "varied" and get demoted — a **false demotion**.
   This is the safe direction: it costs evidence, not safety.
+- Paginated and filtered reads are the same false demotion through the query:
+  the [fingerprint](observe-mode.md#what-a-request-fingerprint-is) keeps
+  parameter *names* and drops their values, so `?page=1` and `?page=2` are one
+  fingerprint, and a list endpoint driven page by page against unchanged data
+  can still report `length_varied` — whenever two pages differ in length — and
+  land `compare_narrowed (body-varies)` if no relay-only rule fires first. The
+  narrowing is evidence about the profile — distinct requests folded together
+  — not about the route. If the handler's body is a deterministic function of
+  the path, the query values, and the shared state, classify it on that source
+  and write its comparison block (or contract) by hand: the narrowed form
+  compares status only and discards body evidence the route can support. The
+  draft's note that a hand-set `enabled: true` compares a body "this route's
+  responses do not support" is the claim the source overrules here.
 
 **A response with no `Content-Length` at all is the third case, and it is
 counted rather than guessed at.** An SSE stream (`text/event-stream`), a chunked

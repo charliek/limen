@@ -48,7 +48,7 @@ The two share a **behavioral contract** (Section 5) but are independently deploy
 Pharos is designed for the same migration shape as Limen: **legacy and new share the same backing datastore**, and the migration is a **re-implementation of request-handling logic** (e.g. a framework or language change), not a data migration. This makes correctness a question of **behavioral parity over shared data**, which the contract and scenarios express directly:
 
 - For **reads**, a passing `compare_live` over identical stored data is itself a consistency check.
-- For **writes**, correctness is validated by performing the write through the new service and **reading the result back** through an already-validated read path, comparing it to what legacy produces (a multi-step scenario; see the migration runbook). Writes are not executed against both implementations, since a shared store would double the side effect.
+- For **writes**, the write is performed through the **new service only** — never against both implementations, since a shared store would double the side effect. Because legacy and new then read the *same* stored row, a read-back compared two-sided can pass even when the write stored the wrong thing, so it cannot establish write correctness; correctness is instead validated by pinning the write's response and its read-back **one-sidedly** to legacy-derived expectations (`new_only_assert` with `explicit_expectations`, derived from the legacy handler or from probing legacy on controlled data), or by comparing **paired resources** — the same write through legacy on one resource and through new on another, compared modulo ids and server timestamps (a multi-step scenario, Section 4.11; see the migration runbook).
 
 Migrations that do **not** share a datastore (separate stores requiring synchronization) move into dual-write/reconciliation territory, which is out of scope; Pharos's consistency guarantees are not designed for that case.
 
@@ -408,7 +408,7 @@ compare:
 
 `set_cookie` and `location` here reuse the **same** Set-Cookie/URL parsers as the two-sided `set_cookie`/`location` comparison blocks (Section 8.6) — one implementation, two consumers. Unlike Section 8.6, these are Pharos-only, one-sided assertions: Limen never asserts one-sided, so this vocabulary carries no lockstep obligation (Section 13); only the parsing semantics (including relative-Location resolution) are shared. The name-pairing rule differs deliberately from Section 8.6's two-sided *positional* pairing within a duplicate-name group: one-sided assertions consume in response order instead, since there is no second side to position against.
 
-**`custom`** — service-specific comparison via a named comparator from the hook registry. The comparator always receives a **redacted view** of each response: configured `redact_paths`/`sensitiveHeaders` are masked as usual, and `set-cookie`/`cookie` are *unconditionally* masked in the header/`setCookie` view regardless of the scenario's `sensitiveHeaders` config — a custom comparator can never surface a raw cookie value into `diffText`, closing off the one path Section 8.5's "no secret value appears in any output" invariant can't enforce by construction alone.
+**`custom`** — service-specific comparison via a named comparator from the hook registry. The comparator always receives a **redacted view** of each response: configured `redact_paths`/`sensitiveHeaders` are masked as usual, and `set-cookie`/`cookie` are *unconditionally* masked in the header/`setCookie` view regardless of the scenario's `sensitiveHeaders` config — a custom comparator can never surface a raw cookie value from the header/`setCookie` view into `diffText`. The body view is masked only at `redact_paths` and for registered values, and captured cookies are not registered, so a cookie value a response body echoes reaches the comparator unless a `redact_paths` entry covers it. Its `args` (Section 7.1) are a different input: substituted but not redacted, so a value placed there (a hook-assigned cookie, a legacy body) is the comparator author's to keep out of its mismatches (Section 8.5).
 
 ```yaml
 compare:
@@ -521,41 +521,46 @@ id: users.create-then-fetch
 name: Create then fetch user
 service: user-service
 tags: [write, read, regression, destructive]
-mode: compare_live
+mode: new_only_assert            # the write reaches the shared store once, through new
 safety:
   destructive: true
   allowedEnvironments: [local, ci, staging]
-contract: "../contracts/user-service.contract.yaml#create-user"
 setup:
   hooks:
-    - name: generateUserPayload
-      assign: { userPayload: payload }
+    - name: generateUserPayload  # returns { email }: a unique address per run
+      assign: { userEmail: email }
 steps:
   - id: create-user
     request:
       method: POST
       path: /users
-      headers: { authorization: Bearer {{ env.AUTH_TOKEN }} }
-      body: '{{ variables.userPayload }}'
+      headers: { authorization: 'Bearer {{ env.AUTH_TOKEN }}' }
+      body: { email: '{{ variables.userEmail }}', name: Grace Hopper }
     extract:
-      userId: { from: legacy.body, path: $.id }
+      userId: { from: new.body, path: $.id }
     compare:
-      strategy: json_semantic
-      status: same
+      strategy: explicit_expectations
+      expect: { status: 201 }
   - id: get-created-user
     request:
       method: GET
       path: /users/{{ variables.userId }}
-      headers: { authorization: Bearer {{ env.AUTH_TOKEN }} }
+      headers: { authorization: 'Bearer {{ env.AUTH_TOKEN }}' }
     compare:
-      strategy: subset
-      body:
-        require_matching_paths: [$.email, $.displayName, $.status]
+      strategy: explicit_expectations
+      expect:                    # what legacy stores for this payload
+        status: 200
+        body:
+          json_paths:            # not $.email: a redacted path compares against the mask
+            $.name: Grace Hopper
+            $.status: ACTIVE     # legacy's default for a new user
 cleanup:
   hooks:
     - name: deleteUser
       args: { userId: '{{ variables.userId }}' }
 ```
+
+The read-back is pinned one-sidedly (Section 1.3): on the shared store both sides would read the same row, so a two-sided read could pass even if the write stored the wrong thing. Expectations see the response after redaction (Section 8.5) — the contract's `redact_paths` plus the config's JSON paths — so a pinned path must be one neither redacts. For a paired-resource comparison instead, a setup hook makes the same write through legacy on its own resource and `assign`s the read-back fields, and the expectations reference them as templates.
 
 ### 4.12 Agent-generated scenario guidelines
 
@@ -733,6 +738,8 @@ Substitution works in `path`, `query`, `headers`, and `body`. A missing variable
 
 Its scope also reaches the `explicit_expectations` `expect` block (Section 4.7): every string leaf there except `expect.status` is substituted too, evaluated at expectation time — after this step's own extraction, so an assertion can reference a value the same step just captured, not only ones from earlier steps.
 
+It reaches `compare.args` as well, under `strategy: custom` only: every string anywhere inside it is substituted at the same point, after the step's own extraction, so a comparator can receive a value captured earlier (an id, a legacy read-back assigned by a hook). A whole-string template keeps the resolved value's type. Substituted `args` are not masked by `redact_paths` (only the `{{ env.X }}` values they read are registered as sensitive), so a comparator must not echo values captured from a redacted path.
+
 ### 7.2 Hook registry
 
 A `hooks/index.ts` exports named hooks; scenarios reference them by name; the harness imports the registry from a configured path.
@@ -778,6 +785,8 @@ All transforms are driven by the merged contract (or inline) rules and must be d
 - **Map enum aliases** (`enum_aliases`).
 - Apply **custom normalizers** by name (from the hook registry).
 
+This feeds the two-sided strategies (`exact`, `json_semantic`, `subset`). `explicit_expectations` asserts the response as received, with only redacted paths masked, and a `custom` comparator receives redacted but un-normalized response views (Section 4.7) plus the merged rules, and normalizes itself if it needs to.
+
 ### 8.3 Comparison result model
 
 ```ts
@@ -819,11 +828,11 @@ Anything outside this subset is a **validation error** at scenario/contract load
 
 ### 8.5 Redaction scope
 
-Applies to console logs, JSON reports, JUnit reports, failure artifacts, and recordings. Configurable targets: header names (`authorization`, `cookie`, `x-api-key`), JSON paths (`$.token`, `$.password`, `$.user.email`), query parameters (`access_token`). **No secret value appears in any output.** A test proves it (Section 16).
+Applies to console logs, JSON reports, JUnit reports, failure artifacts, and recordings. Configurable targets: header names (`authorization`, `cookie`, `x-api-key`), JSON paths (`$.token`, `$.password`, `$.user.email`), query parameters (`access_token`). **No secret value appears in any output**, within the two bounds stated at the end of this section. A test proves it (Section 16).
 
 **Sensitivity propagation.** Name- and path-based targets mask a secret where it is *declared*; they cannot help once a value has been **extracted into a variable** and substituted somewhere else — a session cookie captured by `extract` (Section 4.6) and later sent as a JSON body field, a custom header, or a form value is, to every static list, an ordinary value. So the run also tracks the *values themselves*: every value extracted from a `*.set_cookie` or `*.headers` source registers as sensitive automatically (no opt-out — `sensitive: false` beside those sources is a load-time error), and a body extraction registers when the rule declares `sensitive: true`. The registry is scenario-scoped, created and discarded with the variable store it sits beside. Masking is by value at the boundaries where data leaves execution — mismatches (before the diff text is rendered, so a bounded preview cannot leak a truncated prefix), step and lifecycle error strings, failure artifacts, recordings, and the view a custom comparator is handed — and is applied structurally, before serialization, so an encoder cannot escape a value out of reach. Substitution itself is untouched: the wire still carries the real credential. A whole value is masked at any length; a value embedded in a larger string is replaced only from eight characters up (the over-masking guard), and the replacement names the variable (`[REDACTED:<name>]`), the first-registered one when several share a value. An extracted object or array registers every scalar leaf, so a credential bundle cannot hide its tokens behind a container. Percent- and form-encoded forms of a registered value are masked too, so a secret that reached a URL query or a urlencoded body cannot survive its encoding. This is deliberately **not** taint tracking through substitution.
 
-Two bounds are stated rather than solved. **A value shorter than eight characters is masked only where it stands alone** — an occurrence inside a larger string (`Bearer abc123`) survives, because replacing so short a string everywhere would corrupt unrelated output; registration emits a warning naming the variable (never the value) so the residual is visible rather than assumed away. And **hook code is a trust boundary**: hooks receive the raw variable store by design, so this invariant covers Pharos's own output surfaces — what a hook itself prints or ships is the hook author's responsibility.
+Two bounds are stated rather than solved. **A value shorter than eight characters is masked only where it stands alone** — an occurrence inside a larger string (`Bearer abc123`) survives, because replacing so short a string everywhere would corrupt unrelated output; registration emits a warning naming the variable (never the value) so the residual is visible rather than assumed away. And **hook code is a trust boundary**: hooks receive the raw variable store by design, so this invariant covers Pharos's own output surfaces — what a hook itself prints or ships is the hook author's responsibility. A custom comparator sits on the same boundary for its `args`: the response views it is handed are redacted, but its substituted `args` are not, so a comparator that copies an unregistered secret from them (a cookie a hook assigned, say) into a mismatch or summary has it rendered. Registered values and sensitive header names are still masked in whatever it returns.
 
 ### 8.6 Set-Cookie and Location comparison
 
@@ -1240,7 +1249,10 @@ Work that landed after the MVP phases above. Each increment adds a dimension or 
    value, `SameSite` ignored), a second login asserted one-sided via
    `expect.set_cookie`, and a profile read asserted with an explicit
    `expect.status` (a two-sided "same" status would let a broken jar's
-   identical 401s pass unnoticed).
+   identical 401s pass unnoticed). Sending the login to both sides is
+   acceptable only because it has no shared-state side effect that matters —
+   each example instance mints sessions into its own store; on a shared
+   store, a login that writes shared state is a write (Section 1.3).
 9. `users.find-user-redirect` — a `follow_redirects: false` redirect compared
    two-sided through the contract's `location` dimension (`origin: ignore`)
    and, in a second step, asserted one-sided via `expect.location`.

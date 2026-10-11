@@ -83,7 +83,7 @@ Run this stage whenever a legacy service is reachable and can be driven with rep
 Be precise about what it does not catch. A mutating read with innocuous metadata is invisible to it: `GET /orders/42/mark-read` answering a stable `200` JSON looks exactly like `GET /orders/42` from the outside, and the classifier suggests it as a `compare_candidate` — the tool's own test suite asserts that limitation rather than hiding it. Reading the handler's source is what catches that one, which is why step 6 below is not optional.
 
 **Inputs:**
-- Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough.
+- Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough — plus a `legacy_only` catch-all when that service carries live traffic, since a request no route matches gets Limen's own `404`, not legacy's answer ([observe mode → unrouted requests](https://charliek.github.io/limen/guides/observe-mode/#unrouted-requests-and-the-catch-all-route)).
 - Representative traffic (a driving harness, replayed production shapes, or real traffic if Limen is already on the path).
 - The two doctrine pages this stage orchestrates: [observe mode](https://charliek.github.io/limen/guides/observe-mode/) for the mechanism, [classifying routes](https://charliek.github.io/limen/guides/classifying-routes/) for the judgment.
 
@@ -110,6 +110,8 @@ Be precise about what it does not catch. A mutating read with innocuous metadata
    | `relay_only` | A danger signal fired (a redirecting read, a cookie-minting read, a one-time-token query name, a catch-all or wildcard-granularity route), or too little was observed to say anything at all. | Classes **C**, **D**, **F** — never compared, by policy — or "not yet known", which is not the same thing and must not be recorded as if it were. |
    | `compare_narrowed` | Nothing dangerous fired, but the body cannot be trusted for equality (varying length, more than one content type, incomplete stability evidence). | Class **B** — compare with narrowed equality; the narrowing becomes contract work in Stage 2. |
    | `compare_candidate` | A request fingerprint repeated with a stable length and no danger signal fired. | Class **A** *if* the source agrees — a hypothesis carrying evidence, never a safety claim. |
+
+   With a positive (the default) `--min-samples` floor, a route that carries only writes lands on `relay_only (insufficient-reads)` whatever its volume, once the earlier rules pass. With a zero floor it falls through to later rules ([observe mode](https://charliek.github.io/limen/guides/observe-mode/#2-drive-representative-traffic)). A sampled profile still reports `partial-sample`, a write-only `/` route `catch-all`, and a route the corpus never reached `no-observations`. Only `GET`/`HEAD` count toward the read floor, and no classifier rule reads writes. Take the route's class from its methods and handler source instead (**F** for a mutating write). `insufficient-reads` on such a route is neither a danger finding nor "not yet known".
 
 6. **Confirm candidates against the source, then adopt deliberately.** The default draft emits `comparison: { enabled: false }` for *every* route, suggestion riding as a comment. That is not a hedge: response metadata can prove a route unsafe to compare and can never prove one safe, so no traffic shape may cause the tool to emit a shadowing config. `--adopt-suggestions` is the human act that promotes suggestions into the shadowing form — pass it only after reading each candidate route's handler.
 
@@ -159,28 +161,31 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 
 **Goal:** an executable scenario set per route covering success, error, and edge behavior, referencing the contract for normalization.
 
-**Inputs:** the route inventory; the drafted contract; OpenAPI response definitions (which enumerate status codes and error shapes).
+**Inputs:** the route inventory; the drafted contract; OpenAPI response definitions (which enumerate status codes and error shapes) — or, where the service has none, the legacy handler source and router registration, confirmed by probing legacy on controlled data.
 
 **Actions — for each route, generate the standard scenario family:**
 
-1. **Success (happy path).** The primary 2xx case. `mode: compare_live`, `strategy: json_semantic`, `contract` reference for normalization.
+1. **Success (happy path).** The primary 2xx case. For a read (or another confirmed non-mutating request), use `mode: compare_live`, `strategy: json_semantic`, and a `contract` reference for normalization. For a write, never use `compare_live`, which sends the request to both implementations and doubles the mutation on a shared store. Use `new_only_assert` with a pinned or paired read-back instead ([Section 6.2](#62-writes-postputpatchdelete)); the same applies to every write scenario below.
 2. **Not-found / missing resource.** The 404 (or equivalent) case for a resource that doesn't exist.
-3. **Validation / bad input.** The 4xx case(s) the OpenAPI defines (missing field, bad type, out-of-range). Compare the error envelope shape, not just the status.
+3. **Validation / bad input.** The 4xx case(s) the OpenAPI defines — or, without one, the handler's own validation rules (missing field, bad type, out-of-range). Compare the error envelope shape, not just the status.
 4. **Authorization / permission** (if the route is authenticated). The 401/403 cases.
 5. **Edge cases by shape:**
-   - List endpoints → **empty list**, **single item**, **many items** (exercises array sorting/ordering rules).
+   - List endpoints → **empty list**, **single item**, **many items** (exercises array sorting/ordering rules). On a shared, seeded store, never empty the collection to get the empty case: every other scenario, and the other implementation, reads that seed. Use one of these, in order of preference:
+     1. **A scope or filter that matches nothing**, such as a tenant or owner identity that owns no rows, or a filter value no seeded row carries (check the seed, not the schema). Confirm from the handler that the filtered empty result goes through the same code as an unfiltered empty collection. Where it doesn't, the scenario covers only the filtered path.
+     2. **A disposable database for that one scenario**, if the service lets you point *both* implementations at it.
+     3. **A past-the-end page as a substitute**, with the gap recorded in the inventory. It exercises the empty-array serialization, but not whatever the handler does differently when the collection itself is empty (a zero total, absent next-page links).
    - Endpoints with optional fields → **present** and **absent** variants (exercises null-vs-absent handling).
    - Pagination → first page, middle page, past-the-end.
 6. **Multi-step flows** where behavior spans requests (create → read-back, see Section 6). Mark destructive flows `destructive` with a `safety` block and `cleanup` hooks.
 
 **How to decide what each scenario asserts:**
-- The **status** comes from the OpenAPI response definition.
+- The **status** comes from the OpenAPI response definition where one exists. Many services have none, and a document can omit what the framework answers on the handler's behalf; then take it from the legacy handler source and its router registration — each branch's explicit status, plus the framework defaults for what the handler never writes itself (a validation failure's `400` vs `422`, an unregistered method's `405`, an uncaught exception's `500`) — and confirm each one by probing legacy on controlled data before pinning it. That is the same order of fidelity Stage 1 enumerates routes in: the published document, then the source, then observed behavior.
 - The **body assertions** are "everything in the response except what the contract normalizes."
 - For error cases, assert the **error code and message shape** via `subset` or `explicit_expectations` — error envelopes are a common cross-framework difference (Section 9), so be precise about what's contractual.
 
 **Tagging:** every scenario gets tags. At minimum `read`/`write`, a maturity tag (`smoke` for the few that gate CI, `regression` for the rest), and `migration-ready` once it's trusted. Use `intentional-change` and `legacy-bug-compatible` to mark deliberate deviations.
 
-**Outputs:** a set of `*.yaml` scenarios per route; all validate with `bun run validate`.
+**Outputs:** a set of `*.yaml` scenarios per route; all validate with `bun run validate` from the root of a target repo's scaffolded suite (`pharos init`), or `bun run ftest -- validate` inside the pharos checkout.
 
 **For the agent:** generate **small, focused** scenarios — one behavior each — rather than large scenarios that assert many things. A focused scenario produces a precise failure. Always generate both the success **and** the error/edge cases; a suite that only covers happy paths gives false confidence.
 
@@ -225,10 +230,17 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 **The loop:**
 1. Run the suite locally, focused on the route under work:
    ```bash
-   bun run ftest -- run --scenario users.get-user-success
+   # in the target repo's scaffolded suite (`pharos init`), run from the scaffold root —
+   # Pharos resolves its config against the working directory:
+   bun run conformance -- --scenario users.get-user-success
    # or a whole service by tag:
+   bun run conformance -- --include-tag migration-ready
+
+   # the same runs inside the pharos checkout itself:
+   bun run ftest -- run --scenario users.get-user-success
    bun run ftest -- run --include-tag migration-ready
    ```
+   The scaffold's scripts are `conformance` (`pharos run`), `validate`, and `record`; any other subcommand is the installed bin, e.g. `bunx pharos check-contract contracts/user-service.contract.yaml`.
 2. For each failure, **diagnose which kind it is**:
    - **Real behavioral gap in the new service** → fix the new service. (This is the productive majority.)
    - **A legitimate dynamic difference not yet normalized** → add a *narrow* contract rule (and note why).
@@ -268,11 +280,15 @@ Writes are **not shadowed by default** and are validated differently, because ex
 **Recommended path (a): validate writes via `new_only_assert` against controlled data.**
 - Use Pharos `new_only_assert` to drive the new implementation's write and assert the response (status, returned resource shape, error envelopes) against explicit expectations derived from legacy behavior.
 - Run against **seeded/controlled** test data so the write's effect is known and cleanable. Guard as `destructive` with `cleanup` hooks.
-- Because the store is shared and the migration is a logic re-implementation, a write performed by the new service lands in the same place legacy would have put it — so asserting the response shape plus a read-back (below) gives high confidence.
+- The response is half the evidence: a handler can answer correctly and store the wrong thing. The other half is a read-back of the stored state (b) — and on a shared store the obvious read-back proves nothing about the write, so read (b) before authoring one.
 
-**Advanced pattern (b): compare writes by reading back.**
-- A multi-step scenario: perform the write through the new service, then **read the created/updated resource back** (via a GET that has *already* been validated as a read in 6.1) and compare that read against what legacy produces for the same resource.
-- This validates that the new write produced a stored result indistinguishable from legacy's, using the already-trusted read path as the oracle. Mark `destructive`, seed and clean up.
+**Advanced pattern (b): validate the stored result by reading it back — pinned, or paired.**
+- **A two-sided read-back is not this check.** Legacy and new read the *same* row. Write through new, read the resource back through both implementations, and compare: the two reads agree whenever the read paths are at parity (6.1), whatever the write stored. A write on new that ignores a field legacy would have changed leaves both reads showing the same stale value, and the comparison passes. It re-validates the read path; it never examines the write.
+- **Pinned (one-sided).** Write through new, read the resource back through a GET already validated as a read in 6.1, and assert that read against the post-state *legacy would have produced* — expectations pinned in the scenario (`new_only_assert`), derived from legacy's handler source or from first applying the same write through legacy to a controlled resource and recording its read-back.
+- **Paired resources.** Seed two equivalent resources, A and B. Apply the same write through legacy to A and through new to B, read both back through the validated read path, and compare the two read-backs modulo identifiers and server-generated timestamps (`ignore_paths` on exactly those fields). Each read-back must name its own resource: a `compare_live` read-back step built on one side's extracted id sends the same request — and so reads the same row — to both targets, which is the two-sided comparison above.
+- Either way, mark `destructive`, seed and clean up.
+
+**Write coverage — derive the cases from the legacy handler, not from the happy path.** For every field a write accepts, derive a case for each of: **set** (a value where there was none), **change** (a different value), **clear** (an explicit `null`, where the field is nullable), and **omit** (the field absent — whatever legacy's handler then does, keep the stored value, apply a default, or reject, is the expectation). Add one case per validation rule the handler enforces, asserting its status and error envelope. Pin or pair each case's read-back as above. Keep **one divergence per scenario**: a runner that stops a scenario at its first failing step hides every later step, so a scenario that walks set → change → clear in sequence reports the first divergence it meets and leaves the rest unknown.
 
 **Out of scope (c): shadowing writes to an isolated store.** Running the write against both implementations with a separate store for "new" approaches dual-write and reconciliation, which both tools deliberately exclude. Do not attempt this as part of the standard runbook; if a migration truly needs it, it's a bespoke effort outside Pharos/Limen.
 
@@ -313,16 +329,16 @@ Under the assumed **shared-datastore** pattern, consistency validation is mostly
 
 Because both implementations read and write the same store:
 - **For reads:** identical stored data → responses must match (after normalization). A passing `compare_live` is a direct consistency check.
-- **For writes:** a write through the new implementation must leave the store in the same state legacy would have. Validated via read-back (Section 6.2b).
+- **For writes:** a write through the new implementation must leave the store in the same state legacy would have. Validated via a *pinned* or *paired* read-back (Section 6.2b) — never by comparing two implementations' reads of the same row, which agree by construction.
 
 ### 7.2 Read-after-write across implementations
 
-The shared store makes cross-implementation read-after-write meaningful and safe to test:
-- Write via new (Pharos `new_only_assert` or a `percentage_split` request in Limen), then read via the **trusted** legacy-validated read path, and confirm the result matches legacy's representation. This catches new-write logic that stores subtly different data (wrong defaulting, dropped fields, format drift) even when the *write response* looked fine.
+The shared store makes cross-implementation read-after-write safe to test — and easy to test wrongly:
+- Write via new (Pharos `new_only_assert` or a `percentage_split` request in Limen), then read via the **trusted** legacy-validated read path, and assert the result against the post-state legacy would have produced: pinned from legacy's source or a legacy-side probe, or paired against the same write applied through legacy to an equivalent resource (Section 6.2b). This catches new-write logic that stores subtly different data (wrong defaulting, dropped fields, format drift) even when the *write response* looked fine. Comparing legacy's read of that row with new's read of it does not — both see whatever new stored.
 
 ### 7.3 Drift checks during rollout
 
-While a write route is split between implementations, periodically run the read-back consistency scenarios (Section 6.2b) against resources created by **each** implementation. Both populations should read back identically. Divergence is a signal to halt rollout (Section 8 gates).
+While a write route is split between implementations, periodically run the pinned or paired read-back scenarios (Section 6.2b) against resources written by **each** implementation. Both populations should match the post-state legacy's handler defines — equivalent writes reading back alike, modulo identifiers and server timestamps. Divergence is a signal to halt rollout (Section 8 gates).
 
 ### 7.4 The separate-store exception (caution)
 
@@ -353,6 +369,11 @@ Default budget (tune per route/service):
 
 A **migration exception** is a deliberate, documented allowance for a route to regress within a bound (e.g. a route that does more work in the new implementation by design). Record it next to the route; it changes the gate for that route only. There is no such thing as a parity exception expressed as a rate — an accepted difference is accepted *in the contract*, where it is reviewable, or it is a mismatch.
 
+**Reading the latency and error rows during shadowing.** In `shadow_legacy_primary`, legacy serves every client and is the only upstream the primary path tries. During Stage 6, Limen's request, latency, upstream-error, and upstream-timeout series therefore all read `upstream="legacy"`; none of them has an `upstream="new"` sample. The shadow leg is recorded only in `limen_shadow_requests_total`, `limen_shadow_failed_total{reason="timeout"|"error"}`, and the comparison counters, plus `new_status` in the sink record when there is a mismatch. The [observability guide](https://charliek.github.io/limen/guides/observability/#what-a-shadow-route-records-about-new) has the full map. So:
+
+- **Error rate.** The verdict enforces per-request equality on the compared sample. With `compare_status` on (the default), a status difference is a mismatch (exit `10`), and a shadow `timeout` or `error` undermines a floored route (exit `20`). An exit-`0` verdict therefore means `new` returned legacy's status on every compared request. On a floored route (comparison enabled, `min_comparisons` above `0`), it also means no shadow failed in transport. On an unfloored route, shadow failures are informational and do not change the exit code. None of this is a rate, and Limen cannot supply the rate outside the compared sample. With `compare_status: false`, a new `500` whose body matches legacy's is a match and writes no sink record. The sink holds only mismatches, so its `new_status` values are a selected population. For the 5xx rate itself, probe `new` directly or read new's own metrics.
+- **Latency.** Limen does not measure `new`'s latency in this mode. Measure it outside Limen during this stage, before the first non-zero rung. Drive the same corpus directly at both upstreams, from the same place, against the same data, timed at the same boundary (Section 10), and compare p95/p99 per route. Until that measurement exists the row is unmeasured, never green. From the first non-zero `percentage_split` rung, `limen_request_duration_seconds{route,upstream="new"}` appears beside `upstream="legacy"` for the per-rung recheck (8.4). On a `failover_safe` route, though, the two histograms measure different boundaries. A successful new response within `server.request_body_limit_bytes` is recorded only after it is fully buffered. One over that limit is recorded when it starts streaming, so new's boundary varies with response size. Legacy-selected responses are recorded once their headers arrive. Compare like with like there, or account for that buffering. The shadow leg gives only a ceiling: every compared shadow finished within `timeouts.shadow_ms`. A shadow whose body overran that deadline is recorded as `reason="error"`, not `timeout`, so zero `timeout` alone does not mean nothing overran.
+
 ### 8.2 Stage 6 — Shadow
 
 **Action:** wire the route into Limen as `shadow_legacy_primary` with the validated contract referenced, comparison enabled, and a sensible `sample_rate` for the route's volume.
@@ -381,7 +402,7 @@ Three fields there are not about routing at all — they exist so the gate in 8.
 - **`diff_sink.dir`** (top level) — the durable JSONL trail. Reset it whenever the proxy under test starts; a sink carried across restarts makes the verdict's reconciliation fail, correctly.
 - **`debug.sink_canary: true`** (top level) — exposes `POST /debug/canary`, without which `limen verdict --canary` is refused rather than silently skipped.
 
-**Watch, on the dimensions the gate does not cover:** new-upstream latency and error metrics against legacy (the 8.1 budget rows the proxy cannot judge for you), and the two *separate* skip families —
+**Watch, on the dimensions the gate does not cover:** the 8.1 latency and error rows, and the two *separate* skip families. Judge those two rows as [8.1](#81-the-budget-define-before-shadowing) describes. The skip families are:
 
 - `limen_comparison_skipped_total{reason}`: a shadow was planned but the comparison did not happen. `response_too_large` (body over `max_body_bytes`), `event_stream` (the response declared `text/event-stream`, skipped by content type before a byte was buffered), `response_buffer_timeout` (buffering outlived what was left of the request's `primary_ms` — a trickling or stalled body, of declared length or not).
 - `limen_shadow_skipped_total{reason}`: no shadow was dispatched at all. `concurrency_limit` (the shadow-concurrency cap was saturated) and `request_too_large` (a write-shadowing route's request body could not be buffered for replay).
@@ -404,7 +425,7 @@ In one invocation `verdict` waits for the shadow/comparison/sink pipeline to qui
 
 | Exit | Meaning | The gate's response |
 |---|---|---|
-| `0` | Drained, floors met, sink integral, zero non-canary mismatches. | Advance — subject to the latency/error rows of 8.1, which `verdict` does not judge. |
+| `0` | Drained, floors met, sink integral, zero non-canary mismatches. | Advance — subject to the latency/error rows of 8.1. `verdict` measures no latency, and it covers errors only on the compared sample. |
 | `10` | Mismatches found. | Triage each one: real divergence → fix `new`; incidental → a narrow contract rule; intended → `intentional-change`. |
 | `20` | Floors unmet: a route below its floor (**starved**), or at its floor with sampled work that went uncompared — a skip of any reason, or a shadow that never answered (**undermined**) — or a config that floors nothing at all. | **Not** a parity result, and the two causes take different medicine. Starved: extend the traffic corpus (or fix the config) — the run proved nothing about that route. Undermined: read the verdict's remedy line for the named reason (raise `max_body_bytes`, raise `server.shadow_concurrency_limit` or lower drive concurrency, raise `timeouts.primary_ms`, or — for `event_stream` — unfloor the route and relay it instead), change that one knob, **restart limen, and re-drive the floors**. A shadow failure (`timeout`/`error`) is a finding about `new`, not about limen's tooling — read its logs before re-running. The counters behind this check are cumulative for the process's life, so re-running `verdict` alone against the same process stays `20`. |
 | `30` | Sink integrity: dropped sink records, unparseable sink lines, counter routes this config does not know, per-route disagreement between sink and engine — or, with `--canary`, a canary that never landed or one on which sink and engine disagree. | Stop. Trust none of the numbers in this run until the sink is understood. |
@@ -452,7 +473,7 @@ exit "$verdict_exit"
 
 **The page is not the gate.** `limen report --format html` exits `0` whenever the page was produced — including a page that is nothing but failures, because a CI artifact that vanishes on a bad run is one nobody looks at. `limen verdict`'s exit code is the gate; the page is how a human reads the campaign afterward.
 
-**Gate to proceed:** `limen verdict --canary` exits `0` **and** the latency/error rows of the budget (8.1) are green over a meaningful observation window, with every recurring mismatch resolved or explained.
+**Gate to proceed:** `limen verdict --canary` exits `0` **and** the error row of the budget (8.1) is green over a meaningful observation window, with every recurring mismatch resolved or explained, **and** the latency row is green. That row must be measured outside Limen during this stage (8.1). No `upstream="new"` latency sample exists until a non-zero rung, and raising the flag to one is exactly what this gate decides. Never call an unmeasured row green.
 
 ### 8.4 Stage 7 — Percentage rollout
 
@@ -476,7 +497,7 @@ routes:
 ```
 
 Raise the flag at runtime (no redeploy) via the flag provider. After each increase:
-- Recheck the budget (8.1) on the now-live new traffic.
+- Recheck the budget (8.1) on the now-live new traffic. The `upstream="new"` series exist from the first request new serves. On a `failover_safe` route, read the duration histograms with the boundary caveat from 8.1. One more caveat: on a `failover_safe` route, a new-side `5xx` that Limen replays to legacy is recorded under `upstream="legacy"`, so new's 5xx rate cannot be read reliably from Limen's request metrics there ([resilience → the cost of `failover_safe`](https://charliek.github.io/limen/guides/resilience/#the-cost-of-turning-failover_safe-on)).
 - For write routes, run the read-back drift check (7.3).
 - Watch `limen_rollout_resolved_target_percentage{route}` confirm the flag actually took. It is the flag-resolved **target**, deliberately not the effective share — an open breaker doesn't move it — and a stale-flag fail-safe reads `0` here (with the staleness gauges saying why) even while the flag file still claims otherwise.
 - Only advance when green; otherwise **hold or roll back** (8.5).
@@ -485,13 +506,13 @@ Raise the flag at runtime (no redeploy) via the flag provider. After each increa
 
 Roll back **immediately** if any of the following, during shadow or rollout:
 
-- New-service **error rate** exceeds the budget → Limen's **circuit breaker** opens automatically and returns traffic to legacy; investigate before re-enabling.
+- New-service **error rate** exceeds the budget → **lower the rollout flag** to the last-green percentage (or set `legacy_only`), and investigate before raising it again. Do not wait for the circuit breaker to do this. The breaker opens on its own `failure_rate_threshold` over a `min_requests` window, not on the relative-to-legacy budget. It is off unless `circuit_breaker.enabled`, and it only sees requests that a `percentage_split` or `failover_to_legacy` route sent to `new` — shadow outcomes never reach it.
 - New-service **latency** breaches the budget (and no exception covers it) → **lower the rollout flag** to the last-green percentage.
 - **Parity** regresses (mismatch rate climbs, or a high-risk-field mismatch appears) → lower the flag; reproduce as a Pharos scenario; fix; re-refine.
 - **Data drift** appears in read-back checks → halt rollout at the current percentage; do not advance until resolved.
 
 Rollback mechanisms, in order of automaticity:
-1. **Circuit breaker** (automatic, per Limen config) — covers error/timeout spikes with no human action.
+1. **Circuit breaker** (automatic, per Limen config, on `percentage_split`/`failover_to_legacy` routes with `circuit_breaker.enabled`) — covers error/timeout spikes past its own threshold with no human action.
 2. **Lower the rollout flag** (manual, instant, no redeploy) — the primary deliberate rollback lever.
 3. **Set the route to `legacy_only`** (config change) — full stop for that route.
 
@@ -515,7 +536,7 @@ A generic lookup table mapping the **common ways two HTTP/JSON implementations d
 | **Array ordering** (incidental) | Different query/iteration order over the same data | `sort_arrays` by a stable key | Only if order is genuinely non-contractual |
 | **Array as set** | Order truly meaningless (e.g. permissions) | `unordered_arrays` | Confirm order isn't part of the contract |
 | **Enum casing/spelling** (`ACTIVE` vs `enabled`) | Re-implementation chose different tokens | `enum_aliases` | Document the mapping; ensure it's intended, not a typo |
-| **Null vs. absent field** | Frameworks differ on emitting `null` vs. omitting | Decide the contract: assert the intended one; normalize the other only if the difference is agreed-incidental | This is often a **real** API contract question — don't paper over it reflexively |
+| **Null vs. absent field** | Frameworks differ on emitting `null` vs. omitting | Decide the contract: assert the intended one; normalize the other only if the difference is agreed-incidental | This is often a **real** API contract question — don't paper over it reflexively. Serializer defaults and a probe: 9.1 |
 | **Number formatting** (`1.0` vs `1`, trailing zeros) | Serializer numeric handling | Normalize only if semantically equal and agreed incidental | Precision changes can be real |
 | **Error envelope shape** (`{error:{code,message}}` vs `{message}`) | Frameworks have different default error formats | Assert the **intended** envelope explicitly (`subset`/`explicit_expectations`); if the new shape is intended, tag `intentional-change` | Error contracts matter to clients — be deliberate |
 | **Default/missing pagination fields** | Framework defaults differ | Assert intended pagination contract; normalize only incidental metadata | — |
@@ -524,6 +545,24 @@ A generic lookup table mapping the **common ways two HTTP/JSON implementations d
 
 **Rule of thumb for the catalog:** the left column is *incidental representation*; the right column makes it disappear **narrowly**. Anything that might be a real API-contract decision (null-vs-absent, error envelopes, number precision) is flagged "caution" because the correct move is often to **assert the intended behavior**, not to normalize the difference away.
 
+### 9.1 Request-handling edges in a JVM → Rust/Go rewrite
+
+The table above covers response *representation*. A rewrite off the JVM also changes how requests are *parsed and validated*. The JSON binder, the string APIs, and the serializer each have different defaults on either side, and a happy-path comparison exercises none of them. Most rows below are **not contract rules**: no normalization makes "new accepts what legacy rejects" go away. Each one becomes a Stage 3 validation or edge scenario (Section 3), pinned to what legacy actually does. Then either fix `new` to match, or record an `intentional-change`.
+
+Run the probe against legacy before writing the expectation. The library behavior named in each row is the common default, not a promise about your service, because framework configuration overrides most of it. Most of these edges sit on write bodies, which Limen does not shadow by default, so Pharos scenarios catch them, not the shadow.
+
+| Difference pattern | Why it happens | Probe that confirms legacy | Handling |
+|---|---|---|---|
+| **String length units** | Java's `String.length()`, and length validators built on it, count UTF-16 code units, so an emoji counts as 2. Rust's `str::len()` and Go's `len()` count UTF-8 bytes (`é` is 2 bytes, an emoji 4). Rust's `chars().count()` and Go's `utf8.RuneCountInString` count Unicode scalars, where both are 1. | At a length limit `N`, send a value of `N` × `é`, then a value of `N` × an emoji (e.g. U+1F600). UTF-16 counting accepts the first and rejects the second. Byte counting rejects both. Scalar counting accepts both. Repeat for any length a response reports or truncates to. | Count in legacy's unit in `new`'s validator, with one scenario per boundary. |
+| **"Blank" checks and trimming** | Java's `String.trim()` strips only code points ≤ U+0020. That covers space and the C0 control characters (U+0000–U+001F), but not NBSP (U+00A0) or any other Unicode space. Java's `strip()`/`isBlank()` use `Character.isWhitespace`, which covers U+2003 but still not NBSP or U+0001. Rust's `str::trim()` and Go's `strings.TrimSpace` strip Unicode whitespace, NBSP included, and leave other control characters such as U+0001 in place. | Send a required string as `"\u00a0"` (NBSP only), then `"\u0001"` (a control character only), then `"\u2003"` (an em space only). Read back any field the handler trims on write. A `trim()`-based check treats only `\u0001` as blank. `isBlank()` treats only `\u2003` as blank. Rust or Go trimming treats both `\u00a0` and `\u2003` as blank. | Reproduce legacy's character set explicitly in `new`. Don't rely on the language's `trim`. |
+| **Numeric input coercion** | Jackson's defaults truncate a float literal into an integer field (`1.0` → 1, `1.5` → 1, `1e2` → 100), accept a numeric string (`"42"`), read `-0` as `0`, and reject values outside the target type's range. serde_json rejects `1.0`, `1e2`, `"42"`, and even `-0` for an integer field, because it parses `-0` as a float. It accepts up to 2^64−1 for a `u64` field but only up to 2^63−1 for `i64`. Go's `encoding/json` rejects `1.0`, `1e2`, `"42"`, and out-of-range values. It reads `-0` as `0` for a signed integer field but rejects it for an unsigned one. | For each numeric field, send `1`, `1.0`, `1.5`, `1e2`, `"1"`, `-0`, `9223372036854775807`, `9223372036854775808`, and a negative value where the domain is unsigned. Record the status, and read back what was stored (did `1.5` store `1`?). | Accept and reject exactly what legacy does, which often needs a custom deserializer in `new`. A value legacy silently truncates is a candidate for `intentional-change`; never treat it as parity. |
+| **Duplicate JSON keys** | Jackson keeps the last occurrence unless strict duplicate detection is enabled. Go's `encoding/json` keeps the last value for a scalar. A repeated object decoded into a **struct field** (including a map-valued one) **merges** into what the first occurrence filled, but decoded into a `map[string]any` it replaces the entry, so only the last survives. A serde-derived struct rejects a repeated *known* field (`duplicate field`) but ignores a repeated unknown one, while serde into a map or `Value` keeps the last. | Send `{"name":"a","name":"b"}` on a write. Where the schema has an object-valued field, also send it twice with different members (`{"obj":{"x":1},"obj":{"y":2}}`). Record the status and what was stored: the last value, a merge, or a rejection. The result depends on the type `new` decodes into, so probe each destination type it uses. | Match legacy. A serde struct that rejects a body legacy accepted is a status divergence on that write. |
+| **Unknown request fields** | Jackson 2.x fails on unknown properties by default, and Spring Boot's auto-configured Jackson 2.x mapper turns that off. Jackson 3 ignores them by default. serde ignores unknown fields unless the type has `#[serde(deny_unknown_fields)]`. Go ignores them unless the decoder calls `DisallowUnknownFields`. | Send a valid body with one extra field (`"zzUnknown": 1`), then one with a misspelled known field. | Match legacy. A misspelling that legacy silently ignores is behavior clients depend on without knowing it. |
+| **Request `Content-Type` laxness** | A Spring `@RequestBody` bound to a JSON object type, which the Jackson converter reads, answers a missing or non-JSON `Content-Type` with `415`. A `@RequestBody String` can still accept `text/plain` through the string converter. Spring's Jackson converter also decodes a declared non-Unicode charset, while serde_json accepts only UTF-8. axum's `Json` extractor answers a missing or non-JSON type with `415`, and accepts `application/json` and any `application/*+json`. Go's `encoding/json` never reads the header, so a hand-written Go handler accepts any bytes that parse. | Send the same valid body with no `Content-Type`, with `text/plain`, and with `application/vnd.example+json`. Then send `application/json; charset=ISO-8859-1` with a body actually encoded in Latin-1 that contains `é` (byte `0xE9`), and read the value back: is it `é`, mojibake, or a rejection? | Match legacy's status per case. The charset case decides whether `new` must decode a non-UTF-8 body. |
+| **Empty, `null`, and non-object bodies** | Spring rejects an empty body, a `null` body, or an array where an object is expected on a required `@RequestBody`, typically with `400`. axum's `Json<T>` answers depend on `T`. For a struct with required fields, an empty body gets `400`, while `null` or `[]` (valid JSON of the wrong type) gets `422`. But `Json<Value>` accepts both, and a derived struct without `#[serde(flatten)]` also accepts a positional array whose elements match its fields in order, type, and count (`[]` too, if the struct is `#[serde(default)]`). Go's `encoding/json` errors on an empty body or an array, but decodes `null` into a struct **without error**: the struct stays zero-valued and the handler runs on empty input. | Send each write an empty body, then `null`, `[]`, `{}`, a bare string, and a populated positional array (a valid body's field values as a JSON array, in the order `new`'s type declares its fields), each with a JSON `Content-Type`. | Pin legacy's status and error envelope per case. In Go, reject `null` explicitly. |
+| **Serializer null vs. absent** (responses) | Jackson's default inclusion (`Include.ALWAYS`) writes an unset nullable field as `"field": null`. serde also writes `None` as `null`, unless the field has `skip_serializing_if = "Option::is_none"`, which omits it. Go writes a nil pointer as `null`, but `omitempty` omits it, and it also drops zero values that legacy emitted (`0`, `false`, `""`, an empty list or map). | Read a resource whose nullable fields are unset. Then read one whose numeric field is `0`, boolean is `false`, string is `""`, and list is empty. Compare raw bodies, not parsed objects. | Match legacy field by field. This is the *Null vs. absent* row above with a known cause, so don't normalize it unless the difference is agreed incidental. |
+| **Explicit `null` vs. absent in PATCH / merge-patch bodies** | In a merge patch (RFC 7396), `"field": null` means clear and an absent field means leave unchanged. A JVM handler that reads the body into a `Map`/`JsonNode`, or a presence-tracking wrapper, sees the difference. A serde `Option<T>` field or a Go pointer field decodes both to `None`/`nil`, so `new` cannot tell clear from leave-unchanged. | On a resource whose nullable field is set, PATCH `{"field": null}` and read back: was it cleared? Then set the field to a non-null value again (or use a second seeded resource), PATCH a body that omits it, and read back: was it kept? Running the omission probe on the already-cleared resource cannot fail a handler that wrongly clears omitted fields. | Model the field as tri-state in `new`. In Rust, use `Option<Option<T>>` with a presence-aware deserializer (a plain `Option<Option<T>>` still reads `null` as absent). In Go, decode into `map[string]json.RawMessage`. These are the clear and omit cases of [Section 6.2](#62-writes-postputpatchdelete)'s write coverage. |
+
 ---
 
 ## 10. Monitoring & Validating the Proxy Itself
@@ -531,7 +570,7 @@ A generic lookup table mapping the **common ways two HTTP/JSON implementations d
 Distinct from validating the service: you must also confirm **Limen** is behaving correctly, so that a "green" reading reflects reality.
 
 **Confirm the proxy is healthy (separately from the service):**
-- **Proxy overhead within SLO.** Limen's added latency on the streaming path (p50 < 1 ms, p99 < 5 ms) and buffer-for-compare path (p50 < 3 ms) — from Limen's own latency metrics, isolating proxy time from upstream time. If proxy overhead is out of band, a latency reading attributed to the new service may actually be the proxy.
+- **Proxy overhead within SLO.** Limen's added latency on the streaming path (p50 < 1 ms, p99 < 5 ms) and buffer-for-compare path (p50 < 3 ms). Limen exports no proxy-only latency series — `limen_request_duration_seconds` includes the upstream round-trip — so estimate overhead by comparing that histogram against the same corpus sent directly to the upstream, timed at the same boundary. Limen records a streamed response once the upstream's headers arrive, before the body transfers, but records a sampled buffer-for-compare response only after the whole body is buffered. Time the direct requests the same way, and treat the `proxy_overhead` benchmarks (`benches/`) as evidence for the dominant per-request costs, not an end-to-end figure. If proxy overhead is out of band, a latency reading attributed to the new service may actually be the proxy.
 - **Shadow truly off the client path.** Client-visible latency must be unchanged whether shadowing is on or off (Limen guarantees this architecturally; verify it in staging by toggling shadow and watching client latency).
 - **Comparison coverage.** Watch `limen_comparison_skipped_total` by reason — `response_too_large`, `event_stream` (the response declared `text/event-stream`, so it is skipped by content type before any buffering), `response_buffer_timeout` (buffering outlived what was left of the request's `primary_ms`; a slow body hits this whether or not it declared a `Content-Length`) — and, separately, `limen_shadow_skipped_total`'s `concurrency_limit` / `request_too_large`, where no shadow was dispatched at all. If most eligible traffic lands in these, your parity result rests on too little data: raise `max_body_bytes` for the first reason, but note the other two are deadline- and content-type-driven and will not move. Remember that an unsampled request is recorded in neither family — coverage is `sample_rate` against eligible volume, computed by you, not a metric to read.
 - **Flag health.** Provider health and staleness metrics green — a stale flag provider means rollout decisions may be running on the fail-safe (legacy), which is safe but means your "rollout" isn't actually happening.
@@ -567,14 +606,15 @@ Both must be true to call a route green. Conflating them is a common mistake: a 
 [ ] DISCOVER: route classified (read/write, idempotent?, risk, side-effects), samples captured
 [ ] OBSERVE: profiled unsampled; suggest-routes disposition recorded; candidates confirmed against source
 [ ] DRAFT: contract rules derived narrowly from observable signals; check-contract passes
-[ ] GENERATE: success + error + edge scenarios; correctly tagged; `bun run validate` passes
+[ ] GENERATE: success + error + edge scenarios; correctly tagged; `bun run validate`
+    (`bun run ftest -- validate` in the pharos checkout) passes
 [ ] REVIEW (human gate): contract justified & narrow; scenarios = intended behavior; signed off
 [ ] REFINE: suite green; failures diagnosed correctly; no unjustified ignore rules; contract validated
 [ ] BUDGET: latency + error-rate + parity budget defined (with any documented exceptions)
 [ ] SHADOW (reads): Limen shadow_legacy_primary; min_comparisons floor set; diff_sink reset at start
 [ ] GATE: limen verdict --canary exits 0; latency/error budget green over the window;
     report --format html captured as the campaign artifact
-[ ] WRITES: validated via new_only_assert (+ read-back); no shadow; no auto-failover on POST
+[ ] WRITES: validated via new_only_assert (+ pinned or paired read-back); no shadow; no auto-failover on POST
 [ ] ROLL OUT: 0→1→5→25→50→100, rechecking budget at each step; drift checks for writes
 [ ] PROXY HEALTH: overhead within SLO; shadow off client path; coverage adequate; flags/breaker healthy
 [ ] ROLLBACK READY: breaker configured; flag lever understood; legacy_only escape known

@@ -64,6 +64,40 @@ both, or neither; when no upstream answers at all, none of that response
 metadata is recorded and `transport_errors` counts the silent upstream
 instead.
 
+### Unrouted requests and the catch-all route
+
+The route table is also the proxy's whole vocabulary. A request no route
+matches never reaches legacy: Limen answers it itself — a `404` whose
+`text/plain` body is `limen: no route matched`, carrying its `x-request-id`
+— and that request is neither counted in `limen_requests_total` nor
+observed. Matching is
+method **and** path, so a routed path called with a method no route lists gets
+the same `404`, not legacy's own `405`. In front of a live service, an
+inventory that missed a path silently changes what that path's clients see.
+
+So when fronting real traffic, add a catch-all that relays the remainder
+untouched:
+
+```yaml
+- id: "catch-all"
+  match:
+    methods: ["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"] # every verb the service serves
+    path_prefix: "/"
+  legacy_upstream: "https://legacy.internal"
+  mode: "legacy_only"
+```
+
+It costs no precedence: every other prefix is longer, and every
+`path_template` lies under `/`, which the [overlap
+rules](../reference/config-reference.md#matchpath_template-route-by-shape-not-just-by-subtree)
+accept as a refinement. It is profiled like any other route, so its
+`observations` count is a measure of what your inventory missed. The
+classifier pins it `relay_only` with reason `catch-all` from the config alone,
+before reading any traffic, because comparing `/` would shadow every path
+nobody has looked at — keep it `legacy_only` for the whole campaign, never a
+comparison route, and write that mode back if a draft re-modes it (see [CLI →
+`suggest-routes`](../reference/cli.md#suggest-routes) Notes).
+
 ## 2. Drive representative traffic
 
 Point real (or realistically shaped) traffic at the proxy. What "representative"
@@ -72,10 +106,25 @@ means here matters more than volume: the classifier's dangerous rules are
 route — so a corpus that never exercises a route's flow-hop paths will tell you
 nothing about them, no matter how many times it hits the route's happy path.
 A route with fewer than `--min-samples` reads (`GET`/`HEAD`; 5 by default) is
-not classified at all — writes and transport errors do not count toward the
-floor. A functional test suite driven once through each endpoint will trip
-that floor on nearly every route, which is the correct, unhelpful answer for
-that corpus.
+not classified at all. Writes do not count toward the floor. A read that
+failed in transport does count, though it adds no stability evidence. A
+functional test suite driven once through each endpoint will trip that floor
+on nearly every route, which is the correct, unhelpful answer for that corpus.
+
+**A route that carries only writes never clears the floor.** That includes a
+`POST` used as a logical read. Such a route drafts `relay_only
+(insufficient-reads)` at any volume, since no classifier rule reads writes —
+unless an earlier rule answers first. A sampled profile reports
+`partial-sample`, a `/` route `catch-all`, and a route the corpus never
+reached `no-observations`. Take the route's class from its method and handler
+source instead: [class F](classifying-routes.md#f-writes) for a mutating write.
+Record that class in the inventory, not "insufficient-reads". The label is not
+a danger finding about the route, and the route is not "not yet known".
+
+Lowering `--min-samples` to `0` doesn't help. After those same earlier rules,
+the route lands on `compare_narrowed (no-repeat-evidence)`, which is no more
+evidence than before. If its `match.query_present` names a one-time-token
+parameter, it lands on `one-time-token-query` instead.
 
 ### Sampling and classification are mutually exclusive
 
@@ -219,6 +268,43 @@ once succeeded. The asymmetry is the point: an error response can still
 *condemn* a route (it lands in `status_classes`, where R8a reads it), it can
 never *vouch* for one.
 
+### What a request fingerprint is
+
+The stability counters key on a **request fingerprint**: the method, the
+concrete request path — raw, *not* folded into the route's template — and the
+sorted, de-duplicated query-parameter **names**. Query values, parameter
+order, headers (credentials included), cookies, and the body play no part, and
+the fingerprint itself is a keyed hash that never leaves the process. So
+`GET /orders?page=1` and `GET /orders?page=2` are one fingerprint, `GET
+/orders` is another, and `/orders/1` and `/orders/2` stay two even under
+`/orders/{id}` — the distinct-path count is template-normalized, the
+fingerprint deliberately is not.
+
+Over successful (`2xx`) upstream reads only:
+
+- `length_repeats` counts reads whose fingerprint had been seen before, with
+  a `Content-Length` both times. A fingerprint's first sighting is never
+  counted, so two ids read three times each is `4`, not `6`.
+- `length_varied` counts those repeats whose length differs from the length
+  *last* recorded for that fingerprint. It is a **subset** of
+  `length_repeats` — `length_varied <= length_repeats` holds of every
+  profile — so never add the two.
+- `length_missing` counts reads with no `Content-Length` at all; they are
+  never fingerprinted (next section).
+
+Past `observe.max_fingerprints` distinct fingerprints a new one is dropped and
+`fingerprint_overflow` set; repeats of the fingerprints already held still
+count.
+
+So a route whose response depends on a query *value* (pagination, a filter, a
+search term) or on who is asking folds distinct requests into one
+fingerprint. Driven with several values, it reports `length_varied > 0`
+whenever two of those responses differ in length — equal-length pages vary
+nothing — and then lands `compare_narrowed (body-varies)` even against
+unchanged data, unless a relay-only rule fires first. That is evidence about
+the *profile*, not the route — see
+[the false demotions](classifying-routes.md#what-observation-can-and-cannot-tell-you).
+
 ### Length-less responses collapse to one bucket
 
 `length_repeats` / `length_varied` / `length_missing` are the whole stability
@@ -298,7 +384,7 @@ safer one wins a tie):
 |---|---|
 | `relay_only` | Either a danger signal fired, or too little was observed to say anything. Never compare. |
 | `compare_narrowed` | Nothing dangerous fired, but the response body cannot be trusted for equality (varying length, more than one content type, or incomplete stability evidence). Compare status, not body. |
-| `compare_candidate` | A request fingerprint repeated with a stable length and no danger signal fired. **Not a safety claim** — see [classifying routes](classifying-routes.md#what-observation-can-and-cannot-tell-you) for exactly what this can and cannot establish. |
+| `compare_candidate` | A [request fingerprint](#what-a-request-fingerprint-is) repeated with a stable length and no danger signal fired. **Not a safety claim** — see [classifying routes](classifying-routes.md#what-observation-can-and-cannot-tell-you) for exactly what this can and cannot establish. |
 
 Every rule's machine-readable `reason` (`redirecting-read`, `mints-state`,
 `one-time-token-query`, `stability-unobserved`, and eleven others) is a stable,

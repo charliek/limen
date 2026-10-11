@@ -80,7 +80,7 @@ diff_sink:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `dir` | path | — | Directory for the daily `mismatches-<UTC date>.jsonl` files. Must be non-empty; need not exist (created on the first mismatch). Relative paths resolve against the process working directory, like `flags.file.path`. |
+| `dir` | path | — | Directory for the daily `mismatches-<UTC date>.jsonl` files. Must be non-empty; need not exist (created on the first mismatch). Relative paths resolve against the process working directory, like `flags.file.path` — unlike a route's [`contract`](#routes) reference, which resolves against the config file's directory. |
 
 Every comparison **mismatch** is appended as one JSON line — already redacted by
 the comparison engine — alongside the usual metrics and mismatch log, which are
@@ -104,13 +104,20 @@ Each route declares exactly one mode and the upstreams it needs.
 | `legacy_upstream` | url | — | Required unless mode is `new_only`. |
 | `new_upstream` | url | — | Required unless mode is `legacy_only`. |
 | `mode` | enum | — | `legacy_only` \| `new_only` \| `shadow_legacy_primary` \| `percentage_split` \| `failover_to_legacy`. |
-| `contract` | string | `null` | `path#routeId` reference; conflicts with inline behavioral rules. |
+| `contract` | string | `null` | `path#routeId` reference; conflicts with inline behavioral rules. A relative `path` resolves against the **config file's directory**, not the working directory that `diff_sink.dir`, `flags.file.path`, and `upstream_tls.ca_bundle_path` resolve against — so `./contracts/x.contract.yaml` means "beside the config" wherever `limen` is run from. |
 | `failover_safe` | bool | `false` | Attest the route's operations idempotent, allowing Limen to replay a failed in-flight request to legacy. Takes effect on `failover_to_legacy` routes always, and on `percentage_split` routes for whichever requests the split sent to new (see below). |
 | `rollout` | block | `null` | Required for `percentage_split`. |
 | `timeouts.primary_ms` / `shadow_ms` | int | `2000` / `2000` | Must be > 0. |
 | `comparison` | block | disabled | Operational gate + optional inline behavioral rules. |
 | `circuit_breaker` | block | disabled | Per-route breaker (spec §9.1). |
 | `budget` | block | `null` | Forward-looking rollout budget (validated, not enforced in MVP). |
+
+**A request that matches no route** is answered by Limen itself — `404`, body
+`limen: no route matched` — and never reaches an upstream. Matching is method
+and path, so a routed path called with an unlisted method gets the same `404`,
+not legacy's `405`. A `legacy_only` route on `path_prefix: "/"` listing every
+method the service serves relays that remainder to legacy instead
+([when to add one](../guides/observe-mode.md#unrouted-requests-and-the-catch-all-route)).
 
 ### `match.query_present` / `match.query_absent` (query-aware matching)
 
@@ -307,7 +314,7 @@ validation error).
 | Field | Type | Default | Notes |
 |---|---|---|---|
 | `max_body_bytes` | int | `262144` | Bound on the buffered comparison body. A response over this limit skips comparison rather than buffering unbounded (`response_too_large`); on a route that opted a write into `shadow_methods`, an over-limit *request* body skips shadowing instead (`request_too_large`) and streams to the primary unchanged. Both are, at verdict time, uncompared sampled work: either one fails a floored route's evidence, even once its comparison count clears `min_comparisons`. |
-| `min_comparisons` | int | unset (= `1`) | The minimum number of comparisons [`limen verdict`](cli.md#verdict) requires this route to have recorded for its floors check to pass. `0` opts the route out of the floor explicitly — a visible exemption, not a silent gap. **Read only by `limen verdict`**; the proxy itself ignores it, so it has no effect on `run`, `validate-config`, or `print-routes`. A campaign config in which no enabled route carries a non-zero floor fails the floors check outright — a verdict over a config that compares nothing proves nothing. An explicit positive floor on a `enabled: false` route is a validation error — it could never be met, and silently dropping it from the floors check would fake coverage. **Clearing the floor is necessary but no longer sufficient**: the verdict's `met` for this route also requires that nothing sampled on it went uncompared — no size/timeout/concurrency skip and no failed shadow. A route whose only skip reason is `event_stream` can never satisfy that while floored (every sampled request skips on content type before a byte is buffered) — unfloor it (`0`) and relay it instead of driving more traffic at it. See [prove your lens bites §4](../guides/prove-your-lens-bites.md#4-skips-prove-nothing-sampled-slipped-through-uncompared) for the remedy per reason, and note the fix always ends in a restart: these counters never reset within a running process. |
+| `min_comparisons` | int | unset (= `1`) | The minimum number of comparisons [`limen verdict`](cli.md#verdict) requires this route to have recorded for its floors check to pass. `0` opts the route out of the floor explicitly — a visible exemption, not a silent gap. **Read only by `limen verdict`**: it has no effect on runtime request handling. Its one load-time rule — the disabled-route rule below — is enforced by the validator `run`, `validate-config`, and `print-routes` all share, so a violation refuses startup as well as validation; `print-routes` never displays the floor itself (see [where floors are visible](cli.md#print-routes)). A campaign config in which no enabled route carries a non-zero floor fails the floors check outright — a verdict over a config that compares nothing proves nothing. An explicit positive floor on a `enabled: false` route is a validation error — it could never be met, and silently dropping it from the floors check would fake coverage. **Clearing the floor is necessary but no longer sufficient**: the verdict's `met` for this route also requires that nothing sampled on it went uncompared — no size/timeout/concurrency skip and no failed shadow. A route whose only skip reason is `event_stream` can never satisfy that while floored (every sampled request skips on content type before a byte is buffered) — unfloor it (`0`) and relay it instead of driving more traffic at it. See [prove your lens bites §4](../guides/prove-your-lens-bites.md#4-skips-prove-nothing-sampled-slipped-through-uncompared) for the remedy per reason, and note the fix always ends in a restart: these counters never reset within a running process. |
 
 ### `comparison.shadow_methods` (shadowing a write)
 
