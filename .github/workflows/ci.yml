@@ -37,6 +37,32 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+  # RustSec advisories against Cargo.lock, as its own job so a red run is
+  # attributable to a dependency advisory rather than to the build or the tests.
+  # `cargo audit` reads the lock only (no build), so it needs no cache. Warnings
+  # such as an unmaintained crate print but do not fail the job; only a
+  # vulnerability does. An advisory with no fix yet gets an `--ignore` here with a
+  # reason comment and a link, never a skipped job.
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain (from rust-toolchain.toml)
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache: false
+
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+
+      - name: cargo audit
+        run: cargo audit
+
   # Single required status check the branch ruleset gates on. Keeping it a
   # separate aggregator job means the required check name stays stable even if
   # build-test later fans out into a matrix.
