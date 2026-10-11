@@ -1148,7 +1148,7 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
         .post(&url)
         .send()
         .await
-        .map_err(|e| InputUnavailable(format!("canary trigger unreachable at {url}: {e}")))?;
+        .map_err(|e| request_failed("canary trigger unreachable at", &url, e))?;
     if !resp.status().is_success() {
         return Err(InputUnavailable(format!(
             "canary trigger refused at {url} (HTTP {}): is `debug.sink_canary: true` set \
@@ -1162,7 +1162,7 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
     let text = resp
         .text()
         .await
-        .map_err(|e| InputUnavailable(format!("cannot read canary response from {url}: {e}")))?;
+        .map_err(|e| request_failed("cannot read canary response from", &url, e))?;
     let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         InputUnavailable(format!(
             "canary trigger at {url} returned a non-JSON body: {e}"
@@ -1221,7 +1221,7 @@ async fn fetch_scrape(
         .get(&url)
         .send()
         .await
-        .map_err(|e| InputUnavailable(format!("control plane unreachable at {url}: {e}")))?;
+        .map_err(|e| request_failed("control plane unreachable at", &url, e))?;
     if !resp.status().is_success() {
         return Err(InputUnavailable(format!(
             "control plane returned HTTP {} for {url}",
@@ -1231,8 +1231,16 @@ async fn fetch_scrape(
     let text = resp
         .text()
         .await
-        .map_err(|e| InputUnavailable(format!("cannot read {url}: {e}")))?;
+        .map_err(|e| request_failed("cannot read", &url, e))?;
     Scrape::parse(&text)
+}
+
+/// A failed request to `url`, as `{context} {url}: {error}`. The error is
+/// rendered `without_url`: the message already names the URL, and reqwest's own
+/// `for url (...)` suffix would print it a second time. (A client-build error has
+/// no request, so no URL to strip.)
+fn request_failed(context: &str, url: &str, error: reqwest::Error) -> InputUnavailable {
+    InputUnavailable(format!("{context} {url}: {}", error.without_url()))
 }
 
 /// Read the sink report; an unreadable directory is exit-50 territory.
@@ -1357,7 +1365,37 @@ mod tests {
     use crate::observability::{ShadowFailure, SkipReason};
 
     fn config(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).expect("test config")
+        yaml_serde::from_str(yaml).expect("test config")
+    }
+
+    /// The URL, query included, appears once: in the message, not again in
+    /// reqwest's `for url (...)` suffix (see [`request_failed`]).
+    #[tokio::test]
+    async fn a_transport_failure_names_the_url_exactly_once() {
+        let client = reqwest::Client::new();
+        let base = "http://127.0.0.1:1/?probe=CANARY-VERDICT";
+        let opts = VerdictOptions {
+            sink_dir: PathBuf::from("."),
+            control_base: base.to_string(),
+            metrics_path: "/metrics".to_string(),
+            canary: false,
+            offline: false,
+            drain_deadline: Duration::from_secs(1),
+            poll_interval: Duration::from_millis(10),
+        };
+        for (error, context) in [
+            (
+                trigger_canary(&client, base).await.unwrap_err(),
+                "canary trigger unreachable at",
+            ),
+            (
+                fetch_scrape(&client, &opts).await.unwrap_err(),
+                "control plane unreachable at",
+            ),
+        ] {
+            assert!(error.0.contains(context), "{error}");
+            assert_eq!(error.0.matches("CANARY-VERDICT").count(), 1, "{error}");
+        }
     }
 
     /// A config with two compared routes (default floor 1) and one exempt.

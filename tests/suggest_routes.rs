@@ -226,12 +226,12 @@ fn comment_text(draft: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn routes_of(draft: &str) -> Vec<serde_yaml::Value> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(draft).expect("yaml");
+fn routes_of(draft: &str) -> Vec<yaml_serde::Value> {
+    let parsed: yaml_serde::Value = yaml_serde::from_str(draft).expect("yaml");
     parsed["routes"].as_sequence().expect("routes").clone()
 }
 
-fn route<'a>(routes: &'a [serde_yaml::Value], id: &str) -> &'a serde_yaml::Value {
+fn route<'a>(routes: &'a [yaml_serde::Value], id: &str) -> &'a yaml_serde::Value {
     routes
         .iter()
         .find(|r| r["id"].as_str() == Some(id))
@@ -623,7 +623,7 @@ fn a_route_that_only_ever_failed_is_relayed_and_says_why() {
     let routes = routes_of(&draft);
     assert_eq!(
         route(&routes, "migrated")["comparison"]["enabled"],
-        serde_yaml::Value::Bool(false),
+        yaml_serde::Value::Bool(false),
         "adoption must not promote a route that has never worked"
     );
 }

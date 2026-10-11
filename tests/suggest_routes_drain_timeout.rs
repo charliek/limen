@@ -40,7 +40,7 @@ async fn a_request_still_in_flight_times_the_quiescence_poll_out() {
 
     let data_port = free_port();
     let control_port = free_port();
-    let config: Config = serde_yaml::from_str(&format!(
+    let config: Config = yaml_serde::from_str(&format!(
         r#"
 server:
   listen_addr: "127.0.0.1:{data_port}"

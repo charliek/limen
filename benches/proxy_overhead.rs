@@ -32,7 +32,7 @@ use limen::routing::{resolve_comparisons, RouteTable};
 
 /// A small, realistic routing table compiled once.
 fn route_table() -> RouteTable {
-    let config: Config = serde_yaml::from_str(
+    let config: Config = yaml_serde::from_str(
         r#"
 routes:
   - id: get-device
@@ -70,7 +70,7 @@ routes:
 /// query. That flips `any_query_conditions`, which is what makes matching parse
 /// the query at all — the cost the unconditioned table above never pays.
 fn query_conditioned_route_table() -> RouteTable {
-    let config: Config = serde_yaml::from_str(
+    let config: Config = yaml_serde::from_str(
         r#"
 routes:
   - id: oauth-verifier

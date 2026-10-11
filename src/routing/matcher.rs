@@ -424,7 +424,7 @@ mod tests {
     use crate::routing::resolve::resolve_comparisons;
 
     fn table(yaml: &str) -> RouteTable {
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = yaml_serde::from_str(yaml).unwrap();
         let comparisons = resolve_comparisons(&config, std::path::Path::new(".")).unwrap();
         RouteTable::build(&config, comparisons).unwrap()
     }

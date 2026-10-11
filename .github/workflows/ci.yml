@@ -37,6 +37,107 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      # Dependency-graph guards: one rustls crypto provider, aws-lc-rs.
+      #
+      # rustls panics in `ClientConfig::builder()` when it cannot name a single
+      # process provider, and redis-rs calls that on every `rediss://` connect.
+      # Two providers in one build (`ring` next to the aws-lc-rs that reqwest
+      # 0.13's `rustls` brings) is exactly that case, and it surfaces at the
+      # first TLS connect in production, never in a plain-`redis://` test. These
+      # steps fail the moment `ring` re-enters; `tests/tls_provider.rs` is the
+      # behavioural half.
+      #
+      # Each asserts on a package LISTING (`cargo tree ... --prefix none
+      # --format '{p}'`, first word of each line, de-duplicated), never on
+      # `cargo tree -i`: `-i` exits 101 when the crate is absent, which is
+      # indistinguishable from cargo breaking, so a guard built on it either
+      # always fails or passes vacuously. The listing is checked for the
+      # forbidden crate being ABSENT and for a positive control being PRESENT:
+      # without the control, an empty or mis-scoped listing would pass for the
+      # wrong reason. An empty listing or a cargo error fails the step
+      # (`set -euo pipefail`). `--target all` so a platform-gated edge cannot
+      # hide the crate.
+      #
+      # They read the resolved graph, not Cargo.lock: `ring` is still in the lock
+      # as an optional dependency of rustls-webpki and quinn-proto that no feature
+      # here enables, so a lock grep would be red from day one.
+      - name: "Guard: rustls has one provider (no ring in the build graph)"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal,build --prefix none --format '{p}' \
+            | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in the normal+build graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx aws-lc-rs "$pkgs"; then
+            echo "::error::positive control failed: aws-lc-rs is not in the normal+build graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx ring "$pkgs"; then
+            echo "::error::ring is in the normal+build graph; two rustls providers make rustls::ClientConfig::builder() panic on a rediss:// connect"
+            cargo tree --locked --target all -e normal,build -i ring || true
+            exit 1
+          fi
+          echo "ok: ring absent, aws-lc-rs present"
+
+      # The same listing with dev-dependencies: a test-only dependency that
+      # enables `ring` would unify into the test graph, where the no-panic tests
+      # and every integration test run, and hide a production-graph problem or
+      # create a test-only one.
+      - name: "Guard: no ring in the dev graph"
+        run: |
+          set -euo pipefail
+          pkgs="$(mktemp)"
+          trap 'rm -f "$pkgs"' EXIT
+          cargo tree --locked --target all -e normal,dev --prefix none --format '{p}' \
+            | awk '{print $1}' | sort -u > "$pkgs"
+          echo "$(wc -l < "$pkgs") packages in the normal+dev graph"
+          if [ ! -s "$pkgs" ]; then
+            echo "::error::the package listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx aws-lc-rs "$pkgs"; then
+            echo "::error::positive control failed: aws-lc-rs is not in the normal+dev graph, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx ring "$pkgs"; then
+            echo "::error::ring is in the normal+dev graph"
+            cargo tree --locked --target all -e normal,dev -i ring || true
+            exit 1
+          fi
+          echo "ok: ring absent, aws-lc-rs present"
+
+      # The feature view of the same fact: which provider features rustls itself
+      # is built with, after unification across the whole graph. rustls 0.23's
+      # `ring` feature pulls in the `ring` crate, so the listings above catch it
+      # too; this one checks the provider on the crate that chooses it, and its
+      # positive control that aws_lc_rs is the feature actually in use.
+      - name: "Guard: rustls is built without its ring feature"
+        run: |
+          set -euo pipefail
+          feats="$(mktemp)"
+          trap 'rm -f "$feats"' EXIT
+          cargo tree --locked --target all -e features -i rustls --prefix none \
+            | sed -n 's/^rustls feature "\([^"]*\)".*$/\1/p' | sort -u > "$feats"
+          echo "rustls is built with: $(tr '\n' ' ' < "$feats")"
+          if [ ! -s "$feats" ]; then
+            echo "::error::the rustls feature listing is empty; the guard proved nothing"
+            exit 1
+          fi
+          if ! grep -qx aws_lc_rs "$feats"; then
+            echo "::error::positive control failed: rustls is not built with aws_lc_rs, so this listing is not the one the guard means to inspect"
+            exit 1
+          fi
+          if grep -qx ring "$feats"; then
+            echo "::error::rustls is built with its ring feature; aws-lc-rs must be its only provider"
+            exit 1
+          fi
+          echo "ok: rustls built with aws_lc_rs and without ring"
+
   # RustSec advisories against Cargo.lock, as its own job so a red run is
   # attributable to a dependency advisory rather than to the build or the tests.
   # `cargo audit` reads the lock only (no build), so it needs no cache. Warnings

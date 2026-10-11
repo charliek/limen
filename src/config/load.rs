@@ -166,7 +166,7 @@ pub fn load(path: &Path, overrides: &ConfigOverrides) -> Result<LoadedConfig, Co
         path: path.to_path_buf(),
         source,
     })?;
-    let de = serde_yaml::Deserializer::from_str(&text);
+    let de = yaml_serde::Deserializer::from_str(&text);
     let mut config: Config =
         serde_path_to_error::deserialize(de).map_err(|e| ConfigLoadError::Parse {
             path: path.to_path_buf(),

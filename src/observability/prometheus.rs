@@ -83,17 +83,31 @@ const DURATION_BUCKETS: &[f64] = &[
 
 static HANDLE: OnceLock<PrometheusHandle> = OnceLock::new();
 
+/// The exporter configuration [`install`] uses, separate so a test can render
+/// through exactly this configuration without taking the process-global recorder.
+///
+/// `REQUEST_DURATION` is the only histogram limen records and it has explicit
+/// buckets, so it never takes the exporter's default-summary path. A second
+/// histogram must not be named ending `count` or `sum` (metrics-exporter-
+/// prometheus 0.18 drops the suffix of a default-summary series that already
+/// ends with one), and label keys must stay `[a-z_]` words (two keys that
+/// sanitize alike render as duplicate series); `rendered_exposition_is_pinned`
+/// pins what every metric below renders as — extend it when one is added.
+fn builder() -> PrometheusBuilder {
+    PrometheusBuilder::new()
+        .set_buckets_for_metric(
+            Matcher::Full(REQUEST_DURATION.to_string()),
+            DURATION_BUCKETS,
+        )
+        .expect("duration buckets are non-empty")
+}
+
 /// Install the global Prometheus recorder (idempotent) and return a handle for
 /// rendering. Safe to call more than once; only the first call installs.
 pub fn install() -> PrometheusHandle {
     HANDLE
         .get_or_init(|| {
-            PrometheusBuilder::new()
-                .set_buckets_for_metric(
-                    Matcher::Full(REQUEST_DURATION.to_string()),
-                    DURATION_BUCKETS,
-                )
-                .expect("duration buckets are non-empty")
+            builder()
                 .install_recorder()
                 .expect("install Prometheus recorder")
         })
@@ -594,6 +608,151 @@ mod tests {
             );
         }
     }
+
+    /// The exposition as a scraper sees it, with the order the exporter never
+    /// promised taken out: families sorted by name, series sorted within one,
+    /// each family's `# TYPE` line kept ahead of its samples. What is left is
+    /// every `# HELP`/`# TYPE`/sample line limen serves, exactly.
+    fn normalized(rendered: &str) -> String {
+        let mut families: Vec<String> = rendered
+            .split("\n\n")
+            .filter(|family| !family.trim().is_empty())
+            .map(|family| {
+                let mut lines: Vec<&str> = family.trim_end().lines().collect();
+                lines[1..].sort_unstable();
+                lines.join("\n")
+            })
+            .collect();
+        families.sort_unstable();
+        families.join("\n\n")
+    }
+
+    /// Every kind of series limen records, rendered through the exporter
+    /// configuration `install` uses, pinned line for line: the counter and gauge
+    /// families with and without labels, and the one histogram with its buckets.
+    /// An exporter bump that changes a name, a label order, a `# TYPE` line or a
+    /// number format — or starts emitting `# HELP`, which limen never asks for —
+    /// fails here instead of in an operator's dashboard. Values are exact binary
+    /// fractions so the histogram's sum renders the same everywhere.
+    #[test]
+    fn rendered_exposition_is_pinned() {
+        let recorder = builder().build_recorder();
+        let handle = recorder.handle();
+        // Rendered inside the closure: the held in-flight guard decrements on
+        // drop, and that must happen under this recorder, not the global one.
+        let rendered = metrics::with_local_recorder(&recorder, || {
+            record_request("alpha", "GET", Upstream::Legacy, 200, 0.25);
+            record_request("alpha", "GET", Upstream::Legacy, 200, 0.5);
+            record_request("alpha", "GET", Upstream::Legacy, 503, 2.0);
+            record_upstream_error("alpha", Upstream::New);
+            record_upstream_timeout("alpha", Upstream::Legacy);
+            shadow_dispatched("alpha");
+            shadow_skipped("alpha", SkipReason::ConcurrencyLimit);
+            shadow_failed("alpha", ShadowFailure::Timeout);
+            comparison("alpha", false);
+            comparison_skipped("alpha", SkipReason::ResponseTooLarge);
+            diff_sampled("alpha");
+            observe_observation("alpha");
+            register_verdict_series();
+            diff_sink_enqueued();
+            diff_sink_dropped(SinkDropReason::QueueFull);
+            let _held = shadow_in_flight();
+            set_breaker_state("alpha", BreakerState::HalfOpen);
+            record_breaker_transition("alpha", BreakerState::Open, BreakerState::HalfOpen);
+            set_rollout_target_percentage("alpha", ResolvedPercentage::Percentage(25.0));
+            set_flag_health(false, Some(1.5), 2);
+            handle.render()
+        });
+
+        assert_eq!(normalized(&rendered), PINNED_EXPOSITION);
+    }
+
+    /// Captured from metrics-exporter-prometheus 0.17.2 before the bump to 0.18.3,
+    /// which renders it byte for byte the same (none of the 0.18 changes —
+    /// `_total` on HELP/TYPE under `with_recommended_naming`, suffix and
+    /// duplicate-label handling for default summaries — touches this vocabulary).
+    const PINNED_EXPOSITION: &str = r#"# TYPE limen_breaker_transitions_total counter
+limen_breaker_transitions_total{route="alpha",from="open",to="half_open"} 1
+
+# TYPE limen_circuit_breaker_state gauge
+limen_circuit_breaker_state{route="alpha",upstream="new"} 1
+
+# TYPE limen_comparison_skipped_total counter
+limen_comparison_skipped_total{route="alpha",reason="response_too_large"} 1
+
+# TYPE limen_comparisons_total counter
+limen_comparisons_total{route="alpha",result="mismatch"} 1
+
+# TYPE limen_diff_sampled_total counter
+limen_diff_sampled_total{route="alpha"} 1
+
+# TYPE limen_diff_sink_dropped_total counter
+limen_diff_sink_dropped_total{reason="io_error"} 0
+limen_diff_sink_dropped_total{reason="queue_full"} 1
+limen_diff_sink_dropped_total{reason="writer_gone"} 0
+
+# TYPE limen_diff_sink_enqueued_total counter
+limen_diff_sink_enqueued_total 1
+
+# TYPE limen_diff_sink_written_total counter
+limen_diff_sink_written_total 0
+
+# TYPE limen_flag_provider_consecutive_failures gauge
+limen_flag_provider_consecutive_failures 2
+
+# TYPE limen_flag_provider_stale gauge
+limen_flag_provider_stale 0
+
+# TYPE limen_flag_provider_staleness_seconds gauge
+limen_flag_provider_staleness_seconds 1.5
+
+# TYPE limen_in_flight_requests gauge
+limen_in_flight_requests 0
+
+# TYPE limen_observe_observations_total counter
+limen_observe_observations_total{route="alpha"} 1
+
+# TYPE limen_request_duration_seconds histogram
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="+Inf"} 3
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.001"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.005"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.01"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.025"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.05"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.1"} 0
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.25"} 1
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="0.5"} 2
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="1"} 2
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="10"} 3
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="2.5"} 3
+limen_request_duration_seconds_bucket{route="alpha",upstream="legacy",le="5"} 3
+limen_request_duration_seconds_count{route="alpha",upstream="legacy"} 3
+limen_request_duration_seconds_sum{route="alpha",upstream="legacy"} 2.75
+
+# TYPE limen_requests_total counter
+limen_requests_total{route="alpha",method="GET",upstream="legacy",status_class="2xx"} 2
+limen_requests_total{route="alpha",method="GET",upstream="legacy",status_class="5xx"} 1
+
+# TYPE limen_rollout_resolved_target_percentage gauge
+limen_rollout_resolved_target_percentage{route="alpha"} 25
+
+# TYPE limen_shadow_failed_total counter
+limen_shadow_failed_total{route="alpha",reason="timeout"} 1
+
+# TYPE limen_shadow_in_flight gauge
+limen_shadow_in_flight 1
+
+# TYPE limen_shadow_requests_total counter
+limen_shadow_requests_total{route="alpha"} 1
+
+# TYPE limen_shadow_skipped_total counter
+limen_shadow_skipped_total{route="alpha",reason="concurrency_limit"} 1
+
+# TYPE limen_upstream_errors_total counter
+limen_upstream_errors_total{route="alpha",upstream="new"} 1
+
+# TYPE limen_upstream_timeouts_total counter
+limen_upstream_timeouts_total{route="alpha",upstream="legacy"} 1"#;
 
     #[test]
     fn sink_drop_reasons_are_the_documented_vocabulary() {

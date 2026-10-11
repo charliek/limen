@@ -14,6 +14,11 @@ async fn main() -> ExitCode {
     // logging subsystem or the filesystem.
     let cli = Cli::parse();
     limen::observability::logging::init();
+    // Before anything builds a TLS config. `false` means a provider was already
+    // installed — only aws-lc-rs is compiled in, so that is this one: accept it.
+    if !limen::http::client::install_crypto_provider() {
+        tracing::debug!("a rustls crypto provider was already installed; keeping it");
+    }
     // `verdict` exits with its documented typed codes; everything else maps
     // success/error to 0/1 exactly as the previous anyhow-returning main did.
     match cli.run().await {

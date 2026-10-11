@@ -41,6 +41,26 @@ pub enum ClientBuildError {
     },
 }
 
+/// Install aws-lc-rs as the process-wide rustls crypto provider, returning
+/// whether this call was the one that installed it.
+///
+/// aws-lc-rs is the only provider compiled into this binary (CI's "Guard:
+/// rustls has one provider" steps fail if `ring` returns), so every
+/// `rustls::ClientConfig::builder()` — redis' `rediss://` connect is the one
+/// that matters, since reqwest picks its provider explicitly — would resolve it
+/// from the crate features unaided. Installing it up front takes that from "true
+/// as long as the build stays single-provider" to "true by construction" for the
+/// binary: with a default installed, `builder()` never consults the crate
+/// features, so even a second provider compiled in could not make it panic.
+///
+/// `false` is accepted: it means a default provider was already installed, which
+/// can only be this one. Idempotent, so calling it twice is harmless.
+pub fn install_crypto_provider() -> bool {
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .is_ok()
+}
+
 /// A pooled HTTP client for upstream calls.
 #[derive(Clone)]
 pub struct UpstreamClient {

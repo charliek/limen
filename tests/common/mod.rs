@@ -8,7 +8,8 @@
 #![allow(dead_code)]
 
 use std::future::Future;
-use std::sync::Arc;
+use std::io;
+use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, Response, StatusCode};
@@ -20,7 +21,7 @@ use tower::ServiceExt;
 
 /// Parse a test config from YAML.
 pub fn config_from_yaml(yaml: &str) -> Config {
-    serde_yaml::from_str(yaml).expect("valid test config")
+    yaml_serde::from_str(yaml).expect("valid test config")
 }
 
 /// Grab a currently-free localhost port by binding to `:0` and releasing it.
@@ -226,4 +227,50 @@ pub async fn parts(resp: Response<Body>) -> (StatusCode, HeaderMap, String) {
         headers,
         String::from_utf8_lossy(&bytes).into_owned(),
     )
+}
+
+/// Everything `tracing` emits on this thread while it is alive, as the text a
+/// log file would hold. Every level and target, so hyper's and reqwest's own
+/// events are captured with limen's: a leak is a leak wherever it is logged.
+///
+/// The subscriber is the *thread's* default, so it sees the work of a
+/// `#[tokio::test]` (a current-thread runtime, tasks included) and nothing a
+/// multi-threaded runtime moved to another worker. Start it before the work
+/// and read [`text`](Self::text) after.
+pub struct LogCapture {
+    buf: Arc<Mutex<Vec<u8>>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl LogCapture {
+    pub fn start() -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let writer = buf.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || SharedBuf(writer.clone()))
+            .finish();
+        Self {
+            buf,
+            _guard: tracing::subscriber::set_default(subscriber),
+        }
+    }
+
+    /// The log text so far.
+    pub fn text(&self) -> String {
+        String::from_utf8_lossy(&self.buf.lock().unwrap()).into_owned()
+    }
+}
+
+struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+impl io::Write for SharedBuf {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }

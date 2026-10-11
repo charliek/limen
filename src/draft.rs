@@ -549,9 +549,11 @@ async fn scrape_in_flight(client: &reqwest::Client, url: &str) -> Result<f64, Su
 /// (`health::endpoints::router`), so a 404 is "this proxy is not observing",
 /// not "wrong URL".
 async fn fetch_profile(client: &reqwest::Client, url: &str) -> Result<String, SuggestError> {
-    let resp = client.get(url).send().await.map_err(|e| {
-        SuggestError::InputUnavailable(format!("control plane unreachable at {url}: {e}"))
-    })?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| request_failed("control plane unreachable at", url, e))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(SuggestError::InputUnavailable(format!(
             "{url} returned 404 — the running proxy has no `observe:` block, so it has profiled \
@@ -566,13 +568,15 @@ async fn fetch_profile(client: &reqwest::Client, url: &str) -> Result<String, Su
     }
     resp.text()
         .await
-        .map_err(|e| SuggestError::InputUnavailable(format!("cannot read {url}: {e}")))
+        .map_err(|e| request_failed("cannot read", url, e))
 }
 
 async fn get_text(client: &reqwest::Client, url: &str) -> Result<String, SuggestError> {
-    let resp = client.get(url).send().await.map_err(|e| {
-        SuggestError::InputUnavailable(format!("control plane unreachable at {url}: {e}"))
-    })?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| request_failed("control plane unreachable at", url, e))?;
     if !resp.status().is_success() {
         return Err(SuggestError::InputUnavailable(format!(
             "control plane returned HTTP {} for {url}",
@@ -581,7 +585,15 @@ async fn get_text(client: &reqwest::Client, url: &str) -> Result<String, Suggest
     }
     resp.text()
         .await
-        .map_err(|e| SuggestError::InputUnavailable(format!("cannot read {url}: {e}")))
+        .map_err(|e| request_failed("cannot read", url, e))
+}
+
+/// A failed request to `url`, as `{context} {url}: {error}`. The error is
+/// rendered `without_url`: the message already names the URL, and reqwest's own
+/// `for url (...)` suffix would print it a second time. (A client-build error has
+/// no request, so no URL to strip.)
+fn request_failed(context: &str, url: &str, error: reqwest::Error) -> SuggestError {
+    SuggestError::InputUnavailable(format!("{context} {url}: {}", error.without_url()))
 }
 
 fn parse_profile(document: &str, url: &str) -> Result<ObserveProfile, SuggestError> {
@@ -766,7 +778,7 @@ pub fn render_yaml(
     config: &Config,
     suggestions: &[Suggestion],
     opts: &DraftOptions,
-) -> Result<String, serde_yaml::Error> {
+) -> Result<String, yaml_serde::Error> {
     debug_assert_eq!(
         config.routes.len(),
         suggestions.len(),
@@ -798,11 +810,11 @@ pub fn render_yaml(
     if let Some(sink) = head.diff_sink.as_mut() {
         sink.dir = absolutize(Path::new(""), &sink.dir);
     }
-    let mut value = serde_yaml::to_value(&head)?;
+    let mut value = yaml_serde::to_value(&head)?;
     if let Some(mapping) = value.as_mapping_mut() {
         mapping.remove("routes");
     }
-    out.push_str(&serde_yaml::to_string(&value)?);
+    out.push_str(&yaml_serde::to_string(&value)?);
 
     out.push_str("routes:\n");
     for (route, suggestion) in config.routes.iter().zip(suggestions) {
@@ -816,7 +828,7 @@ pub fn render_yaml(
                 out.push('\n');
             }
         }
-        out.push_str(&indent_as_list_item(&serde_yaml::to_string(
+        out.push_str(&indent_as_list_item(&yaml_serde::to_string(
             &drafted.route,
         )?));
     }
@@ -1228,7 +1240,7 @@ mod tests {
     use crate::suggest::{DEFAULT_MAX_COMPARE_PATHS, DEFAULT_MIN_SAMPLES};
 
     fn config_from(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).expect("valid test config")
+        yaml_serde::from_str(yaml).expect("valid test config")
     }
 
     /// Contract references resolve against the config's base directory, so
@@ -1331,7 +1343,7 @@ routes:
     /// The load-bearing emission test: a draft of a config carrying every shape
     /// validation refuses on a disabled route must still load and validate.
     fn assert_valid(draft: &str) -> Config {
-        let config: Config = serde_yaml::from_str(draft)
+        let config: Config = yaml_serde::from_str(draft)
             .unwrap_or_else(|e| panic!("draft does not parse: {e}\n{draft}"));
         crate::config::validate(&config, &base_dir())
             .unwrap_or_else(|e| panic!("draft does not validate: {e:?}\n{draft}"));
@@ -1482,14 +1494,14 @@ routes:
     /// that happens to contain that substring cannot fail this check for a
     /// reason unrelated to `skip_serializing_if`: only an actual serialized
     /// null *value* counts.
-    fn contains_null(value: &serde_yaml::Value) -> bool {
+    fn contains_null(value: &yaml_serde::Value) -> bool {
         match value {
-            serde_yaml::Value::Null => true,
-            serde_yaml::Value::Sequence(seq) => seq.iter().any(contains_null),
-            serde_yaml::Value::Mapping(map) => {
+            yaml_serde::Value::Null => true,
+            yaml_serde::Value::Sequence(seq) => seq.iter().any(contains_null),
+            yaml_serde::Value::Mapping(map) => {
                 map.values().any(contains_null) || map.keys().any(contains_null)
             }
-            serde_yaml::Value::Tagged(tagged) => contains_null(&tagged.value),
+            yaml_serde::Value::Tagged(tagged) => contains_null(&tagged.value),
             _ => false,
         }
     }
@@ -1506,7 +1518,7 @@ routes:
             &candidate_profile("pat-validate"),
             &DraftOptions::default(),
         );
-        let parsed: serde_yaml::Value = serde_yaml::from_str(&draft).expect("valid yaml");
+        let parsed: yaml_serde::Value = yaml_serde::from_str(&draft).expect("valid yaml");
         assert!(!contains_null(&parsed), "{draft}");
     }
 
@@ -2227,6 +2239,25 @@ routes:
         let profile = candidate_profile("pat-validate");
         std::fs::write(&path, serde_json::to_string(&profile).expect("json")).expect("write");
         assert_eq!(load_profile_file(&path).expect("load"), profile);
+    }
+
+    /// The URL, query included, appears once: in the message, not again in
+    /// reqwest's `for url (...)` suffix (see [`request_failed`]).
+    #[tokio::test]
+    async fn a_transport_failure_names_the_url_exactly_once() {
+        let client = reqwest::Client::new();
+        let url = "http://127.0.0.1:1/metrics?probe=CANARY-DRAFT";
+        for error in [
+            get_text(&client, url).await.unwrap_err(),
+            fetch_profile(&client, url).await.unwrap_err(),
+        ] {
+            let message = error.to_string();
+            assert!(
+                message.contains("control plane unreachable at"),
+                "{message}"
+            );
+            assert_eq!(message.matches("CANARY-DRAFT").count(), 1, "{message}");
+        }
     }
 
     #[test]

@@ -14,7 +14,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// A minimal config with one compared route (default floor 1).
 fn config() -> Config {
-    serde_yaml::from_str(
+    yaml_serde::from_str(
         r#"
 routes:
   - id: r
@@ -194,7 +194,7 @@ async fn one_balanced_scrape_is_not_enough_to_drain() {
 /// exit 50 instead, naming the route whose zero could not be trusted.
 #[tokio::test]
 async fn a_floored_route_with_no_registered_skip_series_is_typed_input_unavailable() {
-    let config: Config = serde_yaml::from_str(
+    let config: Config = yaml_serde::from_str(
         r#"
 routes:
   - id: r
@@ -239,7 +239,7 @@ routes:
 /// it vouches for nothing (exit 20).
 #[tokio::test]
 async fn a_config_with_no_routes_reaches_the_floors_failure_not_the_version_boundary() {
-    let config: Config = serde_yaml::from_str("routes: []\n").expect("test config");
+    let config: Config = yaml_serde::from_str("routes: []\n").expect("test config");
     assert!(config.routes.is_empty());
 
     let server = stub(vec![PROCESS_WIDE.to_string()]).await;

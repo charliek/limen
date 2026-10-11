@@ -103,7 +103,7 @@ pub fn load_file(path: &Path) -> Result<Contract, ContractError> {
 
     match ext.as_deref() {
         Some("yaml") | Some("yml") => {
-            let de = serde_yaml::Deserializer::from_str(&text);
+            let de = yaml_serde::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
                 message: e.to_string(),
@@ -368,7 +368,7 @@ routes:
   - id: ""
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert!(issues
             .iter()
@@ -381,7 +381,7 @@ routes:
     #[test]
     fn validate_semantics_accepts_a_good_contract() {
         let yaml = "version: 1\nservice: s\nroutes:\n  - id: a\n    match: { methods: [GET], path_template: \"/a\" }\n  - id: b\n    match: { methods: [GET], path_template: \"/b\" }\n";
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -403,7 +403,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("route \"r\""));
@@ -428,7 +428,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("`defaults`"));
@@ -451,7 +451,7 @@ routes:
   - id: b
     match: { methods: [GET], path_template: "/b" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("`defaults`"));
@@ -475,7 +475,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("route \"r\""));
@@ -496,7 +496,7 @@ routes:
   - id: r
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -515,7 +515,7 @@ routes:
       location:
         ignore_query_params: [state]
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -534,7 +534,7 @@ routes:
       json:
         ignore_paths: ["$..deep"]
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_paths(&contract);
         assert_eq!(issues.len(), 2);
         assert!(issues

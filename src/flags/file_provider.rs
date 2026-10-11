@@ -44,7 +44,7 @@ impl FileProvider {
     /// Parse the flags file into a value map.
     fn load(path: &Path) -> Result<HashMap<String, FlagValue>, String> {
         let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_yaml::from_str(&text).map_err(|e| e.to_string())
+        yaml_serde::from_str(&text).map_err(|e| e.to_string())
     }
 }
 

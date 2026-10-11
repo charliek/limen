@@ -1108,7 +1108,7 @@ mod tests {
     }
 
     fn parse(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).unwrap()
+        yaml_serde::from_str(yaml).unwrap()
     }
 
     fn errors(yaml: &str) -> Vec<ValidationError> {

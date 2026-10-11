@@ -15,7 +15,8 @@ COPY . .
 RUN cargo build --release --locked --bin limen
 
 FROM debian:bookworm-slim AS runtime
-# ca-certificates for TLS to HTTPS upstreams (rustls also bundles webpki roots).
+# ca-certificates for TLS to HTTPS upstreams: reqwest 0.13 verifies against the OS
+# trust store and bundles no roots, so without it every https:// upstream fails.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates \
     && rm -rf /var/lib/apt/lists/*
