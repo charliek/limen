@@ -87,6 +87,14 @@ still *detected*, while its value is *masked* in the output.
 - If a redact path can't be resolved, the engine **fails closed** — it reports
   the mismatch but emits no diff values rather than risk a leak.
 
+!!! warning "Known gap: transport-error logs"
+    This redaction covers what the comparison engine renders: diffs, the
+    mismatch log, and sink records. It does not cover transport-error logging.
+    When an upstream request fails in transport, the `upstream request failed`
+    WARN includes the HTTP client's error text, which contains the full
+    upstream URL, query string included, unredacted. The code fix is tracked in
+    [limen#41](https://github.com/charliek/limen/issues/41).
+
 ## Bounded output
 
 Diffs are bounded (spec §7.3): a maximum number of differences and a maximum

@@ -274,8 +274,9 @@ hitting new. While shadowing, limen's request, latency, upstream-error, and upst
 no `upstream="new"` sample. A verdict of `0` covers the error row only as per-request equality on the
 compared sample. The latency row must be measured outside limen before the first non-zero rung: both
 upstreams, the same corpus, the same timing boundary. Never call an unmeasured row green. On a
-`failover_safe` split, the two `limen_request_duration_seconds` series measure different boundaries,
-because new's successful responses are buffered in full
+`failover_safe` split, the two `limen_request_duration_seconds` series measure different boundaries:
+new's successful responses within `server.request_body_limit_bytes` are recorded after full buffering,
+and larger ones when they start streaming
 ([runbook §8.1](https://charliek.github.io/limen/runbook/#81-the-budget-define-before-shadowing)).
 This is tested doctrine, not a pointer to plausible machinery: the [rollout
 simulation](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) ran this exact ladder live

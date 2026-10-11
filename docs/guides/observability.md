@@ -174,9 +174,12 @@ latency and error rows during shadowing:
 - **Errors.** With `compare_status` on (the default), the verdict covers the
   compared sample. A status difference is a mismatch (exit `10`), and a shadow
   `timeout` or `error` undermines a floored route (exit `20`). So a verdict of
-  `0` means new returned legacy's status on every compared request and never
-  failed in transport. That is per-request equality on a sample, not a rate.
-  Outside it, Limen cannot give you new's 5xx rate. That covers unsampled
+  `0` means new returned legacy's status on every compared request. That is
+  per-request equality on a sample, not a rate. On a floored route
+  (comparison enabled, `min_comparisons` above `0`), it also means no shadow
+  failed in transport. On an unfloored route, shadow failures are
+  informational and do not change the exit code. Outside the compared sample,
+  Limen cannot give you new's 5xx rate. That covers unsampled
   requests, an unfloored route, and a route with `compare_status: false`,
   where a new `500` whose body matches legacy's counts as a match and writes
   no sink record. The sink holds only mismatches, so its `new_status` values
@@ -189,9 +192,11 @@ latency and error rows during shadowing:
   compare p95/p99 per route. Until then the row is unmeasured, not green. From
   the first non-zero rung, `limen_request_duration_seconds{route,upstream="new"}`
   appears beside the `upstream="legacy"` series for rechecks. On a
-  `failover_safe` route those two histograms measure different boundaries.
-  Limen buffers new's successful responses in full before recording them,
-  while legacy-selected responses are recorded once their headers arrive. The
+  `failover_safe` route those two histograms measure different boundaries. A
+  successful new response within `server.request_body_limit_bytes` is recorded
+  only after it is fully buffered. One over that limit is recorded when it
+  starts streaming, so new's boundary varies with response size.
+  Legacy-selected responses are recorded once their headers arrive. The
   only latency fact the shadow leg gives you is a ceiling: every compared
   shadow finished within `timeouts.shadow_ms`. A shadow that overran it is
   recorded as `reason="timeout"` if its headers were late, but as
