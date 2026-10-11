@@ -48,7 +48,7 @@ The two share a **behavioral contract** (Section 5) but are independently deploy
 Pharos is designed for the same migration shape as Limen: **legacy and new share the same backing datastore**, and the migration is a **re-implementation of request-handling logic** (e.g. a framework or language change), not a data migration. This makes correctness a question of **behavioral parity over shared data**, which the contract and scenarios express directly:
 
 - For **reads**, a passing `compare_live` over identical stored data is itself a consistency check.
-- For **writes**, correctness is validated by performing the write through the new service and **reading the result back** through an already-validated read path, comparing it to what legacy produces (a multi-step scenario; see the migration runbook). Writes are not executed against both implementations, since a shared store would double the side effect.
+- For **writes**, the write is performed through the **new service only** — never against both implementations, since a shared store would double the side effect. Because legacy and new then read the *same* stored row, a read-back compared two-sided can pass even when the write stored the wrong thing, so it cannot establish write correctness; correctness is instead validated by pinning the write's response and its read-back **one-sidedly** to legacy-derived expectations (`new_only_assert` with `explicit_expectations`, derived from the legacy handler or from probing legacy on controlled data), or by comparing **paired resources** — the same write through legacy on one resource and through new on another, compared modulo ids and server timestamps (a multi-step scenario, Section 4.11; see the migration runbook).
 
 Migrations that do **not** share a datastore (separate stores requiring synchronization) move into dual-write/reconciliation territory, which is out of scope; Pharos's consistency guarantees are not designed for that case.
 
@@ -521,41 +521,46 @@ id: users.create-then-fetch
 name: Create then fetch user
 service: user-service
 tags: [write, read, regression, destructive]
-mode: compare_live
+mode: new_only_assert            # the write reaches the shared store once, through new
 safety:
   destructive: true
   allowedEnvironments: [local, ci, staging]
-contract: "../contracts/user-service.contract.yaml#create-user"
 setup:
   hooks:
-    - name: generateUserPayload
-      assign: { userPayload: payload }
+    - name: generateUserPayload  # returns { email }: a unique address per run
+      assign: { userEmail: email }
 steps:
   - id: create-user
     request:
       method: POST
       path: /users
-      headers: { authorization: Bearer {{ env.AUTH_TOKEN }} }
-      body: '{{ variables.userPayload }}'
+      headers: { authorization: 'Bearer {{ env.AUTH_TOKEN }}' }
+      body: { email: '{{ variables.userEmail }}', name: Grace Hopper }
     extract:
-      userId: { from: legacy.body, path: $.id }
+      userId: { from: new.body, path: $.id }
     compare:
-      strategy: json_semantic
-      status: same
+      strategy: explicit_expectations
+      expect: { status: 201 }
   - id: get-created-user
     request:
       method: GET
       path: /users/{{ variables.userId }}
-      headers: { authorization: Bearer {{ env.AUTH_TOKEN }} }
+      headers: { authorization: 'Bearer {{ env.AUTH_TOKEN }}' }
     compare:
-      strategy: subset
-      body:
-        require_matching_paths: [$.email, $.displayName, $.status]
+      strategy: explicit_expectations
+      expect:                    # what legacy stores for this payload
+        status: 200
+        body:
+          json_paths:            # not $.email: a redacted path compares against the mask
+            $.name: Grace Hopper
+            $.status: ACTIVE     # legacy's default for a new user
 cleanup:
   hooks:
     - name: deleteUser
       args: { userId: '{{ variables.userId }}' }
 ```
+
+The read-back is pinned one-sidedly (Section 1.3): on the shared store both sides would read the same row, so a two-sided read could pass even if the write stored the wrong thing. Expectations see the response after redaction (Section 8.5) — the contract's `redact_paths` plus the config's JSON paths — so a pinned path must be one neither redacts. For a paired-resource comparison instead, a setup hook makes the same write through legacy on its own resource and `assign`s the read-back fields, and the expectations reference them as templates.
 
 ### 4.12 Agent-generated scenario guidelines
 
@@ -1240,7 +1245,10 @@ Work that landed after the MVP phases above. Each increment adds a dimension or 
    value, `SameSite` ignored), a second login asserted one-sided via
    `expect.set_cookie`, and a profile read asserted with an explicit
    `expect.status` (a two-sided "same" status would let a broken jar's
-   identical 401s pass unnoticed).
+   identical 401s pass unnoticed). Sending the login to both sides is
+   acceptable only because it has no shared-state side effect that matters —
+   each example instance mints sessions into its own store; on a shared
+   store, a login that writes shared state is a write (Section 1.3).
 9. `users.find-user-redirect` — a `follow_redirects: false` redirect compared
    two-sided through the contract's `location` dimension (`origin: ignore`)
    and, in a second step, asserted one-sided via `expect.location`.
