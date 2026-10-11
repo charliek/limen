@@ -273,6 +273,19 @@ constant. That signal is honest about its own limits:
   fingerprint never includes header or cookie values), so a genuinely safe,
   per-user response can look "varied" and get demoted — a **false demotion**.
   This is the safe direction: it costs evidence, not safety.
+- Paginated and filtered reads are the same false demotion through the query:
+  the [fingerprint](observe-mode.md#what-a-request-fingerprint-is) keeps
+  parameter *names* and drops their values, so `?page=1` and `?page=2` are one
+  fingerprint, and a list endpoint driven page by page against unchanged data
+  can still report `length_varied` — whenever two pages differ in length — and
+  land `compare_narrowed (body-varies)` if no relay-only rule fires first. The
+  narrowing is evidence about the profile — distinct requests folded together
+  — not about the route. If the handler's body is a deterministic function of
+  the path, the query values, and the shared state, classify it on that source
+  and write its comparison block (or contract) by hand: the narrowed form
+  compares status only and discards body evidence the route can support. The
+  draft's note that a hand-set `enabled: true` compares a body "this route's
+  responses do not support" is the claim the source overrules here.
 
 **A response with no `Content-Length` at all is the third case, and it is
 counted rather than guessed at.** An SSE stream (`text/event-stream`), a chunked

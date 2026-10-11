@@ -193,6 +193,29 @@ write nothing; a run with no mismatches never even creates the directory.
  "diff_truncated":false}
 ```
 
+Each `differences` entry is one location in the *normalized* bodies (so an
+`ignore_paths` field never appears), written `$`-rooted with `.key` and
+`[index]` steps (`$.items[2].nickname`), and its `kind` is one of three:
+
+| `kind` | Means | Carries |
+|---|---|---|
+| `changed` | Present on both sides with different values. | `legacy` and `new` |
+| `added` | Present only in `new`'s body. | `new` only |
+| `removed` | Present only in `legacy`'s body. | `legacy` only |
+
+A key that is `null` on one side and absent on the other is `added`/`removed`,
+not `changed` — the null-versus-absent difference, reported as such. Arrays
+are walked by index, so an element inserted mid-array reads as a run of
+`changed` entries plus one `added` at the tail. A non-JSON body mismatch
+produces a single `changed` entry at `$` whose values are byte counts
+(`"<1234 bytes, non-JSON>"`), never the bytes. Values are bounded — a string
+past 512 bytes is truncated with `…`, a larger object or array becomes
+`"<N bytes elided>"` — and `redact_paths` values render as `"<redacted>"`;
+past 100 entries the list stops and `diff_truncated` is `true`. Status,
+headers, cookies, and `Location` never appear here: they are
+`legacy_status`/`new_status` and the three `*_mismatches` lists, so a
+status-only mismatch has an empty `differences`.
+
 !!! warning "Same redaction, one more surface"
     Sink records carry exactly what the mismatch log carries: values the
     comparison engine already redacted (`redact_paths`, sensitive headers,

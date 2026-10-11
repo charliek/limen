@@ -83,7 +83,7 @@ Run this stage whenever a legacy service is reachable and can be driven with rep
 Be precise about what it does not catch. A mutating read with innocuous metadata is invisible to it: `GET /orders/42/mark-read` answering a stable `200` JSON looks exactly like `GET /orders/42` from the outside, and the classifier suggests it as a `compare_candidate` — the tool's own test suite asserts that limitation rather than hiding it. Reading the handler's source is what catches that one, which is why step 6 below is not optional.
 
 **Inputs:**
-- Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough.
+- Limen in front of the legacy service with the Stage 1 inventory expressed as its route table — `mode: legacy_only` is enough — plus a `legacy_only` catch-all when that service carries live traffic, since a request no route matches gets Limen's own `404`, not legacy's answer ([observe mode → unrouted requests](https://charliek.github.io/limen/guides/observe-mode/#unrouted-requests-and-the-catch-all-route)).
 - Representative traffic (a driving harness, replayed production shapes, or real traffic if Limen is already on the path).
 - The two doctrine pages this stage orchestrates: [observe mode](https://charliek.github.io/limen/guides/observe-mode/) for the mechanism, [classifying routes](https://charliek.github.io/limen/guides/classifying-routes/) for the judgment.
 
@@ -159,13 +159,13 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 
 **Goal:** an executable scenario set per route covering success, error, and edge behavior, referencing the contract for normalization.
 
-**Inputs:** the route inventory; the drafted contract; OpenAPI response definitions (which enumerate status codes and error shapes).
+**Inputs:** the route inventory; the drafted contract; OpenAPI response definitions (which enumerate status codes and error shapes) — or, where the service has none, the legacy handler source and router registration, confirmed by probing legacy on controlled data.
 
 **Actions — for each route, generate the standard scenario family:**
 
 1. **Success (happy path).** The primary 2xx case. `mode: compare_live`, `strategy: json_semantic`, `contract` reference for normalization.
 2. **Not-found / missing resource.** The 404 (or equivalent) case for a resource that doesn't exist.
-3. **Validation / bad input.** The 4xx case(s) the OpenAPI defines (missing field, bad type, out-of-range). Compare the error envelope shape, not just the status.
+3. **Validation / bad input.** The 4xx case(s) the OpenAPI defines — or, without one, the handler's own validation rules (missing field, bad type, out-of-range). Compare the error envelope shape, not just the status.
 4. **Authorization / permission** (if the route is authenticated). The 401/403 cases.
 5. **Edge cases by shape:**
    - List endpoints → **empty list**, **single item**, **many items** (exercises array sorting/ordering rules).
@@ -174,13 +174,13 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 6. **Multi-step flows** where behavior spans requests (create → read-back, see Section 6). Mark destructive flows `destructive` with a `safety` block and `cleanup` hooks.
 
 **How to decide what each scenario asserts:**
-- The **status** comes from the OpenAPI response definition.
+- The **status** comes from the OpenAPI response definition where one exists. Many services have none, and a document can omit what the framework answers on the handler's behalf; then take it from the legacy handler source and its router registration — each branch's explicit status, plus the framework defaults for what the handler never writes itself (a validation failure's `400` vs `422`, an unregistered method's `405`, an uncaught exception's `500`) — and confirm each one by probing legacy on controlled data before pinning it. That is the same order of fidelity Stage 1 enumerates routes in: the published document, then the source, then observed behavior.
 - The **body assertions** are "everything in the response except what the contract normalizes."
 - For error cases, assert the **error code and message shape** via `subset` or `explicit_expectations` — error envelopes are a common cross-framework difference (Section 9), so be precise about what's contractual.
 
 **Tagging:** every scenario gets tags. At minimum `read`/`write`, a maturity tag (`smoke` for the few that gate CI, `regression` for the rest), and `migration-ready` once it's trusted. Use `intentional-change` and `legacy-bug-compatible` to mark deliberate deviations.
 
-**Outputs:** a set of `*.yaml` scenarios per route; all validate with `bun run validate`.
+**Outputs:** a set of `*.yaml` scenarios per route; all validate with `bun run validate` from the root of a target repo's scaffolded suite (`pharos init`), or `bun run ftest -- validate` inside the pharos checkout.
 
 **For the agent:** generate **small, focused** scenarios — one behavior each — rather than large scenarios that assert many things. A focused scenario produces a precise failure. Always generate both the success **and** the error/edge cases; a suite that only covers happy paths gives false confidence.
 
@@ -225,10 +225,17 @@ Record **expectations and intentional changes** in the contract's per-route `exp
 **The loop:**
 1. Run the suite locally, focused on the route under work:
    ```bash
-   bun run ftest -- run --scenario users.get-user-success
+   # in the target repo's scaffolded suite (`pharos init`), run from the scaffold root —
+   # Pharos resolves its config against the working directory:
+   bun run conformance -- --scenario users.get-user-success
    # or a whole service by tag:
+   bun run conformance -- --include-tag migration-ready
+
+   # the same runs inside the pharos checkout itself:
+   bun run ftest -- run --scenario users.get-user-success
    bun run ftest -- run --include-tag migration-ready
    ```
+   The scaffold's scripts are `conformance` (`pharos run`), `validate`, and `record`; any other subcommand is the installed bin, e.g. `bunx pharos check-contract contracts/user-service.contract.yaml`.
 2. For each failure, **diagnose which kind it is**:
    - **Real behavioral gap in the new service** → fix the new service. (This is the productive majority.)
    - **A legitimate dynamic difference not yet normalized** → add a *narrow* contract rule (and note why).
@@ -268,11 +275,15 @@ Writes are **not shadowed by default** and are validated differently, because ex
 **Recommended path (a): validate writes via `new_only_assert` against controlled data.**
 - Use Pharos `new_only_assert` to drive the new implementation's write and assert the response (status, returned resource shape, error envelopes) against explicit expectations derived from legacy behavior.
 - Run against **seeded/controlled** test data so the write's effect is known and cleanable. Guard as `destructive` with `cleanup` hooks.
-- Because the store is shared and the migration is a logic re-implementation, a write performed by the new service lands in the same place legacy would have put it — so asserting the response shape plus a read-back (below) gives high confidence.
+- The response is half the evidence: a handler can answer correctly and store the wrong thing. The other half is a read-back of the stored state (b) — and on a shared store the obvious read-back proves nothing about the write, so read (b) before authoring one.
 
-**Advanced pattern (b): compare writes by reading back.**
-- A multi-step scenario: perform the write through the new service, then **read the created/updated resource back** (via a GET that has *already* been validated as a read in 6.1) and compare that read against what legacy produces for the same resource.
-- This validates that the new write produced a stored result indistinguishable from legacy's, using the already-trusted read path as the oracle. Mark `destructive`, seed and clean up.
+**Advanced pattern (b): validate the stored result by reading it back — pinned, or paired.**
+- **A two-sided read-back is not this check.** Legacy and new read the *same* row. Write through new, read the resource back through both implementations, and compare: the two reads agree whenever the read paths are at parity (6.1), whatever the write stored. A write on new that ignores a field legacy would have changed leaves both reads showing the same stale value, and the comparison passes. It re-validates the read path; it never examines the write.
+- **Pinned (one-sided).** Write through new, read the resource back through a GET already validated as a read in 6.1, and assert that read against the post-state *legacy would have produced* — expectations pinned in the scenario (`new_only_assert`), derived from legacy's handler source or from first applying the same write through legacy to a controlled resource and recording its read-back.
+- **Paired resources.** Seed two equivalent resources, A and B. Apply the same write through legacy to A and through new to B, read both back through the validated read path, and compare the two read-backs modulo identifiers and server-generated timestamps (`ignore_paths` on exactly those fields). Each read-back must name its own resource: a `compare_live` read-back step built on one side's extracted id sends the same request — and so reads the same row — to both targets, which is the two-sided comparison above.
+- Either way, mark `destructive`, seed and clean up.
+
+**Write coverage — derive the cases from the legacy handler, not from the happy path.** For every field a write accepts, derive a case for each of: **set** (a value where there was none), **change** (a different value), **clear** (an explicit `null`, where the field is nullable), and **omit** (the field absent — whatever legacy's handler then does, keep the stored value, apply a default, or reject, is the expectation). Add one case per validation rule the handler enforces, asserting its status and error envelope. Pin or pair each case's read-back as above. Keep **one divergence per scenario**: a runner that stops a scenario at its first failing step hides every later step, so a scenario that walks set → change → clear in sequence reports the first divergence it meets and leaves the rest unknown.
 
 **Out of scope (c): shadowing writes to an isolated store.** Running the write against both implementations with a separate store for "new" approaches dual-write and reconciliation, which both tools deliberately exclude. Do not attempt this as part of the standard runbook; if a migration truly needs it, it's a bespoke effort outside Pharos/Limen.
 
@@ -313,16 +324,16 @@ Under the assumed **shared-datastore** pattern, consistency validation is mostly
 
 Because both implementations read and write the same store:
 - **For reads:** identical stored data → responses must match (after normalization). A passing `compare_live` is a direct consistency check.
-- **For writes:** a write through the new implementation must leave the store in the same state legacy would have. Validated via read-back (Section 6.2b).
+- **For writes:** a write through the new implementation must leave the store in the same state legacy would have. Validated via a *pinned* or *paired* read-back (Section 6.2b) — never by comparing two implementations' reads of the same row, which agree by construction.
 
 ### 7.2 Read-after-write across implementations
 
-The shared store makes cross-implementation read-after-write meaningful and safe to test:
-- Write via new (Pharos `new_only_assert` or a `percentage_split` request in Limen), then read via the **trusted** legacy-validated read path, and confirm the result matches legacy's representation. This catches new-write logic that stores subtly different data (wrong defaulting, dropped fields, format drift) even when the *write response* looked fine.
+The shared store makes cross-implementation read-after-write safe to test — and easy to test wrongly:
+- Write via new (Pharos `new_only_assert` or a `percentage_split` request in Limen), then read via the **trusted** legacy-validated read path, and assert the result against the post-state legacy would have produced: pinned from legacy's source or a legacy-side probe, or paired against the same write applied through legacy to an equivalent resource (Section 6.2b). This catches new-write logic that stores subtly different data (wrong defaulting, dropped fields, format drift) even when the *write response* looked fine. Comparing legacy's read of that row with new's read of it does not — both see whatever new stored.
 
 ### 7.3 Drift checks during rollout
 
-While a write route is split between implementations, periodically run the read-back consistency scenarios (Section 6.2b) against resources created by **each** implementation. Both populations should read back identically. Divergence is a signal to halt rollout (Section 8 gates).
+While a write route is split between implementations, periodically run the pinned or paired read-back scenarios (Section 6.2b) against resources written by **each** implementation. Both populations should match the post-state legacy's handler defines — equivalent writes reading back alike, modulo identifiers and server timestamps. Divergence is a signal to halt rollout (Section 8 gates).
 
 ### 7.4 The separate-store exception (caution)
 
@@ -567,14 +578,15 @@ Both must be true to call a route green. Conflating them is a common mistake: a 
 [ ] DISCOVER: route classified (read/write, idempotent?, risk, side-effects), samples captured
 [ ] OBSERVE: profiled unsampled; suggest-routes disposition recorded; candidates confirmed against source
 [ ] DRAFT: contract rules derived narrowly from observable signals; check-contract passes
-[ ] GENERATE: success + error + edge scenarios; correctly tagged; `bun run validate` passes
+[ ] GENERATE: success + error + edge scenarios; correctly tagged; `bun run validate`
+    (`bun run ftest -- validate` in the pharos checkout) passes
 [ ] REVIEW (human gate): contract justified & narrow; scenarios = intended behavior; signed off
 [ ] REFINE: suite green; failures diagnosed correctly; no unjustified ignore rules; contract validated
 [ ] BUDGET: latency + error-rate + parity budget defined (with any documented exceptions)
 [ ] SHADOW (reads): Limen shadow_legacy_primary; min_comparisons floor set; diff_sink reset at start
 [ ] GATE: limen verdict --canary exits 0; latency/error budget green over the window;
     report --format html captured as the campaign artifact
-[ ] WRITES: validated via new_only_assert (+ read-back); no shadow; no auto-failover on POST
+[ ] WRITES: validated via new_only_assert (+ pinned or paired read-back); no shadow; no auto-failover on POST
 [ ] ROLL OUT: 0→1→5→25→50→100, rechecking budget at each step; drift checks for writes
 [ ] PROXY HEALTH: overhead within SLO; shadow off client path; coverage adequate; flags/breaker healthy
 [ ] ROLLBACK READY: breaker configured; flag lever understood; legacy_only escape known

@@ -42,6 +42,13 @@ re-profiling. Where the inventory itself is uncertain, `path_prefix` is still th
 point; expect stage 3 to refine it against the handler source, and treat a fold discovered there as a
 reason to template and re-profile rather than to classify around it.
 
+**Add a `legacy_only` catch-all (`path_prefix: "/"`, every method the service serves) when fronting live
+traffic.** A request no route matches never reaches legacy — limen answers `404 limen: no route matched`
+itself, and since matching is method + path, an unlisted method on a routed path gets that `404` too, not
+legacy's `405`. The catch-all's `observations` count measures what the inventory missed; the classifier pins
+it `relay_only` / `catch-all`, and it stays `legacy_only` for the whole campaign
+([the route and why](https://charliek.github.io/limen/guides/observe-mode/#unrouted-requests-and-the-catch-all-route)).
+
 Drive representative traffic **unsampled**: the classifier's danger rules are existential, so sampling and
 classification are mutually exclusive. A sampled profile is refused outright — every route lands
 `relay_only` / `partial-sample` and `suggest-routes` exits `20`. Coverage, not volume, is the point.
@@ -97,6 +104,16 @@ in the inventory:
 Suggestions **fail toward relay-only** by construction: response metadata can prove a route unsafe to
 compare and can never prove one safe, so the default draft emits `comparison: { enabled: false }` for
 *every* route, suggestion riding as a comment. No traffic shape makes the tool emit a shadowing config.
+It does, however, re-mode every `legacy_only` route to `shadow_legacy_primary` whenever a `new` upstream is
+known — `relay_only` writes and the catch-all included. Inert as drafted (`enabled: false`,
+`sample_rate: 0.0`, no `shadow_methods`: nothing reaches `new`), but setting `enabled: true` with a non-zero
+`sample_rate` by hand would shadow its reads. Write `mode: legacy_only` back for every route that must
+never touch `new` ([CLI → `suggest-routes`, Notes](https://charliek.github.io/limen/reference/cli/#suggest-routes)).
+
+**A paginated or filtered list can be falsely narrowed `body-varies`**: the request fingerprint keeps
+query-parameter names and drops their values, so `?page=1` and `?page=2` count as one repeated request,
+and pages of different lengths then read as a varying body (unless a relay-only rule fires first). That
+narrowing is evidence about the profile, not the route — classify it from the handler ([what a fingerprint is](https://charliek.github.io/limen/guides/observe-mode/#what-a-request-fingerprint-is)).
 
 **A mutating read with innocuous metadata is invisible to observation.** `GET /orders/42/mark-read`
 returning a stable `200` looks exactly like `GET /orders/42` from outside and is suggested
@@ -186,7 +203,21 @@ never reset within a process, so re-running `verdict` alone stays `20`.
 non-canary mismatch is exit `10`. Resolve each (fix `new`, a narrow contract rule, or an
 `intentional-change` recorded in the contract). There is no rate allowance.
 
-→ [prove your lens bites](https://charliek.github.io/limen/guides/prove-your-lens-bites/) · [floors](https://charliek.github.io/limen/guides/prove-your-lens-bites/#1-floors-prove-something-was-compared) · [the sink canary](https://charliek.github.io/limen/guides/prove-your-lens-bites/#2-the-sink-canary-prove-the-recording-pipeline-is-live) · [CLI → `verdict`](https://charliek.github.io/limen/reference/cli/#verdict)
+**Resolving one starts in the sink, not the report.** The verdict's detail says "inspect `limen report`",
+but every report format stops at per-route counts, kinds, and example request ids — never the field that
+differed. That lives in the sink records' `differences` array (`path`, `kind`: `changed`/`added`/`removed`,
+and the redacted values) and in the mismatch's WARN log line:
+
+```bash
+jq -r 'select(.route_id != "__limen_canary__") | .route_id as $r | .differences[] | "\($r)\t\(.kind)\t\(.path)"' \
+  ./campaign-diffs/mismatches-????-??-??.jsonl | sort | uniq -c
+```
+
+A mismatch *only* in status/headers/cookies/`Location` has empty `differences`; its evidence is in
+`legacy_status`/`new_status` or the `*_mismatches` lists
+([CLI → `report`](https://charliek.github.io/limen/reference/cli/#report)).
+
+→ [prove your lens bites](https://charliek.github.io/limen/guides/prove-your-lens-bites/) · [floors](https://charliek.github.io/limen/guides/prove-your-lens-bites/#1-floors-prove-something-was-compared) · [the sink canary](https://charliek.github.io/limen/guides/prove-your-lens-bites/#2-the-sink-canary-prove-the-recording-pipeline-is-live) · [CLI → `verdict`](https://charliek.github.io/limen/reference/cli/#verdict) · [the `differences` vocabulary](https://charliek.github.io/limen/guides/observability/#durable-mismatch-diffs)
 
 ## 6. Report — the campaign bundle
 
@@ -221,6 +252,7 @@ artifacts rather than trusting them. A missing input is INCOMPLETE; an unreadabl
 drift, is FAILURE; an empty sink directory is INCOMPLETE, never clean. `--route`/`--since` are refused
 with `--format html`, and the artifact flags are refused with `human`/`json`. **The page is not the
 gate** — it exits `0` whenever a page was produced, including a page of nothing but failures.
+It never shows which field differed — resolve mismatches from the sink records (stage 5).
 
 → [CLI → `report`](https://charliek.github.io/limen/reference/cli/#report) · [the HTML status page](https://charliek.github.io/limen/reference/cli/#the-html-status-page) · [runbook §8.3](https://charliek.github.io/limen/runbook/#83-the-shadow-gate-limen-verdict-not-a-reading-of-the-counters)
 

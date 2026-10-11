@@ -38,9 +38,12 @@ comparison mechanism *before* committing a line of the rewrite.
 ### 1. Observe — passive, and safe to leave on in production
 
 Put Limen in front of the legacy service with your route inventory as its route
-table. `mode: legacy_only` is enough; no route needs a `new_upstream`. Then add
-the `observe:` block — presence is the whole switch — and drive real traffic
-through it.
+table. `mode: legacy_only` is enough; no route needs a `new_upstream`. Add a
+`legacy_only` catch-all, or every request the inventory missed gets
+Limen's own `404` instead of legacy's answer ([unrouted requests and the
+catch-all route](observe-mode.md#unrouted-requests-and-the-catch-all-route)).
+Then add the `observe:` block — presence is the whole switch — and drive real
+traffic through it.
 
 ```yaml
 metrics: { listen_addr: "127.0.0.1:9090" }   # or an internal-only interface

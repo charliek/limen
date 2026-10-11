@@ -57,10 +57,14 @@ Two things worth internalizing about floors:
 - **`min_comparisons: 0` is a visible opt-out, not a silent gap.** Some
   routes genuinely cannot be exercised in a given campaign topology (a
   read-only test harness never driving a write-gated route, for instance).
-  Setting the floor to `0` for that route is the honest way to say so — it
-  shows up in the config, in `limen print-routes`, and in the verdict's floor
-  list as an explicit, reviewable exemption, not as a route that quietly
-  never came up.
+  Setting the floor to `0` for that route is the honest way to say so. The
+  exemption is written explicitly in only one place, the config, so that is
+  where review has to catch it: `limen print-routes` prints no floors, and
+  after the run the route is visible by absence — no row in the verdict's
+  `.floors[]`, its uncompared work listed under `informational` without
+  gating, and its floor marked NOT APPLICABLE on the HTML status page (see
+  [CLI → `print-routes`](../reference/cli.md#print-routes) for where floors
+  do and do not show).
 
 ### 2. The sink canary: prove the recording pipeline is live
 
@@ -247,13 +251,18 @@ trap 'kill "$limen_pid" 2>/dev/null || true' EXIT
 
 # ... wait for readiness, drive the campaign's traffic ...
 
+# A non-zero verdict is a failing campaign, not a script error. Capturing it
+# inside an `&&`/`||` list (which `set -e` exempts) keeps the script alive, so
+# the detail view below still renders on exactly the runs that need it.
 limen verdict -c campaign.config.yaml --canary --format json \
-  | tee ./campaign-diffs/verdict.json
-verdict_exit=${PIPESTATUS[0]}
+  > ./campaign-diffs/verdict.json && verdict_exit=0 || verdict_exit=$?
+cat ./campaign-diffs/verdict.json
 
 # The detail view, read only after the verdict above has already drained
-# the pipeline — its __limen_canary__ row is expected.
-limen report --dir ./campaign-diffs --format human
+# the pipeline — its __limen_canary__ row is expected. It is not the gate, so
+# its own failure must not replace the verdict's exit code.
+limen report --dir ./campaign-diffs --format human \
+  || echo "limen report failed; exiting with the verdict's code" >&2
 
 exit "$verdict_exit"
 ```
