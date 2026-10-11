@@ -121,13 +121,17 @@ sum(rate(limen_upstream_errors_total{upstream="new"}[5m]))
 
 # New-side 5xx ratio per route new serves (percentage_split and later). The
 # `or 0 * …` arm reports 0 for a route new served without a 5xx (status-class
-# series are created lazily); a route new served nothing stays absent.
+# series are created lazily); a route new served nothing stays absent. The
+# trailing `and … > 0` drops a window in which new served nothing on a route
+# that has served before (0/0 would otherwise be NaN).
 (
     sum by (route) (rate(limen_requests_total{upstream="new",status_class="5xx"}[5m]))
   or
     0 * sum by (route) (rate(limen_requests_total{upstream="new"}[5m]))
 )
   / sum by (route) (rate(limen_requests_total{upstream="new"}[5m]))
+and
+  sum by (route) (rate(limen_requests_total{upstream="new"}[5m])) > 0
 
 # p99 latency by upstream
 histogram_quantile(0.99, sum by (le, upstream) (rate(limen_request_duration_seconds_bucket[5m])))
