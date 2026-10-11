@@ -115,8 +115,19 @@ A few queries to start from:
 # New-vs-legacy traffic split for a route
 sum by (upstream) (rate(limen_requests_total{route="get-device"}[5m]))
 
-# New-side error rate
+# New-side transport errors (connection failure, no response). A 5xx response
+# is not one of these: it is counted as a status_class="5xx" request.
 sum(rate(limen_upstream_errors_total{upstream="new"}[5m]))
+
+# New-side 5xx ratio per route new serves (percentage_split and later). The
+# `or 0 * …` arm reports 0 for a route new served without a 5xx (status-class
+# series are created lazily); a route new served nothing stays absent.
+(
+    sum by (route) (rate(limen_requests_total{upstream="new",status_class="5xx"}[5m]))
+  or
+    0 * sum by (route) (rate(limen_requests_total{upstream="new"}[5m]))
+)
+  / sum by (route) (rate(limen_requests_total{upstream="new"}[5m]))
 
 # p99 latency by upstream
 histogram_quantile(0.99, sum by (le, upstream) (rate(limen_request_duration_seconds_bucket[5m])))
@@ -125,6 +136,79 @@ histogram_quantile(0.99, sum by (le, upstream) (rate(limen_request_duration_seco
 sum(rate(limen_comparisons_total{result="mismatch"}[5m]))
   / sum(rate(limen_comparisons_total[5m]))
 ```
+
+The `upstream="new"` queries above return nothing for a route in
+`shadow_legacy_primary` — see the next section.
+
+### What a shadow route records about `new`
+
+`limen_requests_total` and `limen_request_duration_seconds` describe the
+upstream that **served the client**. `limen_upstream_errors_total` and
+`limen_upstream_timeouts_total` count failed primary-path **attempts** per
+upstream. On a `failover_safe` route, for example, a failed new attempt that
+Limen then replays to legacy still increments new's counter. In
+`shadow_legacy_primary` legacy is the only upstream the primary path ever
+tries. So on a shadow route, all four of these families carry only
+`upstream="legacy"`, however much shadow traffic `new` answered.
+
+One `upstream="new"` series can still appear on a shadow route:
+`limen_circuit_breaker_state`. It is published for any route with
+`circuit_breaker.enabled`, but shadow outcomes never reach the breaker, so on
+a shadow route it stays closed. The shadow leg shows up only in the shadow and
+comparison families:
+
+| What happened to the shadow request | Where it shows |
+|---|---|
+| Dispatched | `limen_shadow_requests_total{route}` |
+| No response headers within `timeouts.shadow_ms` | `limen_shadow_failed_total{route,reason="timeout"}` |
+| Connection failure, or the body errored mid-read. This includes `timeouts.shadow_ms` expiring during the body read, since that deadline bounds the whole exchange | `limen_shadow_failed_total{route,reason="error"}` |
+| Body over `max_body_bytes` | `limen_comparison_skipped_total{route,reason="response_too_large"}` (the same series an oversized legacy body increments) |
+| Answered and compared | `limen_comparisons_total{route,result}`. New's status appears only on a mismatch, as `new_status` in the [sink record](#durable-mismatch-diffs) and the `limen.response_mismatch` log |
+
+So Limen does not measure new's latency in this mode, and you see new's
+status only through the comparison: a `5xx` from new where legacy answered
+`2xx` is a status mismatch, not a `status_class="5xx"` sample. Here is how
+to judge the [runbook §8.1](../runbook.md#81-the-budget-define-before-shadowing)
+latency and error rows during shadowing:
+
+- **Errors.** With `compare_status` on (the default), the verdict covers the
+  compared sample. A status difference is a mismatch (exit `10`), and a shadow
+  `timeout` or `error` undermines a floored route (exit `20`). So a verdict of
+  `0` means new returned legacy's status on every compared request and never
+  failed in transport. That is per-request equality on a sample, not a rate.
+  Outside it, Limen cannot give you new's 5xx rate. That covers unsampled
+  requests, an unfloored route, and a route with `compare_status: false`,
+  where a new `500` whose body matches legacy's counts as a match and writes
+  no sink record. The sink holds only mismatches, so its `new_status` values
+  come from a selected population. `limen_shadow_failed_total` still counts
+  new's transport failures. For the rate itself, probe new directly or read
+  new's own metrics.
+- **Latency.** Measure it outside Limen, before the first non-zero
+  `percentage_split` rung. Drive the same corpus directly at both upstreams,
+  from the same place, against the same data, timed at the same boundary, and
+  compare p95/p99 per route. Until then the row is unmeasured, not green. From
+  the first non-zero rung, `limen_request_duration_seconds{route,upstream="new"}`
+  appears beside the `upstream="legacy"` series for rechecks. On a
+  `failover_safe` route those two histograms measure different boundaries.
+  Limen buffers new's successful responses in full before recording them,
+  while legacy-selected responses are recorded once their headers arrive. The
+  only latency fact the shadow leg gives you is a ceiling: every compared
+  shadow finished within `timeouts.shadow_ms`. A shadow that overran it is
+  recorded as `reason="timeout"` if its headers were late, but as
+  `reason="error"` if its body was. Zero `timeout` alone therefore does not
+  mean nothing overran.
+
+Under `percentage_split` both sides have these series, but they are created
+**lazily**. The `upstream="new"` series appears with the first request new
+serves, and `limen_upstream_errors_total{upstream="new"}` with its first
+transport failure. An absent series there means "nothing yet", not a broken
+scrape. One exception applies on a `failover_safe` route. When new answers
+`5xx` with enough of the `primary_ms` budget left to replay, Limen replays the
+request to legacy, and the request is recorded under `upstream="legacy"` with
+legacy's status. That `5xx` lands in no `upstream="new"` series at all ([the
+cost of `failover_safe`](resilience.md#the-cost-of-turning-failover_safe-on)).
+A `5xx` that arrives with less than 10 ms of the budget left is not replayed.
+The client gets Limen's own `502`, recorded as an `upstream="new"` `5xx`.
 
 ## Observe mode
 
@@ -215,6 +299,30 @@ past 100 entries the list stops and `diff_truncated` is `true`. Status,
 headers, cookies, and `Location` never appear here: they are
 `legacy_status`/`new_status` and the three `*_mismatches` lists, so a
 status-only mismatch has an empty `differences`.
+
+**`path` is the request path without its query string.** The same holds in
+the `limen.response_mismatch` log line and in `limen report`'s examples: both
+take the path from the same field, and neither surface carries the query. So
+`?page=1` and `?page=2` on a paginated route produce records with identical
+`path` values. That field never carries a query value. Query parameters are
+in redaction scope (spec §7.5) because they can carry credentials such as
+`access_token`.
+
+That guarantee covers the `path` field only, not every surface. A `Location`
+query mismatch renders the differing values of any parameter not on the
+built-in sensitive list. A response body that echoes a request parameter
+carries it into `differences`. And the `upstream request failed` WARN for a
+transport failure includes the HTTP client's error text, which contains the
+full upstream URL.
+
+To find the request behind a record, join on `request_id`. It is the request's
+[`x-request-id`](#structured-logs-request-correlation): Limen reuses the
+client's own value when it is 1–128 bytes of printable ASCII with no spaces.
+Otherwise, including when the value is empty, Limen mints one. Either way, the id is echoed on the
+client response and forwarded to both upstreams. So have your driver send a
+unique `x-request-id` per request, or log the echoed response header, next to
+the full URL it requested. That log is what maps a record back to its page,
+filter, or other query.
 
 !!! warning "Same redaction, one more surface"
     Sink records carry exactly what the mismatch log carries: values the

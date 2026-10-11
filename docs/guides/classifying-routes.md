@@ -147,6 +147,13 @@ issuance.
 itself never shadows a write by default, only `GET`/`HEAD` are eligible
 without an explicit opt-in ([`comparison.shadow_methods`](../reference/config-reference.md#comparisonshadow_methods-shadowing-a-write) —
 `POST`, `PUT`, or `PATCH`; `DELETE` is not eligible at all, opt-in or not).
+Observe mode cannot assign this class. With a positive (the default) read
+floor, once the earlier rules pass (`partial-sample`, `catch-all`,
+`no-observations`), a write-only route drafts `relay_only (insufficient-reads)`
+at any volume. A zero floor changes that
+([why](observe-mode.md#2-drive-representative-traffic)). That label means the
+classifier had nothing to read, not that a danger fired. The method and the
+handler source assign class F.
 
 **What to do with it.** Leave unshadowed. Shadowing a write doubles its side
 effect against a system of record — a second charge, a second token, a second

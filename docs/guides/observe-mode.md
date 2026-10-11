@@ -106,10 +106,25 @@ means here matters more than volume: the classifier's dangerous rules are
 route — so a corpus that never exercises a route's flow-hop paths will tell you
 nothing about them, no matter how many times it hits the route's happy path.
 A route with fewer than `--min-samples` reads (`GET`/`HEAD`; 5 by default) is
-not classified at all — writes and transport errors do not count toward the
-floor. A functional test suite driven once through each endpoint will trip
-that floor on nearly every route, which is the correct, unhelpful answer for
-that corpus.
+not classified at all. Writes do not count toward the floor. A read that
+failed in transport does count, though it adds no stability evidence. A
+functional test suite driven once through each endpoint will trip that floor
+on nearly every route, which is the correct, unhelpful answer for that corpus.
+
+**A route that carries only writes never clears the floor.** That includes a
+`POST` used as a logical read. Such a route drafts `relay_only
+(insufficient-reads)` at any volume, since no classifier rule reads writes —
+unless an earlier rule answers first. A sampled profile reports
+`partial-sample`, a `/` route `catch-all`, and a route the corpus never
+reached `no-observations`. Take the route's class from its method and handler
+source instead: [class F](classifying-routes.md#f-writes) for a mutating write.
+Record that class in the inventory, not "insufficient-reads". The label is not
+a danger finding about the route, and the route is not "not yet known".
+
+Lowering `--min-samples` to `0` doesn't help. After those same earlier rules,
+the route lands on `compare_narrowed (no-repeat-evidence)`, which is no more
+evidence than before. If its `match.query_present` names a one-time-token
+parameter, it lands on `one-time-token-query` instead.
 
 ### Sampling and classification are mutually exclusive
 

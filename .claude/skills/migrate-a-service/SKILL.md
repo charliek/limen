@@ -101,6 +101,13 @@ in the inventory:
 | `compare_narrowed` | Nothing dangerous fired, but the body cannot be trusted for equality (varying length, several content types, incomplete stability evidence). The narrowing becomes contract work. |
 | `compare_candidate` | A fingerprint repeated with a stable length and no danger signal. A hypothesis carrying evidence, never a safety claim. |
 
+**With the default (positive) `--min-samples`, a write-only route drafts `relay_only
+(insufficient-reads)` at any volume** once the earlier rules pass (`partial-sample`, `catch-all`,
+`no-observations` still win), since only `GET`/`HEAD` count as reads. With a zero floor it falls through
+to later rules instead.
+Classify it from its methods and handler source (class F), not as a danger finding or "not yet known"
+([why](https://charliek.github.io/limen/guides/observe-mode/#2-drive-representative-traffic)).
+
 Suggestions **fail toward relay-only** by construction: response metadata can prove a route unsafe to
 compare and can never prove one safe, so the default draft emits `comparison: { enabled: false }` for
 *every* route, suggestion riding as a comment. No traffic shape makes the tool emit a shadowing config.
@@ -215,7 +222,10 @@ jq -r 'select(.route_id != "__limen_canary__") | .route_id as $r | .differences[
 
 A mismatch *only* in status/headers/cookies/`Location` has empty `differences`; its evidence is in
 `legacy_status`/`new_status` or the `*_mismatches` lists
-([CLI → `report`](https://charliek.github.io/limen/reference/cli/#report)).
+([CLI → `report`](https://charliek.github.io/limen/reference/cli/#report)). Records and the WARN line
+carry the path **without its query string**; to join one to its request, have the driver send a unique
+`x-request-id` (or log the echoed header) next to the full URL and match `request_id`
+([constraints and why](https://charliek.github.io/limen/guides/observability/#durable-mismatch-diffs)).
 
 → [prove your lens bites](https://charliek.github.io/limen/guides/prove-your-lens-bites/) · [floors](https://charliek.github.io/limen/guides/prove-your-lens-bites/#1-floors-prove-something-was-compared) · [the sink canary](https://charliek.github.io/limen/guides/prove-your-lens-bites/#2-the-sink-canary-prove-the-recording-pipeline-is-live) · [CLI → `verdict`](https://charliek.github.io/limen/reference/cli/#verdict) · [the `differences` vocabulary](https://charliek.github.io/limen/guides/observability/#durable-mismatch-diffs)
 
@@ -258,9 +268,16 @@ It never shows which field differed — resolve mismatches from the sink records
 
 ## 7. Rollout — the ladder, live
 
-Once a route's verdict is `0` and its latency/error budget is green it moves to `percentage_split` and
-rises 0 → 1 → 5 → 25 → 50 → 100, pausing at each step to recheck the budget on the traffic now actually
-hitting new. This is tested doctrine, not a pointer to plausible machinery: the [rollout
+Once a route's verdict is `0` and its latency/error budget is green, it moves to `percentage_split` and
+rises 0 → 1 → 5 → 25 → 50 → 100. Pause at each step to recheck the budget on the traffic now actually
+hitting new. While shadowing, limen's request, latency, upstream-error, and upstream-timeout series carry
+no `upstream="new"` sample. A verdict of `0` covers the error row only as per-request equality on the
+compared sample. The latency row must be measured outside limen before the first non-zero rung: both
+upstreams, the same corpus, the same timing boundary. Never call an unmeasured row green. On a
+`failover_safe` split, the two `limen_request_duration_seconds` series measure different boundaries,
+because new's successful responses are buffered in full
+([runbook §8.1](https://charliek.github.io/limen/runbook/#81-the-budget-define-before-shadowing)).
+This is tested doctrine, not a pointer to plausible machinery: the [rollout
 simulation](https://charliek.github.io/limen/guides/flags-and-rollout/#tuning) ran this exact ladder live
 against two real backends, 2026-08-16.
 

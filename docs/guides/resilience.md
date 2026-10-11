@@ -219,9 +219,14 @@ what it costs before flipping it on a route mid-rollout:
    but the failover guarantee degrades to header-level only for it — the body
    can't be verified or replayed.
 3. **A new-side `5xx` is masked by a legacy replay.** The client never sees
-   it; only the breaker and the upstream-error metric do. Don't rely on
-   client-visible errors to notice new degrading on a `failover_safe` route —
-   watch the metrics instead.
+   it, and neither do the per-upstream metrics. The request is recorded under
+   `upstream="legacy"` with legacy's status, and `limen_upstream_errors_total`
+   counts transport failures, not `5xx` responses. Only the circuit breaker
+   counts it, and only when `circuit_breaker.enabled` is set; even then it
+   shows up only as a state change once the breaker trips. So don't rely on
+   client-visible errors or on `upstream="new"` series to notice new degrading
+   on a `failover_safe` route. Watch new's own metrics and the breaker
+   instead.
 4. **Worst-case latency stays within one `primary_ms`**, never two — the
    one-budget contract above — but that one budget is still the ceiling a
    failing-fast new upstream adds before the client sees legacy's response.
