@@ -226,12 +226,12 @@ fn comment_text(draft: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn routes_of(draft: &str) -> Vec<serde_yaml::Value> {
-    let parsed: serde_yaml::Value = serde_yaml::from_str(draft).expect("yaml");
+fn routes_of(draft: &str) -> Vec<yaml_serde::Value> {
+    let parsed: yaml_serde::Value = yaml_serde::from_str(draft).expect("yaml");
     parsed["routes"].as_sequence().expect("routes").clone()
 }
 
-fn route<'a>(routes: &'a [serde_yaml::Value], id: &str) -> &'a serde_yaml::Value {
+fn route<'a>(routes: &'a [yaml_serde::Value], id: &str) -> &'a yaml_serde::Value {
     routes
         .iter()
         .find(|r| r["id"].as_str() == Some(id))
@@ -465,6 +465,26 @@ fn a_partially_written_profile_is_exit_fifty() {
     );
 }
 
+/// serde's error for a profile quotes the value it rejected; a profile file is
+/// whatever the operator was handed, so the report names the field's type and
+/// position, not the value.
+#[test]
+fn a_profile_that_does_not_deserialize_does_not_echo_its_values() {
+    let dir = workspace(HOSTILE_CONFIG, r#"{"sample_rate":"CANARY-V","routes":{}}"#);
+    let output = suggest(dir.path(), &[]);
+    assert_eq!(code(&output), 50);
+    let all = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!all.contains("CANARY-V"), "{all}");
+    assert!(
+        all.contains("invalid type: string (value redacted), expected f64"),
+        "{all}"
+    );
+}
+
 #[test]
 fn an_unreachable_control_plane_is_exit_fifty() {
     let dir = workspace(HOSTILE_CONFIG, &hostile_profile());
@@ -623,7 +643,7 @@ fn a_route_that_only_ever_failed_is_relayed_and_says_why() {
     let routes = routes_of(&draft);
     assert_eq!(
         route(&routes, "migrated")["comparison"]["enabled"],
-        serde_yaml::Value::Bool(false),
+        yaml_serde::Value::Bool(false),
         "adoption must not promote a route that has never worked"
     );
 }
@@ -754,4 +774,47 @@ routes:
     let routes = routes_of(&draft);
     assert_eq!(routes[0]["mode"].as_str(), Some("shadow_legacy_primary"));
     assert_eq!(routes[0]["comparison"]["enabled"].as_bool(), Some(true));
+}
+
+/// Invariant 5 on the emitted draft, end to end: a config whose Redis URL and
+/// upstreams carry a password, a query and a fragment yields a draft (and a
+/// JSON surface, and stderr) with none of them — and the draft is still a
+/// config `limen validate-config` accepts, which `draft_and_validate` proves.
+#[test]
+fn the_emitted_draft_carries_no_url_credentials() {
+    let config = HOSTILE_CONFIG
+        .replace(
+            "flags:\n  provider: file\n",
+            "flags:\n  provider: file\n  redis: { url: \"redis://u:CANARY-PW@redis.internal:6379/0?t=CANARY-Q#CANARY-F\" }\n",
+        )
+        .replace(
+            "http://legacy.internal",
+            "http://u:CANARY-PW@legacy.internal/?t=CANARY-Q#CANARY-F",
+        )
+        .replace("http://new.internal", "http://u:CANARY-PW@new.internal/?t=CANARY-Q");
+    assert!(
+        config.contains("CANARY-PW@redis.internal"),
+        "premise: the config carries the canary"
+    );
+    let dir = workspace(&config, &hostile_profile());
+
+    let draft = draft_and_validate(dir.path(), &[]);
+    assert!(!draft.contains("CANARY"), "{draft}");
+    assert!(
+        draft.contains("url: redis://redis.internal:6379/0"),
+        "{draft}"
+    );
+    assert!(
+        comment_text(&draft).contains("LIMEN_REDIS_URL or --redis-url"),
+        "{draft}"
+    );
+
+    for extra in [&[][..], &["--format", "json"][..]] {
+        let output = suggest(dir.path(), extra);
+        assert_eq!(code(&output), 0, "{extra:?}");
+        for stream in [&output.stdout, &output.stderr] {
+            let stream = String::from_utf8_lossy(stream);
+            assert!(!stream.contains("CANARY"), "{extra:?}: {stream}");
+        }
+    }
 }

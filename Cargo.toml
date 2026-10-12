@@ -28,14 +28,28 @@ tokio = { version = "1", features = ["full"] }
 # also avoids the collision with our own `http` module (Section 3.5).
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["trace"] }
 bytes = "1"
 
-# Upstream HTTP client (primary + shadow calls)
-reqwest = { version = "0.12", default-features = false, features = [
+# Upstream HTTP client (primary + shadow calls). `rustls` is reqwest 0.13's
+# rename of 0.12's `rustls-tls`: rustls with the aws-lc-rs provider, verifying
+# against the OS trust store (no bundled Mozilla roots), so a runtime image
+# needs `ca-certificates`.
+reqwest = { version = "0.13", default-features = false, features = [
     "stream",
-    "rustls-tls",
-    "rustls-tls-native-roots",
+    "rustls",
+] }
+
+# The one rustls crypto provider in this binary is aws-lc-rs, named here so it
+# is a decision made in this manifest and not an accident of whichever crate
+# happens to enable it. Two providers in one build make every
+# `rustls::ClientConfig::builder()` that leans on the crate-feature default
+# (redis-rs' `rediss://` connect is one) panic at runtime, on a TLS connect no
+# plain-`redis://` test reaches. `main` installs the aws-lc-rs provider
+# explicitly, and CI's "Guard: rustls has one provider" steps fail if ring
+# comes back in any graph (build or dev).
+rustls = { version = "0.23", default-features = false, features = [
+    "aws_lc_rs",
+    "std",
 ] }
 
 # Shared StrideLabs HTTP primitives. The `proxy` feature is where limen's own
@@ -46,25 +60,25 @@ reqwest = { version = "0.12", default-features = false, features = [
 # (the `x-limen-*` strips, the config-shaped client build, the listener scheme)
 # stays here, in thin wrappers over these calls.
 #
-# Pinned to a tag, not a branch — but the committed Cargo.lock rev is the
+# Pinned to the v0.5.0 release tag — but the committed Cargo.lock commit is the
 # actual supply-chain pin (a tag is a mutable ref; the lock is not). The tag
 # names the intent, the lock enforces it, and bumping either is a deliberate
 # edit reviewed here.
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.4.0", default-features = false, features = [
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", tag = "v0.5.0", default-features = false, features = [
     "proxy",
 ] }
 
 # Config / contract serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
+yaml_serde = "0.10"
 serde_path_to_error = "0.1"
 
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 metrics = "0.24"
-metrics-exporter-prometheus = { version = "0.17", default-features = false }
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
 
 # CLI / errors
 clap = { version = "4", features = ["derive", "env"] }
@@ -75,7 +89,7 @@ anyhow = "1"
 blake3 = "1"
 async-trait = "0.1"
 futures = "0.3"
-rand = "0.9"
+rand = "0.10"
 url = "2"
 # RFC3339 parsing for timestamp normalization (convert to UTC before truncating);
 # formatting for the diff sink's record timestamps and daily file names.
@@ -84,8 +98,11 @@ time = { version = "0.3", features = ["parsing", "formatting"] }
 # Redis flag provider (async; cached + polled). `redis` is the more ubiquitous
 # of the two options in the spec; the provider sits behind the FlagProvider
 # trait so a remote provider can replace it later. rustls TLS so `rediss://`
-# URLs (which config validation accepts) actually connect.
-redis = { version = "0.27", features = [
+# URLs (which config validation accepts) actually connect. redis 1.x's
+# `tokio-rustls-comp` selects no crypto provider of its own (0.27's
+# `tls-rustls` forced `rustls/ring`); the provider is the `rustls` entry
+# above.
+redis = { version = "1", features = [
     "tokio-comp",
     "connection-manager",
     "tokio-rustls-comp",
@@ -99,9 +116,13 @@ tempfile = "3"
 # proxy router directly and parse test configs.
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
-serde_yaml = "0.9"
+yaml_serde = "0.10"
+# The `log` -> `tracing` bridge `LogCapture` installs, so a dependency's `log::`
+# records (reqwest's) land in the captured text as they do in production.
+# Already in the graph through tracing-subscriber's default `tracing-log`.
+tracing-log = "0.2"
 # Criterion for the proxy-overhead benchmarks (lean: no plotters/rayon).
-criterion = { version = "0.5", default-features = false, features = [
+criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",
 ] }
 

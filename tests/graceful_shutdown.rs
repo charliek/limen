@@ -27,7 +27,7 @@ async fn drains_in_flight_then_stops_accepting() {
 
     let data_port = free_port();
     let control_port = free_port();
-    let cfg: Config = serde_yaml::from_str(&format!(
+    let cfg: Config = yaml_serde::from_str(&format!(
         r#"
 server:
   listen_addr: "127.0.0.1:{data_port}"

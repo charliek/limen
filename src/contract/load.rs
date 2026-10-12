@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::compare::jsonpath;
+use crate::config::redact;
 use crate::contract::model::{BehavioralRules, Contract};
 
 /// The only contract schema version the MVP supports.
@@ -103,17 +104,17 @@ pub fn load_file(path: &Path) -> Result<Contract, ContractError> {
 
     match ext.as_deref() {
         Some("yaml") | Some("yml") => {
-            let de = serde_yaml::Deserializer::from_str(&text);
+            let de = yaml_serde::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: e.to_string(),
+                message: redact::serde_error(&e),
             })
         }
         Some("json") => {
             let de = &mut serde_json::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: e.to_string(),
+                message: redact::serde_error(&e),
             })
         }
         _ => Err(ContractError::UnknownExtension {
@@ -368,7 +369,7 @@ routes:
   - id: ""
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert!(issues
             .iter()
@@ -381,7 +382,7 @@ routes:
     #[test]
     fn validate_semantics_accepts_a_good_contract() {
         let yaml = "version: 1\nservice: s\nroutes:\n  - id: a\n    match: { methods: [GET], path_template: \"/a\" }\n  - id: b\n    match: { methods: [GET], path_template: \"/b\" }\n";
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -403,7 +404,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("route \"r\""));
@@ -428,7 +429,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("`defaults`"));
@@ -451,7 +452,7 @@ routes:
   - id: b
     match: { methods: [GET], path_template: "/b" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("`defaults`"));
@@ -475,7 +476,7 @@ routes:
   - id: clean
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_semantics(&contract);
         assert_eq!(issues.len(), 1, "{issues:?}");
         assert!(issues[0].contains("route \"r\""));
@@ -496,7 +497,7 @@ routes:
   - id: r
     match: { methods: [GET], path_template: "/x" }
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -515,7 +516,7 @@ routes:
       location:
         ignore_query_params: [state]
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         assert!(validate_semantics(&contract).is_empty());
     }
 
@@ -534,7 +535,7 @@ routes:
       json:
         ignore_paths: ["$..deep"]
 "#;
-        let contract: Contract = serde_yaml::from_str(yaml).unwrap();
+        let contract: Contract = yaml_serde::from_str(yaml).unwrap();
         let issues = validate_paths(&contract);
         assert_eq!(issues.len(), 2);
         assert!(issues
@@ -543,5 +544,84 @@ routes:
         assert!(issues
             .iter()
             .any(|i| i.path == "$..deep" && i.route_id.as_deref() == Some("r")));
+    }
+
+    /// Invariant 5: serde quotes the value it choked on, in YAML and in JSON
+    /// alike; the contract loader reports the field and the expected type.
+    #[test]
+    fn a_wrong_typed_contract_value_is_not_echoed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: \"CANARY-V\"\nservice: svc\nroutes: []\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": "CANARY-V", "service": "svc", "routes": []}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(!message.contains("CANARY-V"), "{file}: {message}");
+            assert!(message.contains("version"), "{file}: {message}");
+            assert!(
+                message.contains("invalid type: string (value redacted), expected u32"),
+                "{file}: {message}"
+            );
+        }
+    }
+
+    /// A map key that is the text of one of the sanitizer's own markers, with a
+    /// value of the wrong type: the diagnostic must survive whole, in YAML and
+    /// JSON — what was expected, and where.
+    #[test]
+    fn a_marker_in_an_alias_key_keeps_the_rest_of_the_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: 1\nservice: svc\nroutes:\n  - id: r\n    match: { methods: [GET], path_template: /x }\n    comparison:\n      json:\n        enum_aliases:\n          - path: $.s\n            aliases: { 'unknown variant `': [1] }\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": 1, "service": "svc", "routes": [{"id": "r", "match": {"methods": ["GET"], "path_template": "/x"}, "comparison": {"json": {"enum_aliases": [{"path": "$.s", "aliases": {"unknown variant `": [1]}}]}}}]}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(message.contains("aliases"), "{file}: {message}");
+            assert!(message.contains("expected a string"), "{file}: {message}");
+            assert!(
+                message.contains("line"),
+                "{file}: the position stays: {message}"
+            );
+        }
+    }
+
+    /// A URL used as a key in a contract is hidden in the path serde reports and
+    /// in the message, in YAML and JSON alike.
+    #[test]
+    fn a_credential_shaped_contract_key_is_not_echoed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: 1\nservice: svc\nroutes: []\n'redis://:CANARY-K@host': 1\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": 1, "service": "svc", "routes": [], "redis://:CANARY-K@host": 1}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(!message.contains("CANARY-K"), "{file}: {message}");
+            assert!(message.contains("unknown field"), "{file}: {message}");
+            assert!(message.contains("expected one of"), "{file}: {message}");
+        }
     }
 }

@@ -19,16 +19,11 @@ ignore = []
 # none), not warn-vs-deny -- every advisory (vulnerability, unmaintained,
 # unsound, notice) is otherwise hard-denied by default. Demoting unmaintained
 # findings to warnings is done via the `-W unmaintained` flag on the
-# `cargo deny check` invocation in the Makefile's `audit` target instead.
-# That's for `rustls-pemfile` (RUSTSEC-2025-0134, pulled in via redis), which
-# is what actually tripped this at the time this file was written.
-# serde_yaml 0.9 (a direct dependency, also deprecated upstream) isn't
-# currently flagged by RustSec, but would fall under the same `-W
-# unmaintained` treatment if/when it is -- the swap away from serde_yaml is
-# tracked separately and deliberately deferred. The decision (swap or stay,
-# and to what) is recorded on the limen+pharos refinement roadmap's gap list
-# (slauth plans/limen-pharos-refinement.md) with serde_norway, serde-yaml-ng,
-# and saphyr as the candidates to vet when it next matters.
+# `cargo deny check` invocation in the Makefile's `audit` target instead, so
+# an unmaintained transitive crate is reported without failing the audit.
+# (`rustls-pemfile`, RUSTSEC-2025-0134, via redis 0.27, is what tripped it when
+# this file was written; redis 1.x no longer pulls it in. The direct dependency
+# on the deprecated serde_yaml moved to the maintained fork yaml_serde.)
 
 [licenses]
 # Licenses allowed for any crate in the dependency graph. Kept to the
@@ -50,6 +45,9 @@ allow = [
     # Mozilla root CA bundle, not code) and is permissive in substance, just
     # not one of the usual OSI code licenses.
     "CDLA-Permissive-2.0",
+    # xxhash-rust (a non-optional redis 1.x dependency, for its value
+    # digests). Boost Software License: permissive, in the same family as MIT.
+    "BSL-1.0",
 ]
 confidence-threshold = 0.8
 

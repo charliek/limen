@@ -8,9 +8,12 @@
 //! - [`model`] — serde structs for `limen.config.yaml`.
 //! - [`load`] — layered loading.
 //! - [`validate`] — semantic validation (URLs, percentages, timeouts, refs).
+//! - [`redact`] — how a configured URL is shown in a message (no userinfo,
+//!   query or fragment).
 
 pub mod load;
 pub mod model;
+pub mod redact;
 pub mod validate;
 
 pub use load::{ConfigLoadError, ConfigOverrides, LoadedConfig};

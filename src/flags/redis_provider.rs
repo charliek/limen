@@ -4,7 +4,7 @@
 //! Values are read as strings and parsed by shape (JSON number/bool, else a
 //! string), mirroring the file provider. The cache + staleness machinery is the
 //! shared [`CachedFlags`], which the file provider's tests exercise; live-Redis
-//! behavior needs a running server (see the ignored integration test).
+//! behavior is tested against a scripted RESP server in `tests/flag_redis.rs`.
 //!
 //! Designed so a remote provider (LaunchDarkly-style) can later replace this
 //! behind the same [`FlagProvider`] trait.
@@ -47,8 +47,23 @@ impl RedisProvider {
     /// Fetch all flags under the prefix. Note: uses `KEYS` for simplicity, which
     /// is fine for the small flag key spaces Limen expects; switching to `SCAN`
     /// for very large key spaces is a documented future change.
-    async fn load(&self) -> Result<HashMap<String, FlagValue>, redis::RedisError> {
-        let mut conn = self.client.get_multiplexed_async_connection().await?;
+    ///
+    /// `budget` is the whole load's bound ([`FlagProvider::refresh`] enforces it
+    /// around this call). It is also handed to the client as its connect and
+    /// per-command timeouts: redis 1.x defaults those to 1 s and 500 ms where 0.27
+    /// had none, and a dependency bump should not quietly tighten how long a slow
+    /// but live Redis is given to answer. The one budget stays the single bound.
+    async fn load(
+        &self,
+        budget: Duration,
+    ) -> Result<HashMap<String, FlagValue>, redis::RedisError> {
+        let config = redis::AsyncConnectionConfig::new()
+            .set_connection_timeout(Some(budget))
+            .set_response_timeout(Some(budget));
+        let mut conn = self
+            .client
+            .get_multiplexed_async_connection_with_config(&config)
+            .await?;
         let pattern = format!("{}*", self.key_prefix);
         let keys: Vec<String> = conn.keys(&pattern).await?;
 
@@ -90,7 +105,7 @@ impl FlagProvider for RedisProvider {
         // goes stale (fail-safe to legacy). Capped so a large poll interval still
         // bounds startup.
         let budget = self.interval.min(Duration::from_secs(5));
-        match tokio::time::timeout(budget, self.load()).await {
+        match tokio::time::timeout(budget, self.load(budget)).await {
             Ok(Ok(values)) => self.cache.record_success(values),
             Ok(Err(error)) => {
                 warn!(%error, "redis flag refresh failed; keeping last known good");

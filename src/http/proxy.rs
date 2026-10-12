@@ -397,7 +397,15 @@ async fn dispatch(
             // still steers *subsequent* requests to legacy.
             record_breaker(&breaker, false);
             prometheus::record_upstream_error(route_id, upstream);
-            warn!(upstream = upstream.as_str(), %error, "upstream request failed");
+            // `without_url`: reqwest renders a failed request as `... for url
+            // (<full URL>)`, and that URL is the client's own query string
+            // (an `access_token`, a signed-URL signature) plus any userinfo the
+            // route's upstream carries. Invariant 5: no secret in a log line.
+            warn!(
+                upstream = upstream.as_str(),
+                error = %error.without_url(),
+                "upstream request failed"
+            );
             Dispatched::silent(bad_gateway(), upstream)
         }
         Err(_elapsed) => {
@@ -725,7 +733,8 @@ async fn failover_dispatch(
             } else {
                 prometheus::record_upstream_error(route_id, Upstream::Legacy);
             }
-            warn!(%error, "legacy failover also failed");
+            // `without_url` for the reason given at the primary's warn above.
+            warn!(error = %error.without_url(), "legacy failover also failed");
             Dispatched::silent(bad_gateway(), Upstream::Legacy)
         }
     }

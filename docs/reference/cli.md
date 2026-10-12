@@ -43,6 +43,52 @@ modes, resolvable contract references, the contract-vs-inline conflict rule,
 JSONPath-subset compliance, and valid fail-safe / budget values. Failures name
 the offending field and route. Exits non-zero on any error.
 
+Values the file holds are never echoed back by a parse error either: serde's
+`invalid type: string "…"` and `unknown variant` messages are rewritten to
+`invalid type: string (value redacted), expected …` — the field path, the
+expected type and the line and column stay. This holds for the YAML and JSON
+forms of a config and a contract, and for a rejected `LIMEN_FLAGS_PROVIDER` /
+`LIMEN_FAIL_SAFE_MODE` override.
+
+A URL that fails validation is never echoed back: `flags.redis.url` and the
+route upstreams can carry a password in their userinfo or a token in their
+query, so the message says what failed to parse (`is not a valid URL (invalid
+port number; value redacted)`) and leaves the value out. The same holds for
+every message that names a configured or `--control-url` URL, and
+`verdict --canary` / `suggest-routes` report a control plane's unexpected answer
+by status and size (`did not acknowledge the injection: HTTP 200 OK, a
+62-byte JSON body`), never by quoting its body.
+
+Beneath those specific messages is a backstop. Everything the CLI prints — the
+`Error:` line, command-line usage errors, validation errors, the routing table, the `verdict` and
+`suggest-routes` reports in every format, the draft and its warnings, and the
+`report` output in `human` and `json` — is passed through a text-level scrubber
+first. In any `scheme://…` run it keeps the
+scheme, host, port and path, and drops the userinfo (everything up to the last
+`@`), the query and the fragment; elsewhere it masks the value of a
+`token`/`password`/`secret`/`key`/`auth`-named query parameter (`?token=<redacted>`).
+So a URL that reaches the output by a path no message was written for — a route
+id, a field of a profile some other service answered with — is cut all the same.
+The price is that it also rewrites a value that is *meant* to be printed: a
+route id that is itself a credential-bearing URL appears in a draft or a report
+without its credentials, and no longer matches the config it came from.
+
+The one exception is the HTML page of `report --format html`. It is printed to
+stdout exactly as `--out` would write it, because a scrubber that reads the
+whole page as text misreads escaped markup (`&#39;` looks like a fragment). It
+is covered where it is built instead: the page redacts each piece of text it
+inserts, in its own context, before escaping it.
+
+The scrubber is idempotent (text that has been through it comes out unchanged),
+so text that is cut where it is built and cut again where it is printed is not
+cut twice.
+
+Output that cannot be written is not mistaken for output that was. A closed pipe
+(`limen verdict | head`) is ignored and the command keeps its typed exit code;
+any other failed write (a full disk under `suggest-routes > draft.yaml`) exits
+`1` after printing `limen: cannot write to stdout: <error kind>` to stderr. The
+message names the kind of error only, never what was being printed.
+
 ## `print-routes`
 
 ```bash
@@ -69,7 +115,9 @@ get-user
 write is opted in. `behavioral` names where the comparison rules come from —
 `contract <reference>` (as written), `inline`, or `none` — not the rules
 themselves. Use it to confirm routing — which route, which mode, which
-upstreams — before starting the proxy.
+upstreams — before starting the proxy. The upstreams are shown as
+`scheme://host[:port]/path`: any userinfo, query or fragment on the configured
+URL is left out.
 
 It does **not** print the merged contract rules (read the contract; `limen
 check-contract` validates it), timeouts, rollout, breaker, or any floor.
@@ -368,6 +416,17 @@ enabled: false }`, with the suggestion riding as a comment above it —
 because response metadata can prove a route unsafe to compare but never safe.
 `--adopt-suggestions` is the deliberate human act that promotes a suggestion
 into a shadowing config.
+
+The draft is printed to stdout and ends up in tickets and CI logs, so **no URL
+in it keeps a userinfo, query or fragment**: `flags.redis.url` and each
+route's `legacy_upstream` / `new_upstream` (and `--new-upstream`) are emitted
+as `scheme://host[:port]/path` when the input carried any, with a comment
+saying so. A Redis password is the usual casualty — give limen the full URL
+when you run the draft, with `LIMEN_REDIS_URL` or `--redis-url`, which win over
+the file. Credentials in an upstream URL are unusual; a draft whose upstream
+had them needs the full URL restored by hand before it is run. A URL with
+nothing to hide is emitted exactly as written. The `--format json` surface
+carries no URLs.
 
 Like `verdict`, a config file is required: it supplies the route table
 classified and the `observe.sample_rate` the profile is cross-checked

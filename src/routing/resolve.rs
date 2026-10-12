@@ -98,7 +98,7 @@ mod tests {
 
     #[test]
     fn resolves_inline_and_default_rules() {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 routes:
   - id: a

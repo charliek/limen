@@ -694,7 +694,7 @@ mod tests {
 
     #[test]
     fn minimal_config_uses_defaults() {
-        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        let cfg: Config = yaml_serde::from_str("{}").unwrap();
         assert_eq!(cfg.server.listen_addr, "0.0.0.0:8080");
         assert_eq!(cfg.metrics.listen_addr, "0.0.0.0:9090");
         assert!(cfg.upstream_tls.verify_certificates);
@@ -708,7 +708,7 @@ mod tests {
         // Specifying only one field of a block must not require the others —
         // built-in defaults fill the rest (spec §5.1 layering).
         let cfg: Config =
-            serde_yaml::from_str("server:\n  listen_addr: \"0.0.0.0:1234\"\n").unwrap();
+            yaml_serde::from_str("server:\n  listen_addr: \"0.0.0.0:1234\"\n").unwrap();
         assert_eq!(cfg.server.listen_addr, "0.0.0.0:1234");
         assert_eq!(cfg.server.graceful_shutdown_timeout_ms, 10_000);
         assert_eq!(cfg.server.request_body_limit_bytes, 1_048_576);
@@ -730,7 +730,7 @@ routes:
     comparison: { enabled: true, sample_rate: 0.1, max_body_bytes: 262144 }
     circuit_breaker: { enabled: true, failure_rate_threshold: 0.25, min_requests: 20, open_duration_ms: 30000, half_open_max_requests: 5 }
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         let r = &cfg.routes[0];
         assert_eq!(r.id, "get-device");
         assert_eq!(r.mode, RouteMode::ShadowLegacyPrimary);
@@ -757,7 +757,7 @@ routes:
     legacy_upstream: "https://legacy.internal"
     mode: legacy_only
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         // Omitting the fields must stay indistinguishable from writing them empty.
         assert!(cfg.routes[0].r#match.query_present.is_empty());
         assert!(cfg.routes[0].r#match.query_absent.is_empty());
@@ -776,7 +776,7 @@ routes:
     legacy_upstream: "https://legacy.internal"
     mode: legacy_only
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             cfg.routes[0].r#match.path_template.as_deref(),
             Some("/conversations/{id}")
@@ -786,7 +786,7 @@ routes:
         // Both fields at once still *parses* — it is a semantic error, caught
         // by `validate`, so the operator gets a message rather than a serde
         // complaint about a field they did write.
-        let both: Config = serde_yaml::from_str(
+        let both: Config = yaml_serde::from_str(
             r#"
 routes:
   - id: r
@@ -818,7 +818,7 @@ routes:
                 "path_template",
             ),
         ] {
-            let cfg: Config = serde_yaml::from_str(&format!(
+            let cfg: Config = yaml_serde::from_str(&format!(
                 r#"
 routes:
   - id: r
@@ -828,7 +828,7 @@ routes:
 "#
             ))
             .unwrap();
-            let out = serde_yaml::to_string(&cfg).unwrap();
+            let out = yaml_serde::to_string(&cfg).unwrap();
             assert!(out.contains(present), "{out}");
             assert!(!out.contains(absent), "{out}");
             assert!(!out.contains("null"), "{out}");
@@ -851,7 +851,7 @@ routes:
       json:
         ignore_paths: ["$.ts"]
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         assert!(cfg.routes[0].comparison.has_inline_behavioral());
         assert_eq!(
             cfg.routes[0]
@@ -866,17 +866,17 @@ routes:
 
     #[test]
     fn unknown_top_level_key_rejected() {
-        assert!(serde_yaml::from_str::<Config>("serer: {}").is_err());
+        assert!(yaml_serde::from_str::<Config>("serer: {}").is_err());
     }
 
     #[test]
     fn debug_block_is_absent_and_off_by_default() {
-        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        let cfg: Config = yaml_serde::from_str("{}").unwrap();
         assert!(cfg.debug.is_none());
         assert!(!cfg.sink_canary_enabled());
         assert!(!cfg.upstream_header_enabled());
         // An empty block is still off: only an explicit `true` enables it.
-        let cfg: Config = serde_yaml::from_str("debug: {}").unwrap();
+        let cfg: Config = yaml_serde::from_str("debug: {}").unwrap();
         assert_eq!(
             cfg.debug,
             Some(DebugConfig {
@@ -890,57 +890,57 @@ routes:
 
     #[test]
     fn debug_sink_canary_parses_and_rejects_typos() {
-        let cfg: Config = serde_yaml::from_str("debug:\n  sink_canary: true\n").unwrap();
+        let cfg: Config = yaml_serde::from_str("debug:\n  sink_canary: true\n").unwrap();
         assert!(cfg.sink_canary_enabled());
         // A misspelled debug switch must fail loudly rather than silently
         // leaving the canary off — a runner would then "prove" nothing.
-        assert!(serde_yaml::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
+        assert!(yaml_serde::from_str::<Config>("debug:\n  sink_canry: true\n").is_err());
     }
 
     #[test]
     fn debug_upstream_header_parses_and_rejects_typos() {
-        let cfg: Config = serde_yaml::from_str("debug:\n  upstream_header: true\n").unwrap();
+        let cfg: Config = yaml_serde::from_str("debug:\n  upstream_header: true\n").unwrap();
         assert!(cfg.upstream_header_enabled());
         assert!(
             !cfg.sink_canary_enabled(),
             "the two switches are independent"
         );
-        assert!(serde_yaml::from_str::<Config>("debug:\n  upstream_hedaer: true\n").is_err());
+        assert!(yaml_serde::from_str::<Config>("debug:\n  upstream_hedaer: true\n").is_err());
     }
 
     #[test]
     fn debug_switches_enable_independently() {
-        let sink_only: Config = serde_yaml::from_str("debug:\n  sink_canary: true\n").unwrap();
+        let sink_only: Config = yaml_serde::from_str("debug:\n  sink_canary: true\n").unwrap();
         assert!(sink_only.sink_canary_enabled());
         assert!(!sink_only.upstream_header_enabled());
 
         let header_only: Config =
-            serde_yaml::from_str("debug:\n  upstream_header: true\n").unwrap();
+            yaml_serde::from_str("debug:\n  upstream_header: true\n").unwrap();
         assert!(!header_only.sink_canary_enabled());
         assert!(header_only.upstream_header_enabled());
 
         let both: Config =
-            serde_yaml::from_str("debug:\n  sink_canary: true\n  upstream_header: true\n").unwrap();
+            yaml_serde::from_str("debug:\n  sink_canary: true\n  upstream_header: true\n").unwrap();
         assert!(both.sink_canary_enabled());
         assert!(both.upstream_header_enabled());
     }
 
     #[test]
     fn observe_block_is_absent_by_default() {
-        let cfg: Config = serde_yaml::from_str("{}").unwrap();
+        let cfg: Config = yaml_serde::from_str("{}").unwrap();
         assert!(cfg.observe.is_none());
         assert!(!cfg.observe_enabled());
         // An empty block is still on: presence is the switch, so the bare
         // `observe: {}` an operator is most likely to write must observe with
         // the built-in bounds rather than do nothing.
-        let cfg: Config = serde_yaml::from_str("observe: {}").unwrap();
+        let cfg: Config = yaml_serde::from_str("observe: {}").unwrap();
         assert_eq!(cfg.observe, Some(ObserveConfig::default()));
         assert!(cfg.observe_enabled());
     }
 
     #[test]
     fn observe_partial_block_fills_remaining_defaults() {
-        let cfg: Config = serde_yaml::from_str("observe:\n  sample_rate: 0.25\n").unwrap();
+        let cfg: Config = yaml_serde::from_str("observe:\n  sample_rate: 0.25\n").unwrap();
         let observe = cfg.observe.unwrap();
         assert_eq!(observe.sample_rate, 0.25);
         assert_eq!(observe.max_query_names, 32);
@@ -952,7 +952,7 @@ routes:
     fn observe_block_rejects_typos() {
         // A misspelled bound must fail loudly: silently defaulting it back to
         // 32 would leave an operator believing they had raised a cap.
-        assert!(serde_yaml::from_str::<Config>("observe:\n  max_query_name: 64\n").is_err());
+        assert!(yaml_serde::from_str::<Config>("observe:\n  max_query_name: 64\n").is_err());
     }
 
     #[test]
@@ -967,7 +967,7 @@ flags:
   stale_ttl_ms: 30000
   fail_safe_mode: legacy_only
 "#;
-        let cfg: Config = serde_yaml::from_str(yaml).unwrap();
+        let cfg: Config = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(
             cfg.flags.static_values.values["migration.get-device.rollout_percentage"].as_f64(),
             Some(25.0)

@@ -35,12 +35,23 @@ pub fn build(config: &FlagsConfig) -> anyhow::Result<Arc<dyn FlagProvider>> {
             Duration::from_millis(config.file.refresh_interval_ms),
             stale_ttl,
         )),
-        FlagProviderKind::Redis => Arc::new(redis_provider::RedisProvider::new(
-            &config.redis.url,
-            config.redis.key_prefix.clone(),
-            Duration::from_millis(config.redis.refresh_interval_ms),
-            stale_ttl,
-        )?),
+        FlagProviderKind::Redis => Arc::new(
+            redis_provider::RedisProvider::new(
+                &config.redis.url,
+                config.redis.key_prefix.clone(),
+                Duration::from_millis(config.redis.refresh_interval_ms),
+                stale_ttl,
+            )
+            // The client's own error can quote part of the URL (a rejected
+            // `?protocol=` value), which is a config value that carries the
+            // password — so it is never rendered as it comes.
+            .map_err(|e| {
+                anyhow::anyhow!(
+                    "flags.redis.url: cannot build a Redis client: {}",
+                    crate::config::redact::redis_client_error(&e)
+                )
+            })?,
+        ),
     };
     Ok(provider)
 }

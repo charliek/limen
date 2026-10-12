@@ -841,7 +841,7 @@ mod tests {
             .map(|name| format!("\"{name}\""))
             .collect::<Vec<_>>()
             .join(", ");
-        serde_yaml::from_str(&format!(
+        yaml_serde::from_str(&format!(
             r#"
 id: "test-route"
 match:

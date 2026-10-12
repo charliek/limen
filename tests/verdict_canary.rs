@@ -28,7 +28,7 @@ use common::{free_port, spawn_proxy, wait_serving};
 /// matches and the only mismatch in the run is the canary), plus the debug
 /// block that exposes the endpoint.
 fn server_config(data_port: u16, control_port: u16, upstream: &str, sink_dir: &Path) -> Config {
-    serde_yaml::from_str(&format!(
+    yaml_serde::from_str(&format!(
         r#"
 server:
   listen_addr: "127.0.0.1:{data_port}"

@@ -41,7 +41,7 @@ async fn a_hung_shadow_times_the_drain_out() {
 
     let data_port = free_port();
     let control_port = free_port();
-    let config: Config = serde_yaml::from_str(&format!(
+    let config: Config = yaml_serde::from_str(&format!(
         r#"
 server:
   listen_addr: "127.0.0.1:{data_port}"

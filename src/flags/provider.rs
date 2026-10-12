@@ -154,19 +154,19 @@ mod tests {
     #[test]
     fn untagged_parsing_picks_the_right_shape() {
         assert_eq!(
-            serde_yaml::from_str::<FlagValue>("true").unwrap(),
+            yaml_serde::from_str::<FlagValue>("true").unwrap(),
             FlagValue::Bool(true)
         );
         assert_eq!(
-            serde_yaml::from_str::<FlagValue>("25").unwrap(),
+            yaml_serde::from_str::<FlagValue>("25").unwrap(),
             FlagValue::Number(25.0)
         );
         assert_eq!(
-            serde_yaml::from_str::<FlagValue>("0.5").unwrap(),
+            yaml_serde::from_str::<FlagValue>("0.5").unwrap(),
             FlagValue::Number(0.5)
         );
         assert_eq!(
-            serde_yaml::from_str::<FlagValue>("\"legacy_only\"").unwrap(),
+            yaml_serde::from_str::<FlagValue>("\"legacy_only\"").unwrap(),
             FlagValue::String("legacy_only".into())
         );
     }

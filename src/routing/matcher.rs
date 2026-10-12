@@ -30,6 +30,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::config::model::{Config, RolloutConfig, RouteMatch, RouteMode, TimeoutsConfig};
+use crate::config::redact::unparseable_url;
 use crate::contract::model::ComparisonRules;
 use crate::resilience::CircuitBreaker;
 use crate::routing::template::{CompiledTemplate, TemplateParseError};
@@ -37,13 +38,15 @@ use crate::routing::template::{CompiledTemplate, TemplateParseError};
 /// Failure compiling a route into the route table.
 #[derive(Debug, Error)]
 pub enum RouteBuildError {
-    /// An upstream URL did not parse (should not happen post-validation).
-    #[error("route {id:?}: invalid upstream URL {url:?}: {source}")]
+    /// An upstream URL did not parse (should not happen post-validation). The
+    /// URL itself is deliberately not carried: it may hold credentials, and the
+    /// route id plus field name find it in the config.
+    #[error("route {id:?}: {field} {}", unparseable_url(*.source))]
     BadUrl {
         /// The route id.
         id: String,
-        /// The offending URL string.
-        url: String,
+        /// Which upstream field held the URL (`legacy_upstream`/`new_upstream`).
+        field: &'static str,
         /// The parse error.
         source: url::ParseError,
     },
@@ -350,8 +353,8 @@ impl RouteTable {
                 query_absent: r.r#match.query_absent.clone(),
                 query_conditioned: r.r#match.is_query_conditioned(),
                 mode: r.mode,
-                legacy_upstream: parse_opt(&r.id, r.legacy_upstream.as_deref())?,
-                new_upstream: parse_opt(&r.id, r.new_upstream.as_deref())?,
+                legacy_upstream: parse_opt(&r.id, "legacy_upstream", r.legacy_upstream.as_deref())?,
+                new_upstream: parse_opt(&r.id, "new_upstream", r.new_upstream.as_deref())?,
                 timeouts: r.timeouts.clone(),
                 comparison,
                 rollout: r.rollout.clone(),
@@ -405,13 +408,17 @@ impl RouteTable {
     }
 }
 
-fn parse_opt(id: &str, url: Option<&str>) -> Result<Option<Url>, RouteBuildError> {
+fn parse_opt(
+    id: &str,
+    field: &'static str,
+    url: Option<&str>,
+) -> Result<Option<Url>, RouteBuildError> {
     match url {
         Some(s) => Url::parse(s)
             .map(Some)
             .map_err(|source| RouteBuildError::BadUrl {
                 id: id.to_string(),
-                url: s.to_string(),
+                field,
                 source,
             }),
         None => Ok(None),
@@ -424,7 +431,7 @@ mod tests {
     use crate::routing::resolve::resolve_comparisons;
 
     fn table(yaml: &str) -> RouteTable {
-        let config: Config = serde_yaml::from_str(yaml).unwrap();
+        let config: Config = yaml_serde::from_str(yaml).unwrap();
         let comparisons = resolve_comparisons(&config, std::path::Path::new(".")).unwrap();
         RouteTable::build(&config, comparisons).unwrap()
     }
@@ -931,5 +938,42 @@ routes:
         assert!(t
             .match_route("GET", "/x", Some("a=1&consent_verifier="))
             .is_none());
+    }
+
+    /// Invariant 5 on the route-build error: it names the route and the field,
+    /// never the URL (which may carry userinfo or a token), in `Display` or in
+    /// `Debug`. Built from an unvalidated config, the one way this can fire.
+    #[test]
+    fn a_bad_upstream_url_error_names_the_field_and_never_the_url() {
+        for (field, legacy, new) in [
+            (
+                "legacy_upstream",
+                "https://u:CANARY@x:99999/?t=CANARY",
+                "https://n",
+            ),
+            ("new_upstream", "https://l", "CANARY is not a url"),
+        ] {
+            let config: Config = yaml_serde::from_str(&format!(
+                r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET"], path_prefix: "/" }}
+    legacy_upstream: "{legacy}"
+    new_upstream: "{new}"
+    mode: shadow_legacy_primary
+"#
+            ))
+            .unwrap();
+            let comparisons = resolve_comparisons(&config, std::path::Path::new(".")).unwrap();
+            let error = RouteTable::build(&config, comparisons).unwrap_err();
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(!rendered.contains("CANARY"), "{rendered}");
+            }
+            let shown = error.to_string();
+            assert!(
+                shown.contains(r#"route "r""#) && shown.contains(field),
+                "{shown}"
+            );
+        }
     }
 }

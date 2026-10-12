@@ -433,8 +433,8 @@ mod tests {
 
     #[test]
     fn timestamp_precision_accepts_both_millis_spellings() {
-        let millis: TimestampPrecision = serde_yaml::from_str("millis").unwrap();
-        let milliseconds: TimestampPrecision = serde_yaml::from_str("milliseconds").unwrap();
+        let millis: TimestampPrecision = yaml_serde::from_str("millis").unwrap();
+        let milliseconds: TimestampPrecision = yaml_serde::from_str("milliseconds").unwrap();
         assert_eq!(millis, TimestampPrecision::Millis);
         assert_eq!(milliseconds, TimestampPrecision::Millis);
         // Serialization stays on Limen's historical spelling.
@@ -456,7 +456,7 @@ location:
   ignore_query_params: [state, nonce]
   origin: ignore
 "#;
-        let rules: BehavioralRules = serde_yaml::from_str(yaml).unwrap();
+        let rules: BehavioralRules = yaml_serde::from_str(yaml).unwrap();
         let sc = rules.set_cookie.unwrap();
         assert_eq!(sc.compare, Some(true));
         assert_eq!(sc.ignore_cookies, vec!["csrf_token"]);
@@ -471,7 +471,7 @@ location:
     #[test]
     fn empty_set_cookie_and_location_blocks_parse() {
         let rules: BehavioralRules =
-            serde_yaml::from_str("set_cookie: {}\nlocation: {}\n").unwrap();
+            yaml_serde::from_str("set_cookie: {}\nlocation: {}\n").unwrap();
         assert_eq!(rules.set_cookie, Some(SetCookieRules::default()));
         assert_eq!(rules.location, Some(LocationRules::default()));
     }
@@ -479,9 +479,9 @@ location:
     #[test]
     fn rejects_unknown_fields_in_new_blocks() {
         assert!(
-            serde_yaml::from_str::<BehavioralRules>("set_cookie:\n  ignore_cookie: [a]\n").is_err()
+            yaml_serde::from_str::<BehavioralRules>("set_cookie:\n  ignore_cookie: [a]\n").is_err()
         );
-        assert!(serde_yaml::from_str::<BehavioralRules>("location:\n  origin: partial\n").is_err());
+        assert!(yaml_serde::from_str::<BehavioralRules>("location:\n  origin: partial\n").is_err());
     }
 
     #[test]
@@ -527,7 +527,7 @@ routes:
         ignore_paths: ["$.device.lastSeenAt"]
     tags: [read, migration-ready]
 "#;
-        let c: Contract = serde_yaml::from_str(yaml).unwrap();
+        let c: Contract = yaml_serde::from_str(yaml).unwrap();
         assert_eq!(c.version, 1);
         assert_eq!(c.service, "device-service");
         let r = c.route("get-device").unwrap();
@@ -556,6 +556,6 @@ defaults:
   compaer_status: true
 "#;
         // A typo'd key is rejected rather than silently ignored.
-        assert!(serde_yaml::from_str::<Contract>(yaml).is_err());
+        assert!(yaml_serde::from_str::<Contract>(yaml).is_err());
     }
 }

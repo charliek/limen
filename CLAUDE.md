@@ -99,6 +99,16 @@ behavioral rules, never both (validation error).
   binary top level.
 - Avoid high-cardinality metric labels (no user/tenant/request IDs or raw
   paths) — use route IDs and path templates.
+- Never render a `reqwest::Error` as it comes: its `Display` ends
+  `for url (<full URL>)`, query string and all (invariant 5). Use
+  `.without_url()` wherever one is logged or put in a message;
+  `tests/upstream_error_logs.rs` holds the canary tests for the proxy paths.
+- One rustls crypto provider, aws-lc-rs. `ring` must stay out of every graph
+  (CI's "Guard: rustls …" steps): with two providers rustls panics in
+  `ClientConfig::builder()` on the first `rediss://` connect, which no
+  plain-`redis://` test reaches. `main` installs aws-lc-rs explicitly
+  (`http::client::install_crypto_provider`); `tests/tls_provider.rs` runs the
+  connect in a fresh process that never installs one.
 - Match the surrounding code's comment density and idiom; comments explain
   *why*, not *what*.
 

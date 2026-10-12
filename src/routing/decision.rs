@@ -220,7 +220,7 @@ mod tests {
     }
 
     fn split_table() -> RouteTable {
-        let config: Config = serde_yaml::from_str(
+        let config: Config = yaml_serde::from_str(
             r#"
 routes:
   - id: r

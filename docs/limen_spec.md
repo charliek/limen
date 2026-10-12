@@ -79,7 +79,7 @@ This assumption is why shadowing reads is safe (both read the same data) and why
 | Async runtime | `tokio` | De facto standard; mature, performant. |
 | HTTP server + middleware | `axum` + `tower` on `hyper` | `tower`'s `Service`/`Layer` model maps directly onto the proxy's middleware concerns (routing decision, rollout, shadow dispatch, circuit breaking, timeouts, metrics) as composable layers rather than ad-hoc code. `axum` gives ergonomic routing for the control-plane endpoints. `hyper` keeps the data plane low-level enough to control buffering and streaming. |
 | Upstream HTTP client | `reqwest` | Connection pooling, timeouts, TLS, redirects handled. Pragmatic for both primary and shadow calls. A raw `hyper` client is the documented fallback if tighter control over shadow-path resource use is needed later. |
-| Config / serde | `serde`, `serde_json`, `serde_yaml` | Config in YAML; contract in YAML or JSON. |
+| Config / serde | `serde`, `serde_json`, `yaml_serde` | Config in YAML; contract in YAML or JSON. |
 | Logging / tracing | `tracing`, `tracing-subscriber` | Structured logs, span context. |
 | Metrics | `metrics` + `metrics-exporter-prometheus` | Prometheus endpoint, low-cardinality. |
 | CLI | `clap` | Subcommands and config validation. |

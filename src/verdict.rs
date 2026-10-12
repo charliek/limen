@@ -47,6 +47,7 @@ use serde::Serialize;
 use tokio::time::Instant;
 
 use crate::config::model::Config;
+use crate::config::redact::redact_url;
 use crate::observability::prometheus::{
     expected_skip_series, COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL,
     DIFF_SINK_ENQUEUED_TOTAL, DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT,
@@ -206,15 +207,24 @@ impl Scrape {
     /// Parse a Prometheus text exposition. Comment/blank lines are skipped;
     /// any other unparseable line is an error — this parser reads limen's own
     /// exporter, so leniency would only hide renderer drift (fail closed).
+    ///
+    /// A bad line is reported by number and length, never by content: the text
+    /// is whatever answered at `--control-url`, and a misdirected service that
+    /// reflects its request (the query's token, say) would put it in the error.
     pub fn parse(text: &str) -> Result<Scrape, InputUnavailable> {
         let mut samples = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
+        for (index, raw) in text.lines().enumerate() {
+            let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let sample = parse_sample(line)
-                .ok_or_else(|| InputUnavailable(format!("unparseable /metrics line: {line:?}")))?;
+            let sample = parse_sample(line).ok_or_else(|| {
+                InputUnavailable(format!(
+                    "unparseable /metrics line {} ({} bytes; its content is not echoed)",
+                    index + 1,
+                    raw.len()
+                ))
+            })?;
             samples.push(sample);
         }
         Ok(Scrape { samples })
@@ -1144,16 +1154,17 @@ pub async fn run_verdict(
 /// injection input was denied, so nothing downstream is trustworthy.
 async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), InputUnavailable> {
     let url = format!("{base}/debug/canary");
+    let shown = redact_url(&url);
     let resp = client
         .post(&url)
         .send()
         .await
-        .map_err(|e| InputUnavailable(format!("canary trigger unreachable at {url}: {e}")))?;
-    if !resp.status().is_success() {
+        .map_err(|e| request_failed("canary trigger unreachable at", &url, e))?;
+    let status = resp.status();
+    if !status.is_success() {
         return Err(InputUnavailable(format!(
-            "canary trigger refused at {url} (HTTP {}): is `debug.sink_canary: true` set \
-             in the running proxy's config?",
-            resp.status()
+            "canary trigger refused at {shown} (HTTP {status}): is `debug.sink_canary: true` set \
+             in the running proxy's config?"
         )));
     }
     // Require the endpoint's own acknowledgment, not just a 2xx: a mis-aimed
@@ -1162,15 +1173,19 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
     let text = resp
         .text()
         .await
-        .map_err(|e| InputUnavailable(format!("cannot read canary response from {url}: {e}")))?;
+        .map_err(|e| request_failed("cannot read canary response from", &url, e))?;
     let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         InputUnavailable(format!(
-            "canary trigger at {url} returned a non-JSON body: {e}"
+            "canary trigger at {shown} returned a non-JSON body: {e}"
         ))
     })?;
     if body.get("injected") != Some(&serde_json::Value::Bool(true)) {
+        // The body is not quoted: a control endpoint that is not limen's may
+        // answer by reflecting the request, query token and all.
         return Err(InputUnavailable(format!(
-            "canary trigger at {url} did not acknowledge the injection (body: {body})"
+            "canary trigger at {shown} did not acknowledge the injection: HTTP {status}, a \
+             {}-byte JSON body without `\"injected\": true` (not echoed)",
+            text.len()
         )));
     }
     Ok(())
@@ -1221,18 +1236,32 @@ async fn fetch_scrape(
         .get(&url)
         .send()
         .await
-        .map_err(|e| InputUnavailable(format!("control plane unreachable at {url}: {e}")))?;
+        .map_err(|e| request_failed("control plane unreachable at", &url, e))?;
     if !resp.status().is_success() {
         return Err(InputUnavailable(format!(
-            "control plane returned HTTP {} for {url}",
-            resp.status()
+            "control plane returned HTTP {} for {}",
+            resp.status(),
+            redact_url(&url)
         )));
     }
     let text = resp
         .text()
         .await
-        .map_err(|e| InputUnavailable(format!("cannot read {url}: {e}")))?;
+        .map_err(|e| request_failed("cannot read", &url, e))?;
     Scrape::parse(&text)
+}
+
+/// A failed request to `url`, as `{context} {url}: {error}`, with the URL
+/// redacted (`--control-url` may carry userinfo or a query; invariant 5). The
+/// error is rendered `without_url`: the message already names the URL, and
+/// reqwest's own `for url (...)` suffix would print it — in full — a second
+/// time. (A client-build error has no request, so no URL to strip.)
+fn request_failed(context: &str, url: &str, error: reqwest::Error) -> InputUnavailable {
+    InputUnavailable(format!(
+        "{context} {}: {}",
+        redact_url(url),
+        error.without_url()
+    ))
 }
 
 /// Read the sink report; an unreadable directory is exit-50 territory.
@@ -1357,7 +1386,55 @@ mod tests {
     use crate::observability::{ShadowFailure, SkipReason};
 
     fn config(yaml: &str) -> Config {
-        serde_yaml::from_str(yaml).expect("test config")
+        yaml_serde::from_str(yaml).expect("test config")
+    }
+
+    /// The URL appears once, redacted: in the message, not again in reqwest's
+    /// `for url (...)` suffix (see [`request_failed`]) — and never with the
+    /// userinfo or query an operator's `--control-url` may carry (invariant 5).
+    #[tokio::test]
+    async fn a_transport_failure_names_the_url_exactly_once() {
+        let client = reqwest::Client::new();
+        // (the configured base, what each request's URL must read as)
+        for (base, canary_url, scrape_url) in [
+            (
+                "http://user:CANARY-VERDICT@127.0.0.1:1",
+                "http://127.0.0.1:1/debug/canary",
+                "http://127.0.0.1:1/metrics",
+            ),
+            // A query swallows the appended path, so both read as the base.
+            (
+                "http://user:CANARY-VERDICT@127.0.0.1:1/ctl?probe=CANARY-VERDICT",
+                "http://127.0.0.1:1/ctl",
+                "http://127.0.0.1:1/ctl",
+            ),
+        ] {
+            let opts = VerdictOptions {
+                sink_dir: PathBuf::from("."),
+                control_base: base.to_string(),
+                metrics_path: "/metrics".to_string(),
+                canary: false,
+                offline: false,
+                drain_deadline: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(10),
+            };
+            for (error, context, shown) in [
+                (
+                    trigger_canary(&client, base).await.unwrap_err(),
+                    "canary trigger unreachable at",
+                    canary_url,
+                ),
+                (
+                    fetch_scrape(&client, &opts).await.unwrap_err(),
+                    "control plane unreachable at",
+                    scrape_url,
+                ),
+            ] {
+                assert!(error.0.contains(context), "{error}");
+                assert_eq!(error.0.matches(shown).count(), 1, "{error}");
+                assert!(!error.0.contains("CANARY-VERDICT"), "{error}");
+            }
+        }
     }
 
     /// A config with two compared routes (default floor 1) and one exempt.

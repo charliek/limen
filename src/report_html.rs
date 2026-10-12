@@ -66,6 +66,7 @@ use serde::Deserialize;
 
 use crate::config::load::{load as load_config, ConfigOverrides};
 use crate::config::model::{Config, FailSafeMode, RouteMode};
+use crate::config::redact::redact_urls_in_text;
 use crate::observability::prometheus::{
     expected_skip_series, BREAKER_TRANSITIONS_TOTAL, CIRCUIT_BREAKER_STATE, COMPARISONS_TOTAL,
     COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL, DIFF_SINK_ENQUEUED_TOTAL,
@@ -2903,6 +2904,10 @@ pub fn render_report(inputs: &Inputs) -> String {
 /// paths and verdict details all come from documents this tool did not write,
 /// and a report that executes its input is worse than no report.
 pub fn esc(value: &str) -> String {
+    // Every piece of text the page inserts comes through here, so this is the
+    // page's backstop for a URL's secrets (invariant 5), before the escaping
+    // changes what a quote or an ampersand looks like.
+    let value = redact_urls_in_text(value);
     let mut out = String::with_capacity(value.len());
     for c in value.chars() {
         match c {
