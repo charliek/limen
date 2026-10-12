@@ -43,6 +43,12 @@ modes, resolvable contract references, the contract-vs-inline conflict rule,
 JSONPath-subset compliance, and valid fail-safe / budget values. Failures name
 the offending field and route. Exits non-zero on any error.
 
+A URL that fails validation is never echoed back: `flags.redis.url` and the
+route upstreams can carry a password in their userinfo or a token in their
+query, so the message says what failed to parse (`is not a valid URL (invalid
+port number; value redacted)`) and leaves the value out. The same holds for
+every message that names a configured or `--control-url` URL.
+
 ## `print-routes`
 
 ```bash
@@ -69,7 +75,9 @@ get-user
 write is opted in. `behavioral` names where the comparison rules come from —
 `contract <reference>` (as written), `inline`, or `none` — not the rules
 themselves. Use it to confirm routing — which route, which mode, which
-upstreams — before starting the proxy.
+upstreams — before starting the proxy. The upstreams are shown as
+`scheme://host[:port]/path`: any userinfo, query or fragment on the configured
+URL is left out.
 
 It does **not** print the merged contract rules (read the contract; `limen
 check-contract` validates it), timeouts, rollout, breaker, or any floor.

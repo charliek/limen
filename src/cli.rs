@@ -329,6 +329,13 @@ fn cmd_print_routes(args: ConfigArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// An upstream as the routing table shows it: redacted, or `-` when unset.
+fn upstream_display(upstream: &Option<String>) -> String {
+    upstream
+        .as_deref()
+        .map_or_else(|| "-".to_string(), config::redact::redact_url)
+}
+
 /// Render the resolved routing table as readable per-route blocks.
 fn print_routes(loaded: &LoadedConfig) {
     let routes = &loaded.config.routes;
@@ -357,14 +364,10 @@ fn print_routes(loaded: &LoadedConfig) {
             println!("  query_absent:  {}", route.r#match.query_absent.join(", "));
         }
         println!("  mode:       {}", route.mode.as_str());
-        println!(
-            "  legacy:     {}",
-            route.legacy_upstream.as_deref().unwrap_or("-")
-        );
-        println!(
-            "  new:        {}",
-            route.new_upstream.as_deref().unwrap_or("-")
-        );
+        // Through `redact_url`: an upstream may legally carry userinfo or a
+        // query, and this table is pasted into tickets and CI logs.
+        println!("  legacy:     {}", upstream_display(&route.legacy_upstream));
+        println!("  new:        {}", upstream_display(&route.new_upstream));
         println!(
             "  comparison: {}, sample_rate={:.2}, max_body_bytes={}",
             if route.comparison.enabled {

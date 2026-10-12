@@ -121,6 +121,10 @@ tempfile = "3"
 axum = "0.8"
 tower = { version = "0.5", features = ["util"] }
 yaml_serde = "0.10"
+# The `log` -> `tracing` bridge `LogCapture` installs, so a dependency's `log::`
+# records (reqwest's) land in the captured text as they do in production.
+# Already in the graph through tracing-subscriber's default `tracing-log`.
+tracing-log = "0.2"
 # Criterion for the proxy-overhead benchmarks (lean: no plotters/rayon).
 criterion = { version = "0.8", default-features = false, features = [
     "cargo_bench_support",

@@ -18,6 +18,7 @@ use crate::config::model::{
     MetricsConfig, ObserveConfig, RolloutConfig, RouteConfig, RouteMatch, RouteMode,
     TimeoutsConfig, UpstreamTlsConfig,
 };
+use crate::config::redact;
 use crate::contract::load as contract_load;
 use crate::contract::model::{BehavioralRules, Contract};
 use crate::health::endpoints::CONTROL_PLANE_RESERVED_PATHS;
@@ -288,6 +289,10 @@ fn validate_observe(observe: Option<&ObserveConfig>, metrics: &MetricsConfig, er
     }
 }
 
+// Neither URL validator may echo the value (invariant 5): `flags.redis.url`
+// carries the Redis password in its userinfo, and an unparseable value is by
+// definition one we cannot tell the secret part of. The parse error names what
+// failed; the `got scheme` arms show only the scheme of a URL that parsed.
 fn validate_redis_url(loc: &str, value: &str, errs: &mut Errors) {
     match url::Url::parse(value) {
         Ok(u) if matches!(u.scheme(), "redis" | "rediss") && u.has_host() => {}
@@ -298,7 +303,7 @@ fn validate_redis_url(loc: &str, value: &str, errs: &mut Errors) {
                 u.scheme()
             ),
         ),
-        Err(e) => errs.push(loc, format!("{value:?} is not a valid URL: {e}")),
+        Err(e) => errs.push(loc, redact::unparseable_url(e)),
     }
 }
 
@@ -312,7 +317,7 @@ fn validate_upstream_url(loc: &str, value: &str, errs: &mut Errors) {
                 u.scheme()
             ),
         ),
-        Err(e) => errs.push(loc, format!("{value:?} is not a valid URL: {e}")),
+        Err(e) => errs.push(loc, redact::unparseable_url(e)),
     }
 }
 
@@ -2164,6 +2169,91 @@ flags:
 "#,
         );
         assert!(locations(&errs).contains(&"flags.redis.url"));
+    }
+
+    /// Invariant 5. Each value below carries a canary where a real one would
+    /// sit — the password of `redis://:pw@host:99999` is what the port error is
+    /// reported *around* — and none may come back in a message. The location
+    /// still says which field to fix.
+    const URL_CANARIES: [&str; 3] = [
+        "redis://:CANARY-PW@host:99999",
+        "https://user:CANARY@x:99999/?token=CANARY",
+        "CANARY is not a url",
+    ];
+
+    /// The error `validate` reports at `location`, with the canary check every
+    /// URL-echo test shares: no error anywhere in the list renders the canary.
+    fn error_at<'a>(errs: &'a [ValidationError], location: &str) -> &'a ValidationError {
+        for e in errs {
+            assert!(!e.to_string().contains("CANARY"), "{e}");
+        }
+        errs.iter()
+            .find(|e| e.location == location)
+            .unwrap_or_else(|| panic!("no error at {location}: {errs:?}"))
+    }
+
+    #[test]
+    fn an_unparseable_redis_url_is_not_echoed() {
+        for bad in URL_CANARIES {
+            let errs = errors(&format!(
+                r#"
+flags:
+  provider: redis
+  redis: {{ url: "{bad}", key_prefix: "p", refresh_interval_ms: 1000 }}
+  stale_ttl_ms: 30000
+  fail_safe_mode: legacy_only
+"#
+            ));
+            let e = error_at(&errs, "flags.redis.url");
+            assert!(e.message.contains("is not a valid URL"), "{e}");
+            assert!(e.message.contains("value redacted"), "{e}");
+        }
+    }
+
+    #[test]
+    fn an_unparseable_upstream_url_is_not_echoed() {
+        for bad in URL_CANARIES {
+            let errs = errors(&format!(
+                r#"
+routes:
+  - id: r
+    match: {{ methods: ["GET"], path_prefix: "/" }}
+    legacy_upstream: "{bad}"
+    new_upstream: "{bad}"
+    mode: shadow_legacy_primary
+"#
+            ));
+            for field in ["legacy_upstream", "new_upstream"] {
+                let e = error_at(&errs, &format!("routes[0] \"r\".{field}"));
+                assert!(e.message.contains("is not a valid URL"), "{e}");
+                assert!(e.message.contains("value redacted"), "{e}");
+            }
+        }
+    }
+
+    /// The other two arms report a URL that parsed but is the wrong kind; they
+    /// name its scheme and nothing else, so the credential in the same value
+    /// stays out.
+    #[test]
+    fn a_wrong_scheme_url_is_reported_by_scheme_alone() {
+        let errs = errors(
+            r#"
+flags:
+  provider: redis
+  redis: { url: "http://u:CANARY@host/?token=CANARY", key_prefix: "p", refresh_interval_ms: 1000 }
+  stale_ttl_ms: 30000
+  fail_safe_mode: legacy_only
+routes:
+  - id: r
+    match: { methods: ["GET"], path_prefix: "/" }
+    legacy_upstream: "ftp://u:CANARY@host/?token=CANARY"
+    mode: legacy_only
+"#,
+        );
+        let redis = error_at(&errs, "flags.redis.url");
+        assert!(redis.message.contains(r#"scheme "http""#), "{redis}");
+        let upstream = error_at(&errs, r#"routes[0] "r".legacy_upstream"#);
+        assert!(upstream.message.contains(r#"scheme "ftp""#), "{upstream}");
     }
 
     #[test]

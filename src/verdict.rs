@@ -47,6 +47,7 @@ use serde::Serialize;
 use tokio::time::Instant;
 
 use crate::config::model::Config;
+use crate::config::redact::redact_url;
 use crate::observability::prometheus::{
     expected_skip_series, COMPARISONS_TOTAL, COMPARISON_SKIPPED_TOTAL, DIFF_SINK_DROPPED_TOTAL,
     DIFF_SINK_ENQUEUED_TOTAL, DIFF_SINK_WRITTEN_TOTAL, SHADOW_FAILED_TOTAL, SHADOW_IN_FLIGHT,
@@ -1144,6 +1145,7 @@ pub async fn run_verdict(
 /// injection input was denied, so nothing downstream is trustworthy.
 async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), InputUnavailable> {
     let url = format!("{base}/debug/canary");
+    let shown = redact_url(&url);
     let resp = client
         .post(&url)
         .send()
@@ -1151,7 +1153,7 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
         .map_err(|e| request_failed("canary trigger unreachable at", &url, e))?;
     if !resp.status().is_success() {
         return Err(InputUnavailable(format!(
-            "canary trigger refused at {url} (HTTP {}): is `debug.sink_canary: true` set \
+            "canary trigger refused at {shown} (HTTP {}): is `debug.sink_canary: true` set \
              in the running proxy's config?",
             resp.status()
         )));
@@ -1165,12 +1167,12 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
         .map_err(|e| request_failed("cannot read canary response from", &url, e))?;
     let body: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
         InputUnavailable(format!(
-            "canary trigger at {url} returned a non-JSON body: {e}"
+            "canary trigger at {shown} returned a non-JSON body: {e}"
         ))
     })?;
     if body.get("injected") != Some(&serde_json::Value::Bool(true)) {
         return Err(InputUnavailable(format!(
-            "canary trigger at {url} did not acknowledge the injection (body: {body})"
+            "canary trigger at {shown} did not acknowledge the injection (body: {body})"
         )));
     }
     Ok(())
@@ -1224,8 +1226,9 @@ async fn fetch_scrape(
         .map_err(|e| request_failed("control plane unreachable at", &url, e))?;
     if !resp.status().is_success() {
         return Err(InputUnavailable(format!(
-            "control plane returned HTTP {} for {url}",
-            resp.status()
+            "control plane returned HTTP {} for {}",
+            resp.status(),
+            redact_url(&url)
         )));
     }
     let text = resp
@@ -1235,12 +1238,17 @@ async fn fetch_scrape(
     Scrape::parse(&text)
 }
 
-/// A failed request to `url`, as `{context} {url}: {error}`. The error is
-/// rendered `without_url`: the message already names the URL, and reqwest's own
-/// `for url (...)` suffix would print it a second time. (A client-build error has
-/// no request, so no URL to strip.)
+/// A failed request to `url`, as `{context} {url}: {error}`, with the URL
+/// redacted (`--control-url` may carry userinfo or a query; invariant 5). The
+/// error is rendered `without_url`: the message already names the URL, and
+/// reqwest's own `for url (...)` suffix would print it — in full — a second
+/// time. (A client-build error has no request, so no URL to strip.)
 fn request_failed(context: &str, url: &str, error: reqwest::Error) -> InputUnavailable {
-    InputUnavailable(format!("{context} {url}: {}", error.without_url()))
+    InputUnavailable(format!(
+        "{context} {}: {}",
+        redact_url(url),
+        error.without_url()
+    ))
 }
 
 /// Read the sink report; an unreadable directory is exit-50 territory.
@@ -1368,33 +1376,51 @@ mod tests {
         yaml_serde::from_str(yaml).expect("test config")
     }
 
-    /// The URL, query included, appears once: in the message, not again in
-    /// reqwest's `for url (...)` suffix (see [`request_failed`]).
+    /// The URL appears once, redacted: in the message, not again in reqwest's
+    /// `for url (...)` suffix (see [`request_failed`]) — and never with the
+    /// userinfo or query an operator's `--control-url` may carry (invariant 5).
     #[tokio::test]
     async fn a_transport_failure_names_the_url_exactly_once() {
         let client = reqwest::Client::new();
-        let base = "http://127.0.0.1:1/?probe=CANARY-VERDICT";
-        let opts = VerdictOptions {
-            sink_dir: PathBuf::from("."),
-            control_base: base.to_string(),
-            metrics_path: "/metrics".to_string(),
-            canary: false,
-            offline: false,
-            drain_deadline: Duration::from_secs(1),
-            poll_interval: Duration::from_millis(10),
-        };
-        for (error, context) in [
+        // (the configured base, what each request's URL must read as)
+        for (base, canary_url, scrape_url) in [
             (
-                trigger_canary(&client, base).await.unwrap_err(),
-                "canary trigger unreachable at",
+                "http://user:CANARY-VERDICT@127.0.0.1:1",
+                "http://127.0.0.1:1/debug/canary",
+                "http://127.0.0.1:1/metrics",
             ),
+            // A query swallows the appended path, so both read as the base.
             (
-                fetch_scrape(&client, &opts).await.unwrap_err(),
-                "control plane unreachable at",
+                "http://user:CANARY-VERDICT@127.0.0.1:1/ctl?probe=CANARY-VERDICT",
+                "http://127.0.0.1:1/ctl",
+                "http://127.0.0.1:1/ctl",
             ),
         ] {
-            assert!(error.0.contains(context), "{error}");
-            assert_eq!(error.0.matches("CANARY-VERDICT").count(), 1, "{error}");
+            let opts = VerdictOptions {
+                sink_dir: PathBuf::from("."),
+                control_base: base.to_string(),
+                metrics_path: "/metrics".to_string(),
+                canary: false,
+                offline: false,
+                drain_deadline: Duration::from_secs(1),
+                poll_interval: Duration::from_millis(10),
+            };
+            for (error, context, shown) in [
+                (
+                    trigger_canary(&client, base).await.unwrap_err(),
+                    "canary trigger unreachable at",
+                    canary_url,
+                ),
+                (
+                    fetch_scrape(&client, &opts).await.unwrap_err(),
+                    "control plane unreachable at",
+                    scrape_url,
+                ),
+            ] {
+                assert!(error.0.contains(context), "{error}");
+                assert_eq!(error.0.matches(shown).count(), 1, "{error}");
+                assert!(!error.0.contains("CANARY-VERDICT"), "{error}");
+            }
         }
     }
 

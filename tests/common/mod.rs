@@ -233,6 +233,13 @@ pub async fn parts(resp: Response<Body>) -> (StatusCode, HeaderMap, String) {
 /// log file would hold. Every level and target, so hyper's and reqwest's own
 /// events are captured with limen's: a leak is a leak wherever it is logged.
 ///
+/// That includes dependencies that log through the `log` facade, which reqwest
+/// does and `tracing` alone never sees: production's `logging::init` installs
+/// the `log` -> `tracing` bridge (tracing-subscriber's `tracing-log` feature),
+/// and a subscriber built with `.finish()` and `set_default` does not, so
+/// [`start`](Self::start) installs it. Without it every "no secret in any log
+/// line" assertion would be blind to those records.
+///
 /// The subscriber is the *thread's* default, so it sees the work of a
 /// `#[tokio::test]` (a current-thread runtime, tasks included) and nothing a
 /// multi-threaded runtime moved to another worker. Start it before the work
@@ -244,6 +251,12 @@ pub struct LogCapture {
 
 impl LogCapture {
     pub fn start() -> Self {
+        // The `log` logger is process-global, so every start after the first gets
+        // an `Err` and leaves the installed bridge alone; `LogTracer` hands each
+        // record to the *calling thread's* subscriber, so concurrent captures
+        // stay apart. (`logging::init` installs the same bridge, but only the
+        // binary's `main` calls it, so the two never contend in a test process.)
+        let _ = tracing_log::LogTracer::init();
         let buf = Arc::new(Mutex::new(Vec::new()));
         let writer = buf.clone();
         let subscriber = tracing_subscriber::fmt()

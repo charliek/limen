@@ -171,3 +171,37 @@ async fn a_failed_shadow_logs_no_url() {
     .await;
     assert_no_canary("the log", &logs.text());
 }
+
+/// The positive control for every `assert_no_canary("the log", ..)` above:
+/// reqwest logs through the `log` facade, not `tracing`, so a capture that is
+/// only a `tracing` subscriber never sees those records and "no canary in the
+/// log" passes over them. This proves a `log::` record with a canary in it IS
+/// in [`LogCapture::text`], at every level a dependency might use for it.
+#[test]
+fn the_capture_sees_what_a_dependency_logs_through_the_log_facade() {
+    use tracing_log::log;
+
+    let logs = LogCapture::start();
+    let url =
+        format!("http://{USER_CANARY}:{PASS_CANARY}@127.0.0.1:1/x?access_token={QUERY_CANARY}");
+
+    log::warn!(target: "reqwest::connect", "warn-level record for {url}");
+    log::debug!(target: "reqwest::connect", "debug-level record for {url}");
+    log::trace!(target: "reqwest::connect", "trace-level record for {url}");
+
+    let text = logs.text();
+    for level in ["warn", "debug", "trace"] {
+        let line = text
+            .lines()
+            .find(|l| l.contains(&format!("{level}-level record")))
+            .unwrap_or_else(|| {
+                panic!(
+                    "a log::{level}! record never reached the capture, so the no-canary \
+                     assertions are blind to dependency logs:\n{text:?}"
+                )
+            });
+        for canary in [QUERY_CANARY, USER_CANARY, PASS_CANARY] {
+            assert!(line.contains(canary), "{canary} missing from {line}");
+        }
+    }
+}

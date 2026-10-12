@@ -46,6 +46,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::config::model::{ComparisonConfig, Config, RouteConfig, RouteMode};
+use crate::config::redact::redact_url;
 use crate::observability::observe::{ObserveProfile, RouteProfile, OBSERVE_PROFILE_PATH};
 use crate::observability::prometheus::IN_FLIGHT;
 use crate::routing::matcher::{basis_normalizes_paths, PathMatcher};
@@ -537,8 +538,9 @@ async fn scrape_in_flight(client: &reqwest::Client, url: &str) -> Result<f64, Su
     let scrape = Scrape::parse(&text).map_err(|e| SuggestError::InputUnavailable(e.0))?;
     if !scrape.has_family(IN_FLIGHT) {
         return Err(SuggestError::InputUnavailable(format!(
-            "required series {IN_FLIGHT} absent from {url} — the proxy is not exporting the \
-             in-flight gauge quiescence is measured against (older binary?)"
+            "required series {IN_FLIGHT} absent from {} — the proxy is not exporting the \
+             in-flight gauge quiescence is measured against (older binary?)",
+            redact_url(url)
         )));
     }
     Ok(scrape.sum(IN_FLIGHT, &[]).unwrap_or(0.0))
@@ -556,14 +558,16 @@ async fn fetch_profile(client: &reqwest::Client, url: &str) -> Result<String, Su
         .map_err(|e| request_failed("control plane unreachable at", url, e))?;
     if resp.status() == reqwest::StatusCode::NOT_FOUND {
         return Err(SuggestError::InputUnavailable(format!(
-            "{url} returned 404 — the running proxy has no `observe:` block, so it has profiled \
-             nothing. Add the block and restart it before profiling"
+            "{} returned 404 — the running proxy has no `observe:` block, so it has profiled \
+             nothing. Add the block and restart it before profiling",
+            redact_url(url)
         )));
     }
     if !resp.status().is_success() {
         return Err(SuggestError::InputUnavailable(format!(
-            "control plane returned HTTP {} for {url}",
-            resp.status()
+            "control plane returned HTTP {} for {}",
+            resp.status(),
+            redact_url(url)
         )));
     }
     resp.text()
@@ -579,8 +583,9 @@ async fn get_text(client: &reqwest::Client, url: &str) -> Result<String, Suggest
         .map_err(|e| request_failed("control plane unreachable at", url, e))?;
     if !resp.status().is_success() {
         return Err(SuggestError::InputUnavailable(format!(
-            "control plane returned HTTP {} for {url}",
-            resp.status()
+            "control plane returned HTTP {} for {}",
+            resp.status(),
+            redact_url(url)
         )));
     }
     resp.text()
@@ -588,17 +593,25 @@ async fn get_text(client: &reqwest::Client, url: &str) -> Result<String, Suggest
         .map_err(|e| request_failed("cannot read", url, e))
 }
 
-/// A failed request to `url`, as `{context} {url}: {error}`. The error is
-/// rendered `without_url`: the message already names the URL, and reqwest's own
-/// `for url (...)` suffix would print it a second time. (A client-build error has
-/// no request, so no URL to strip.)
+/// A failed request to `url`, as `{context} {url}: {error}`, with the URL
+/// redacted (`--control-url` may carry userinfo or a query; invariant 5). The
+/// error is rendered `without_url`: the message already names the URL, and
+/// reqwest's own `for url (...)` suffix would print it — in full — a second
+/// time. (A client-build error has no request, so no URL to strip.)
 fn request_failed(context: &str, url: &str, error: reqwest::Error) -> SuggestError {
-    SuggestError::InputUnavailable(format!("{context} {url}: {}", error.without_url()))
+    SuggestError::InputUnavailable(format!(
+        "{context} {}: {}",
+        redact_url(url),
+        error.without_url()
+    ))
 }
 
 fn parse_profile(document: &str, url: &str) -> Result<ObserveProfile, SuggestError> {
     serde_json::from_str(document).map_err(|e| {
-        SuggestError::InputUnavailable(format!("{url} did not serve an observe profile: {e}"))
+        SuggestError::InputUnavailable(format!(
+            "{} did not serve an observe profile: {e}",
+            redact_url(url)
+        ))
     })
 }
 
@@ -2241,12 +2254,13 @@ routes:
         assert_eq!(load_profile_file(&path).expect("load"), profile);
     }
 
-    /// The URL, query included, appears once: in the message, not again in
-    /// reqwest's `for url (...)` suffix (see [`request_failed`]).
+    /// The URL appears once, redacted: in the message, not again in reqwest's
+    /// `for url (...)` suffix (see [`request_failed`]) — and never with the
+    /// userinfo or query an operator's `--control-url` may carry (invariant 5).
     #[tokio::test]
     async fn a_transport_failure_names_the_url_exactly_once() {
         let client = reqwest::Client::new();
-        let url = "http://127.0.0.1:1/metrics?probe=CANARY-DRAFT";
+        let url = "http://user:CANARY-DRAFT@127.0.0.1:1/metrics?probe=CANARY-DRAFT";
         for error in [
             get_text(&client, url).await.unwrap_err(),
             fetch_profile(&client, url).await.unwrap_err(),
@@ -2256,7 +2270,12 @@ routes:
                 message.contains("control plane unreachable at"),
                 "{message}"
             );
-            assert_eq!(message.matches("CANARY-DRAFT").count(), 1, "{message}");
+            assert_eq!(
+                message.matches("http://127.0.0.1:1/metrics").count(),
+                1,
+                "{message}"
+            );
+            assert!(!message.contains("CANARY-DRAFT"), "{message}");
         }
     }
 
