@@ -294,13 +294,37 @@ fn credential_shaped(name: &str) -> bool {
         || (name.contains('=') && is_sensitive_name(name))
 }
 
-/// Whether a query parameter or field name says it holds a secret.
+/// Whether a query parameter or field name says it holds a secret. A name is
+/// read as the receiving server reads it, percent-decoded (`%74oken` is
+/// `token`); the text that is printed keeps its spelling.
 fn is_sensitive_name(name: &str) -> bool {
     const SENSITIVE: [&str; 8] = [
         "token", "pass", "pwd", "secret", "key", "auth", "cred", "sig",
     ];
-    let name = name.to_ascii_lowercase();
+    let name = percent_decoded(name).to_ascii_lowercase();
     SENSITIVE.iter().any(|word| name.contains(word))
+}
+
+/// `text` with its `%XX` escapes decoded, for comparing a name, not printing
+/// one. A `%` without two hex digits after it is kept, and a decoded byte
+/// sequence that is not UTF-8 is replaced rather than refused.
+fn percent_decoded(text: &str) -> String {
+    let hex = |byte: Option<&u8>| byte.and_then(|&b| char::from(b).to_digit(16));
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            if let (Some(high), Some(low)) = (hex(bytes.get(at + 1)), hex(bytes.get(at + 2))) {
+                out.push((high * 16 + low) as u8);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A path-tracked serde error as an operator should read it: the same
@@ -690,6 +714,38 @@ mod tests {
         serde_path_to_error::deserialize::<_, T>(de).unwrap_err()
     }
 
+    /// The parameter name is read as the server reads it: `%74oken` is `token`.
+    /// What is printed keeps the spelling it came in.
+    #[test]
+    fn redact_urls_in_text_masks_percent_encoded_parameter_names() {
+        for (text, expected) in [
+            (
+                format!("/x?%74oken={CANARY}"),
+                "/x?%74oken=<redacted>".to_string(),
+            ),
+            (
+                format!("/x?pass%77ord={CANARY}&page=2"),
+                "/x?pass%77ord=<redacted>&page=2".to_string(),
+            ),
+            (
+                format!("/x?%54OKEN={CANARY}"),
+                "/x?%54OKEN=<redacted>".to_string(),
+            ),
+            (
+                format!("/cb#access_%74%6f%6B%65%6e={CANARY}&expires_in=3600"),
+                "/cb#access_%74%6f%6B%65%6e=<redacted>&expires_in=3600".to_string(),
+            ),
+            // Not names that hold a secret once decoded (`page2`), and a `%` that
+            // starts no escape is just a `%`.
+            (
+                "/x?page%32=2&%zz=1&100%=1&%4=1".to_string(),
+                "/x?page%32=2&%zz=1&100%=1&%4=1".to_string(),
+            ),
+        ] {
+            assert_eq!(redact_urls_in_text(&text), expected, "{text}");
+        }
+    }
+
     /// Parse `yaml` as a `Config` and return how the failure is reported.
     fn config_error(yaml: &str) -> String {
         serde_error(&yaml_error::<crate::config::model::Config>(yaml))
@@ -710,6 +766,7 @@ mod tests {
             format!("redis://:{CANARY}@host"),
             format!("{CANARY}@host"),
             format!("token={CANARY}"),
+            format!("%74oken={CANARY}"),
             format!("what?{CANARY}"),
             // A URL with nothing credential-shaped in it but its path: a webhook
             // path is a secret too, and `://` alone says "this is a URL".

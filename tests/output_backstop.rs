@@ -582,3 +582,36 @@ fn the_html_page_on_stdout_is_the_page_out_writes() {
         "the entity and the URL it quotes are intact:\n{page}"
     );
 }
+
+/// clap prints an env-bound arg's current value in `--help`
+/// (`[env: LIMEN_CONFIG=<value>]`), and help leaves through clap's own printing,
+/// not the backstop. The value can be a URL, so help must name the variable and
+/// not the value, for the command and for every subcommand.
+#[test]
+fn help_names_the_env_variable_but_not_its_value() {
+    use clap::CommandFactory;
+    let ws = workspace(&config(&["r"]));
+    let value = "https://user:CANARY-PW@canary.example/config?token=CANARY-Q";
+    let command = limen::cli::Cli::command();
+    let mut shows_the_variable = 0;
+    let helps = std::iter::once(None).chain(command.get_subcommands().map(|s| Some(s.get_name())));
+    for sub in helps {
+        let args: Vec<&str> = sub.into_iter().chain(["--help"]).collect();
+        let out = limen_command(ws.path(), &args)
+            .env("LIMEN_CONFIG", value)
+            .output()
+            .expect("run limen");
+        assert_eq!(out.status.code(), Some(0), "{args:?}: {}", stderr(&out));
+        assert!(
+            stdout(&out).contains("Usage:"),
+            "{args:?}: {}",
+            stdout(&out)
+        );
+        assert_no_canary(&format!("{args:?}"), &out);
+        if stdout(&out).contains("[env: LIMEN_CONFIG]") {
+            shows_the_variable += 1;
+        }
+    }
+    // Not vacuous: the variable's name is still shown where it applies.
+    assert!(shows_the_variable > 0, "no help names LIMEN_CONFIG");
+}

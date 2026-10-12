@@ -143,7 +143,17 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct ConfigArgs {
     /// Path to the limen configuration file (YAML).
-    #[arg(short, long, env = "LIMEN_CONFIG", default_value = "limen.config.yaml")]
+    // `--help` names the variable but not its value: clap prints a set one as
+    // `[env: LIMEN_CONFIG=<value>]`, and the value can be a URL (invariant 5).
+    // Every arg with an `env` needs the same; `every_env_arg_hides_its_value`
+    // walks the command tree so a new one cannot forget.
+    #[arg(
+        short,
+        long,
+        env = "LIMEN_CONFIG",
+        hide_env_values = true,
+        default_value = "limen.config.yaml"
+    )]
     pub config: PathBuf,
     /// CLI overrides (highest-precedence layer; spec §5.1).
     #[command(flatten)]
@@ -901,6 +911,37 @@ mod tests {
     fn cli_definition_is_valid() {
         // Catches structural mistakes (duplicate args, bad defaults) at test time.
         Cli::command().debug_assert();
+    }
+
+    /// `--help` prints an env-bound arg's current value unless told not to, and
+    /// help leaves through clap's own printing, not `print_redacted`. So every
+    /// arg with an `env`, in every (sub)command, must hide it.
+    #[test]
+    fn every_env_arg_hides_its_value() {
+        fn visit(command: &clap::Command, path: &str, seen: &mut usize, bare: &mut Vec<String>) {
+            for arg in command.get_arguments() {
+                if arg.get_env().is_some() {
+                    *seen += 1;
+                    if !arg.is_hide_env_values_set() {
+                        bare.push(format!("{path} --{}", arg.get_id()));
+                    }
+                }
+            }
+            for sub in command.get_subcommands() {
+                visit(sub, &format!("{path} {}", sub.get_name()), seen, bare);
+            }
+        }
+        let (mut seen, mut bare) = (0, Vec::new());
+        visit(&Cli::command(), "limen", &mut seen, &mut bare);
+        // The walk must have something to check, or it checks nothing.
+        assert!(
+            seen > 0,
+            "no env-bound arg found: the walk is not reaching them"
+        );
+        assert!(
+            bare.is_empty(),
+            "these args print their env value in --help: {bare:?}"
+        );
     }
 
     #[test]
