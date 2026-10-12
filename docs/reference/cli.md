@@ -59,6 +59,36 @@ every message that names a configured or `--control-url` URL, and
 by status and size (`did not acknowledge the injection: HTTP 200 OK, a
 62-byte JSON body`), never by quoting its body.
 
+Beneath those specific messages is a backstop. Everything the CLI prints — the
+`Error:` line, command-line usage errors, validation errors, the routing table, the `verdict` and
+`suggest-routes` reports in every format, the draft and its warnings, and the
+`report` output in `human` and `json` — is passed through a text-level scrubber
+first. In any `scheme://…` run it keeps the
+scheme, host, port and path, and drops the userinfo (everything up to the last
+`@`), the query and the fragment; elsewhere it masks the value of a
+`token`/`password`/`secret`/`key`/`auth`-named query parameter (`?token=<redacted>`).
+So a URL that reaches the output by a path no message was written for — a route
+id, a field of a profile some other service answered with — is cut all the same.
+The price is that it also rewrites a value that is *meant* to be printed: a
+route id that is itself a credential-bearing URL appears in a draft or a report
+without its credentials, and no longer matches the config it came from.
+
+The one exception is the HTML page of `report --format html`. It is printed to
+stdout exactly as `--out` would write it, because a scrubber that reads the
+whole page as text misreads escaped markup (`&#39;` looks like a fragment). It
+is covered where it is built instead: the page redacts each piece of text it
+inserts, in its own context, before escaping it.
+
+The scrubber is idempotent (text that has been through it comes out unchanged),
+so text that is cut where it is built and cut again where it is printed is not
+cut twice.
+
+Output that cannot be written is not mistaken for output that was. A closed pipe
+(`limen verdict | head`) is ignored and the command keeps its typed exit code;
+any other failed write (a full disk under `suggest-routes > draft.yaml`) exits
+`1` after printing `limen: cannot write to stdout: <error kind>` to stderr. The
+message names the kind of error only, never what was being printed.
+
 ## `print-routes`
 
 ```bash

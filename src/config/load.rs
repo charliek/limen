@@ -175,7 +175,7 @@ pub fn load(path: &Path, overrides: &ConfigOverrides) -> Result<LoadedConfig, Co
             path: path.to_path_buf(),
             // serde quotes the value it choked on, and this is raised before
             // any validator has looked at it (invariant 5).
-            message: redact::serde_message(&e.to_string()),
+            message: redact::serde_error(&e),
         })?;
     overrides.apply(&mut config);
     let base_dir = path
@@ -356,6 +356,30 @@ mod tests {
             assert!(!message.contains("CANARY"), "{message}");
             assert!(message.contains(var), "{message}");
             assert!(message.contains("value redacted"), "{message}");
+        }
+    }
+
+    /// A URL pasted as a *key* has no value for serde to quote, but it reaches
+    /// the field path and the `unknown field` message all the same.
+    #[test]
+    fn a_credential_shaped_key_is_not_echoed_in_yaml_or_json() {
+        for (file, text) in [
+            (
+                "limen.config.yaml",
+                "flags: {redis: {'redis://:CANARY@host': null}}\n",
+            ),
+            (
+                "limen.config.json",
+                r#"{"flags": {"redis": {"redis://:CANARY@host": null}}}"#,
+            ),
+            (
+                "limen.config.yaml",
+                "flags: {static: {values: {'https://u:CANARY@h/p?t=1': [1]}}}\n",
+            ),
+        ] {
+            let message = load_error(file, text);
+            assert!(!message.contains("CANARY"), "{file}: {message}");
+            assert!(message.contains("flags."), "the path stays: {message}");
         }
     }
 }

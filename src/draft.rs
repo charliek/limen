@@ -346,7 +346,11 @@ fn check_match_bases(config: &Config, profile: &ObserveProfile) -> Result<(), Su
                  profile's path counts were recorded against a matcher this config no longer \
                  uses, so they do not mean what the classifier would read them as. Re-profile \
                  against this configuration",
-                route.id, observed.match_basis, configured
+                route.id,
+                // A real basis has no query or fragment; one that does came
+                // from the profile's author, not from limen.
+                redact::without_query(&observed.match_basis),
+                configured
             )));
         }
     }

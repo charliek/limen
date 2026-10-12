@@ -107,14 +107,14 @@ pub fn load_file(path: &Path) -> Result<Contract, ContractError> {
             let de = yaml_serde::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: redact::serde_message(&e.to_string()),
+                message: redact::serde_error(&e),
             })
         }
         Some("json") => {
             let de = &mut serde_json::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: redact::serde_message(&e.to_string()),
+                message: redact::serde_error(&e),
             })
         }
         _ => Err(ContractError::UnknownExtension {
@@ -570,6 +570,58 @@ routes:
                 message.contains("invalid type: string (value redacted), expected u32"),
                 "{file}: {message}"
             );
+        }
+    }
+
+    /// A map key that is the text of one of the sanitizer's own markers, with a
+    /// value of the wrong type: the diagnostic must survive whole, in YAML and
+    /// JSON — what was expected, and where.
+    #[test]
+    fn a_marker_in_an_alias_key_keeps_the_rest_of_the_diagnostic() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: 1\nservice: svc\nroutes:\n  - id: r\n    match: { methods: [GET], path_template: /x }\n    comparison:\n      json:\n        enum_aliases:\n          - path: $.s\n            aliases: { 'unknown variant `': [1] }\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": 1, "service": "svc", "routes": [{"id": "r", "match": {"methods": ["GET"], "path_template": "/x"}, "comparison": {"json": {"enum_aliases": [{"path": "$.s", "aliases": {"unknown variant `": [1]}}]}}}]}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(message.contains("aliases"), "{file}: {message}");
+            assert!(message.contains("expected a string"), "{file}: {message}");
+            assert!(
+                message.contains("line"),
+                "{file}: the position stays: {message}"
+            );
+        }
+    }
+
+    /// A URL used as a key in a contract is hidden in the path serde reports and
+    /// in the message, in YAML and JSON alike.
+    #[test]
+    fn a_credential_shaped_contract_key_is_not_echoed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: 1\nservice: svc\nroutes: []\n'redis://:CANARY-K@host': 1\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": 1, "service": "svc", "routes": [], "redis://:CANARY-K@host": 1}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(!message.contains("CANARY-K"), "{file}: {message}");
+            assert!(message.contains("unknown field"), "{file}: {message}");
+            assert!(message.contains("expected one of"), "{file}: {message}");
         }
     }
 }

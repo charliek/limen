@@ -615,3 +615,114 @@ async fn a_profile_that_does_not_deserialize_is_reported_without_its_values() {
     )
     .await;
 }
+
+/// A URL pasted as a YAML or JSON *key* has no value to quote, but serde reports
+/// the key in the field path and in its `unknown field` message.
+#[test]
+fn a_credential_shaped_key_is_not_echoed_by_validate_config() {
+    let ws = Workspace::with_config(&config(None, "https://l", "https://n"));
+    for (file, body) in [
+        (
+            "key.yaml",
+            format!("{BASE_CONFIG}flags:\n  redis:\n    'redis://:{CANARY}@host': null\n"),
+        ),
+        (
+            "key.json",
+            format!(r#"{{"flags": {{"redis": {{"redis://:{CANARY}@host": null}}}}}}"#),
+        ),
+        (
+            "assignment.yaml",
+            format!("{BASE_CONFIG}flags:\n  redis:\n    'token={CANARY}': null\n"),
+        ),
+    ] {
+        ws.write(file, &body);
+        let out = ws
+            .command_for(file, &["validate-config"])
+            .output()
+            .expect("run limen");
+        assert_eq!(out.status.code(), Some(1), "{file}: {}", text(&out));
+        assert_no_canary(file, &out);
+        let err = stderr(&out);
+        assert!(err.contains("flags.redis"), "the path stays: {err}");
+        assert!(err.contains("unknown field"), "{file}: {err}");
+    }
+}
+
+/// A control plane answers with a complete, matching profile whose `match_basis`
+/// carries a token: it deserializes, so no serde error quotes it, and then the
+/// comparison against the configured matcher does.
+#[tokio::test]
+async fn a_profile_basis_with_a_query_is_not_quoted_back() {
+    use limen::observability::observe::{ObserveProfile, RouteProfile};
+    for basis in [
+        format!("prefix:/a?token={CANARY}"),
+        format!("prefix:/a?harmless={CANARY}"),
+        format!("prefix:/a#{CANARY}"),
+    ] {
+        let profile = serde_json::to_string(&ObserveProfile {
+            sample_rate: 1.0,
+            routes: [(
+                "r1".to_string(),
+                RouteProfile {
+                    match_basis: basis.clone(),
+                    ..RouteProfile::default()
+                },
+            )]
+            .into(),
+        })
+        .expect("profile");
+        let server = MockServer::start().await;
+        for (route, body) in [
+            ("/metrics", "limen_in_flight_requests 0\n".to_string()),
+            ("/observe/profile", profile),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .mount(&server)
+                .await;
+        }
+        let control_url = format!("http://{}", server.address());
+        let ws = Workspace::with_config(&config(None, "https://l", "https://n").replacen(
+            "routes:",
+            "observe: {}\nroutes:",
+            1,
+        ));
+        for format in ["yaml", "json"] {
+            let out = tokio::task::spawn_blocking({
+                let mut cmd = ws.command(&[
+                    "suggest-routes",
+                    "--control-url",
+                    &control_url,
+                    "--poll-interval-ms",
+                    "10",
+                    "--format",
+                    format,
+                ]);
+                move || cmd.output().expect("run limen")
+            })
+            .await
+            .expect("join");
+            let all = text(&out);
+            assert_eq!(out.status.code(), Some(50), "{basis} {format}: {all}");
+            assert_no_canary(&format!("{basis} --format {format}"), &out);
+            // Not vacuous: the mismatch is reported, with the profiled basis
+            // as the matcher would have written it. (The configured half is
+            // `prefix:/a` whatever the profile said, so only the whole sentence
+            // proves the profiled half survived the cut.)
+            let reported = if format == "json" {
+                let body: serde_json::Value =
+                    serde_json::from_str(&stdout(&out)).expect("a JSON document");
+                body["error"].as_str().expect("an error message").to_owned()
+            } else {
+                stderr(&out)
+            };
+            assert!(
+                reported.contains(
+                    r#"route "r1" was profiled as "prefix:/a" but this configuration declares "prefix:/a""#
+                ),
+                "{basis} {format}: {reported}"
+            );
+        }
+    }
+}

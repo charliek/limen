@@ -9,7 +9,18 @@
 //! - `verdict` — render a typed campaign verdict from the config, the live
 //!   control plane, and the sink (drain, floors, integrity, canary).
 //! - `suggest-routes` — classify an observe-mode profile into a draft config.
+//!
+//! Everything this module prints goes through `print_redacted`, which runs
+//! `redact_urls_in_text` over it (safety invariant 5): the specific messages
+//! redact the URLs they know about, and this catches a URL in anything they
+//! do not — a route id, a field of a profile some other service answered with.
+//! The one exception is the HTML page (`cmd_report_html`), which cuts each piece
+//! of text it inserts as it builds. The lint below makes a bare `println!` here
+//! a build failure, so a new output point cannot skip it.
+#![deny(clippy::print_stdout, clippy::print_stderr)]
 
+use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -18,6 +29,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
+use crate::config::redact::redact_urls_in_text;
 use crate::config::{self, ConfigOverrides, LoadedConfig};
 use crate::contract::load as contract_load;
 use crate::draft::{self, DraftOptions, ProfileSource, SuggestOptions};
@@ -25,6 +37,76 @@ use crate::observability::sink::{self, Report, ReportFilter, REPORT_EXAMPLES_PER
 use crate::report_html;
 use crate::suggest::{DEFAULT_MAX_COMPARE_PATHS, DEFAULT_MIN_SAMPLES};
 use crate::verdict;
+
+/// Write `args` to stdout, or to stderr, with every URL's secrets cut out of
+/// it.
+fn print_redacted(to_stderr: bool, args: fmt::Arguments<'_>) {
+    write_out(to_stderr, redact_urls_in_text(&args.to_string()).as_bytes());
+}
+
+/// Write `text`, as it is, to stdout or to stderr.
+///
+/// A closed pipe is dropped rather than turned into a panic, which is what
+/// `println!` does: these commands exit with typed codes that wrappers branch
+/// on, and a `| head` must not turn a 50 into a 101. Any other failed write (a
+/// full disk under `suggest-routes > draft.yaml`) must not look like success,
+/// though: it is a truncated document. So it says so on stderr, naming the
+/// error's kind and nothing else (an error's text can carry anything), and
+/// exits 1, the code for an unexpected tooling error.
+fn write_out(to_stderr: bool, text: &[u8]) {
+    let written = if to_stderr {
+        write_all_flushed(std::io::stderr().lock(), text)
+    } else {
+        write_all_flushed(std::io::stdout().lock(), text)
+    };
+    match written {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        Err(e) => {
+            let stream = if to_stderr { "stderr" } else { "stdout" };
+            let _ = writeln!(
+                std::io::stderr(),
+                "limen: cannot write to {stream}: {:?}",
+                e.kind()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Stdout is line-buffered, so a write that ends mid-line would otherwise fail
+/// (or not) later, where nothing is listening.
+fn write_all_flushed(mut out: impl Write, bytes: &[u8]) -> std::io::Result<()> {
+    out.write_all(bytes)?;
+    out.flush()
+}
+
+/// `print!`, redacted.
+macro_rules! out {
+    ($($arg:tt)*) => { print_redacted(false, format_args!($($arg)*)) };
+}
+
+/// `println!`, redacted.
+macro_rules! outln {
+    ($($arg:tt)*) => { print_redacted(false, format_args!("{}\n", format_args!($($arg)*))) };
+}
+
+/// `eprintln!`, redacted.
+macro_rules! errln {
+    ($($arg:tt)*) => { print_redacted(true, format_args!("{}\n", format_args!($($arg)*))) };
+}
+
+/// Report a failed command the way the binary does: `Error: …` and its chain
+/// on stderr, redacted like everything else this module prints.
+pub fn report_error(error: &anyhow::Error) {
+    errln!("Error: {error:?}");
+}
+
+/// Report a command-line usage error the way clap would, redacted: it quotes
+/// the value it rejected, and the value can be a URL.
+pub fn report_usage_error(error: &clap::Error) {
+    print_redacted(true, format_args!("{}", error.render()));
+}
 
 /// Limen — a migration proxy that safely shifts HTTP traffic from a legacy
 /// service to a new implementation.
@@ -295,7 +377,7 @@ fn load_and_validate(args: &ConfigArgs) -> anyhow::Result<LoadedConfig> {
     let loaded = config::load::load(&args.config, &overrides)?;
     if let Err(errors) = config::validate(&loaded.config, &loaded.base_dir) {
         for e in &errors {
-            eprintln!("  {e}");
+            errln!("  {e}");
         }
         anyhow::bail!(
             "{} is invalid: {} error(s)",
@@ -315,7 +397,7 @@ async fn cmd_run(args: ConfigArgs) -> anyhow::Result<()> {
 
 fn cmd_validate_config(args: ConfigArgs) -> anyhow::Result<()> {
     let loaded = load_and_validate(&args)?;
-    println!(
+    outln!(
         "OK: {} is valid ({} route(s))",
         args.config.display(),
         loaded.config.routes.len()
@@ -340,7 +422,7 @@ fn upstream_display(upstream: &Option<String>) -> String {
 fn print_routes(loaded: &LoadedConfig) {
     let routes = &loaded.config.routes;
     if routes.is_empty() {
-        println!("(no routes configured)");
+        outln!("(no routes configured)");
         return;
     }
     for route in routes {
@@ -350,25 +432,25 @@ fn print_routes(loaded: &LoadedConfig) {
             (None, true) => "inline".to_string(),
             (None, false) => "none".to_string(),
         };
-        println!("{}", route.id);
-        println!("  match:      {methods}  {}", route.r#match.path_display());
+        outln!("{}", route.id);
+        outln!("  match:      {methods}  {}", route.r#match.path_display());
         // Only shown when the route conditions on the query — an unconditioned
         // route (the default) needs no line.
         if !route.r#match.query_present.is_empty() {
-            println!(
+            outln!(
                 "  query_present: {}",
                 route.r#match.query_present.join(", ")
             );
         }
         if !route.r#match.query_absent.is_empty() {
-            println!("  query_absent:  {}", route.r#match.query_absent.join(", "));
+            outln!("  query_absent:  {}", route.r#match.query_absent.join(", "));
         }
-        println!("  mode:       {}", route.mode.as_str());
+        outln!("  mode:       {}", route.mode.as_str());
         // Through `redact_url`: an upstream may legally carry userinfo or a
         // query, and this table is pasted into tickets and CI logs.
-        println!("  legacy:     {}", upstream_display(&route.legacy_upstream));
-        println!("  new:        {}", upstream_display(&route.new_upstream));
-        println!(
+        outln!("  legacy:     {}", upstream_display(&route.legacy_upstream));
+        outln!("  new:        {}", upstream_display(&route.new_upstream));
+        outln!(
             "  comparison: {}, sample_rate={:.2}, max_body_bytes={}",
             if route.comparison.enabled {
                 "enabled"
@@ -381,12 +463,12 @@ fn print_routes(loaded: &LoadedConfig) {
         // Only shown when the route opted a write into shadowing — the default
         // (reads only) needs no line.
         if !route.comparison.shadow_methods.is_empty() {
-            println!(
+            outln!(
                 "  shadow_methods: {}",
                 route.comparison.shadow_methods.join(", ")
             );
         }
-        println!("  behavioral: {behavioral}");
+        outln!("  behavioral: {behavioral}");
     }
 }
 
@@ -398,7 +480,7 @@ fn cmd_check_contract(args: CheckContractArgs) -> anyhow::Result<()> {
     let total = semantic.len() + path_issues.len();
 
     if total == 0 {
-        println!(
+        outln!(
             "OK: {} (service {:?}, {} route(s)) — schema valid and all JSONPaths within the supported subset",
             args.contract.display(),
             contract.service,
@@ -408,7 +490,7 @@ fn cmd_check_contract(args: CheckContractArgs) -> anyhow::Result<()> {
     }
 
     for issue in &semantic {
-        eprintln!("  {issue}");
+        errln!("  {issue}");
     }
     for issue in &path_issues {
         let where_ = issue
@@ -416,9 +498,11 @@ fn cmd_check_contract(args: CheckContractArgs) -> anyhow::Result<()> {
             .as_deref()
             .map(|r| format!("route {r:?}"))
             .unwrap_or_else(|| "defaults".to_string());
-        eprintln!(
+        errln!(
             "  {where_} {}: {:?} — {}",
-            issue.field, issue.path, issue.error
+            issue.field,
+            issue.path,
+            issue.error
         );
     }
     anyhow::bail!(
@@ -473,6 +557,14 @@ fn cmd_report(args: ReportArgs) -> anyhow::Result<()> {
         ReportFormat::Human => render_human_report(&report),
         ReportFormat::Html => unreachable!("handled above"),
     };
+    // Only a file needs it here: `--out` never reaches `print_redacted`, which
+    // cuts what goes to stdout. (The HTML page redacts each piece of text it
+    // inserts.)
+    let rendered = if args.out.is_some() {
+        redact_urls_in_text(&rendered)
+    } else {
+        rendered
+    };
     emit(args.out.as_deref(), &rendered)
 }
 
@@ -507,7 +599,15 @@ fn cmd_report_html(args: ReportArgs) -> anyhow::Result<()> {
         profile: args.profile,
         metrics: args.metrics,
     });
-    emit(args.out.as_deref(), &page)
+    match args.out.as_deref() {
+        // Not through `print_redacted`: `esc()` cut each piece of text in its own
+        // context, and a pass over the escaped page misreads `&#39;` as a fragment.
+        None => {
+            write_out(false, page.as_bytes());
+            Ok(())
+        }
+        Some(path) => emit(Some(path), &page),
+    }
 }
 
 /// The flags among these that were passed. Both of `report`'s guards refuse a
@@ -527,7 +627,7 @@ fn emit(out: Option<&Path>, rendered: &str) -> anyhow::Result<()> {
         Some(path) => std::fs::write(path, rendered)
             .map_err(|e| anyhow::anyhow!("cannot write {}: {e}", path.display())),
         None => {
-            print!("{rendered}");
+            out!("{rendered}");
             Ok(())
         }
     }
@@ -581,8 +681,8 @@ async fn cmd_verdict(args: VerdictArgs) -> anyhow::Result<ExitCode> {
     match verdict::run_verdict(config, &opts).await {
         Ok(report) => {
             match args.format {
-                VerdictFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-                VerdictFormat::Human => print!("{}", verdict::render_human(&report)),
+                VerdictFormat::Json => outln!("{}", serde_json::to_string_pretty(&report)?),
+                VerdictFormat::Human => out!("{}", verdict::render_human(&report)),
             }
             Ok(ExitCode::from(report.exit_code))
         }
@@ -593,7 +693,7 @@ async fn cmd_verdict(args: VerdictArgs) -> anyhow::Result<ExitCode> {
 /// Report an input-unavailable verdict (exit 50) in the requested format.
 fn render_unavailable(format: VerdictFormat, detail: &str) -> anyhow::Result<ExitCode> {
     match format {
-        VerdictFormat::Json => println!(
+        VerdictFormat::Json => outln!(
             "{}",
             serde_json::json!({
                 "mode": "unavailable",
@@ -603,13 +703,13 @@ fn render_unavailable(format: VerdictFormat, detail: &str) -> anyhow::Result<Exi
             })
         ),
         VerdictFormat::Human => {
-            println!("LIMEN VERDICT: INPUT UNAVAILABLE");
-            println!("  {detail}");
-            println!(
+            outln!("LIMEN VERDICT: INPUT UNAVAILABLE");
+            outln!("  {detail}");
+            outln!(
                 "  This is a tooling failure, not a clean run — it must never be read as \
                  0 mismatches."
             );
-            println!(
+            outln!(
                 "  exit {} — input-unavailable",
                 verdict::EXIT_INPUT_UNAVAILABLE
             );
@@ -664,20 +764,20 @@ async fn cmd_suggest_routes(args: SuggestRoutesArgs) -> anyhow::Result<ExitCode>
     // The document goes to stdout so it can be redirected into a file;
     // everything advisory goes to stderr so that redirection stays clean.
     match args.format {
-        DraftFormat::Json => println!("{}", draft::render_json(&outcome.suggestions)?),
-        DraftFormat::Yaml => print!(
+        DraftFormat::Json => outln!("{}", draft::render_json(&outcome.suggestions)?),
+        DraftFormat::Yaml => out!(
             "{}",
             draft::render_yaml(config, &outcome.suggestions, &draft_opts)?
         ),
     }
     for warning in &outcome.warnings {
-        eprintln!("warning: {warning}");
+        errln!("warning: {warning}");
     }
     // Only when a draft was actually emitted: `--adopt-suggestions` changes
     // nothing about the JSON surface, and a note claiming comparison was
     // enabled would be describing a document that does not exist.
     if draft_opts.adopt && args.format == DraftFormat::Yaml {
-        eprintln!(
+        errln!(
             "note: --adopt-suggestions emitted comparison.enabled: true — every enabled route \
              dispatches a shadow request. Confirm each against the service's source before \
              running this draft."
@@ -692,7 +792,7 @@ async fn cmd_suggest_routes(args: SuggestRoutesArgs) -> anyhow::Result<ExitCode>
 fn suggest_failed(format: DraftFormat, error: &draft::SuggestError) -> anyhow::Result<ExitCode> {
     let code = error.exit_code();
     match format {
-        DraftFormat::Json => println!(
+        DraftFormat::Json => outln!(
             "{}",
             serde_json::json!({
                 "outcome": error.name(),
@@ -701,10 +801,10 @@ fn suggest_failed(format: DraftFormat, error: &draft::SuggestError) -> anyhow::R
             })
         ),
         DraftFormat::Yaml => {
-            eprintln!("LIMEN SUGGEST-ROUTES FAILED: {}", error.name());
-            eprintln!("  {error}");
-            eprintln!("  No draft was emitted — this is a tooling failure, not a suggestion.");
-            eprintln!("  exit {code} — {}", error.name());
+            errln!("LIMEN SUGGEST-ROUTES FAILED: {}", error.name());
+            errln!("  {error}");
+            errln!("  No draft was emitted — this is a tooling failure, not a suggestion.");
+            errln!("  exit {code} — {}", error.name());
         }
     }
     Ok(ExitCode::from(code))
