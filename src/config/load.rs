@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::model::{Config, FailSafeMode, FlagProviderKind};
+use crate::config::redact;
 
 /// Errors from loading configuration.
 #[derive(Debug, Error)]
@@ -133,9 +134,11 @@ fn parse_provider(v: &str) -> Result<FlagProviderKind, ConfigLoadError> {
         "static" => Ok(FlagProviderKind::Static),
         "file" => Ok(FlagProviderKind::File),
         "redis" => Ok(FlagProviderKind::Redis),
-        other => Err(ConfigLoadError::BadOverride {
+        // Not echoed: an override arrives from the environment or a flag, where
+        // a URL pasted into the wrong variable is the realistic mistake.
+        _ => Err(ConfigLoadError::BadOverride {
             var: "LIMEN_FLAGS_PROVIDER".to_string(),
-            message: format!("unknown provider {other:?} (expected static|file|redis)"),
+            message: "unknown provider (expected static|file|redis; value redacted)".to_string(),
         }),
     }
 }
@@ -143,9 +146,9 @@ fn parse_provider(v: &str) -> Result<FlagProviderKind, ConfigLoadError> {
 fn parse_fail_safe(v: &str) -> Result<FailSafeMode, ConfigLoadError> {
     match v {
         "legacy_only" => Ok(FailSafeMode::LegacyOnly),
-        other => Err(ConfigLoadError::BadOverride {
+        _ => Err(ConfigLoadError::BadOverride {
             var: "LIMEN_FAIL_SAFE_MODE".to_string(),
-            message: format!("unknown mode {other:?} (expected legacy_only)"),
+            message: "unknown mode (expected legacy_only; value redacted)".to_string(),
         }),
     }
 }
@@ -170,7 +173,9 @@ pub fn load(path: &Path, overrides: &ConfigOverrides) -> Result<LoadedConfig, Co
     let mut config: Config =
         serde_path_to_error::deserialize(de).map_err(|e| ConfigLoadError::Parse {
             path: path.to_path_buf(),
-            message: e.to_string(),
+            // serde quotes the value it choked on, and this is raised before
+            // any validator has looked at it (invariant 5).
+            message: redact::serde_message(&e.to_string()),
         })?;
     overrides.apply(&mut config);
     let base_dir = path
@@ -243,5 +248,114 @@ mod tests {
         std::fs::write(&path, "server: 123\n").unwrap();
         let err = load(&path, &ConfigOverrides::default()).unwrap_err();
         assert!(matches!(err, ConfigLoadError::Parse { .. }));
+    }
+
+    /// Write `text` as `file` (the extension is only a name: the loader reads
+    /// both formats with one parser) and return what loading it reports. Also
+    /// proves the premise: serde's own message for the same text carries the
+    /// canary, so the redaction is what removed it.
+    fn load_error(file: &str, text: &str) -> String {
+        let raw =
+            serde_path_to_error::deserialize::<_, Config>(yaml_serde::Deserializer::from_str(text))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            raw.contains("CANARY"),
+            "premise: serde quotes the value: {raw}"
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(file);
+        std::fs::write(&path, text).unwrap();
+        let err = load(&path, &ConfigOverrides::default()).unwrap_err();
+        assert!(matches!(err, ConfigLoadError::Parse { .. }), "{err}");
+        err.to_string()
+    }
+
+    /// Invariant 5, before any validator runs: serde's type errors quote the
+    /// value they choked on, so a URL written one level too shallow came back
+    /// out in full. The field path, the expected type and the position stay.
+    #[test]
+    fn a_nesting_mistake_does_not_echo_the_url_in_yaml_or_json() {
+        for (file, text) in [
+            (
+                "limen.config.yaml",
+                "flags:\n  provider: redis\n  redis: \"redis://:CANARY@host\"\n",
+            ),
+            (
+                "limen.config.json",
+                r#"{"flags": {"provider": "redis", "redis": "redis://:CANARY@host"}}"#,
+            ),
+        ] {
+            let message = load_error(file, text);
+            assert!(!message.contains("CANARY"), "{file}: {message}");
+            assert!(message.contains("flags.redis"), "{file}: {message}");
+            assert!(
+                message.contains("invalid type: string (value redacted), expected"),
+                "{file}: {message}"
+            );
+            assert!(message.contains("line"), "position kept: {message}");
+        }
+    }
+
+    #[test]
+    fn a_plain_wrong_type_does_not_echo_the_value() {
+        let message = load_error(
+            "limen.config.yaml",
+            "server:\n  graceful_shutdown_timeout_ms: \"CANARY\"\n",
+        );
+        assert!(!message.contains("CANARY"), "{message}");
+        assert!(
+            message.contains("server.graceful_shutdown_timeout_ms"),
+            "{message}"
+        );
+        assert!(
+            message.contains("invalid type: string (value redacted), expected u64"),
+            "{message}"
+        );
+    }
+
+    /// An enum field holding something else (a URL pasted into `provider`)
+    /// names its variants, not the value.
+    #[test]
+    fn an_unknown_variant_does_not_echo_the_value_but_lists_the_variants() {
+        let message = load_error(
+            "limen.config.yaml",
+            "flags:\n  provider: \"redis://:CANARY@host\"\n",
+        );
+        assert!(!message.contains("CANARY"), "{message}");
+        assert!(
+            message.contains("unknown variant (value redacted), expected one of `static`"),
+            "{message}"
+        );
+    }
+
+    /// A misspelt *key* is still named: that is schema vocabulary, and how the
+    /// typo is found.
+    #[test]
+    fn an_unknown_field_is_still_named() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("limen.config.yaml");
+        std::fs::write(&path, "flags:\n  providr: file\n").unwrap();
+        let message = load(&path, &ConfigOverrides::default())
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("unknown field `providr`"), "{message}");
+    }
+
+    /// Overrides don't go through serde; they are matched by hand, and the
+    /// mismatch used to be reported with the value.
+    #[test]
+    fn a_bad_override_names_the_variable_not_the_value() {
+        for var in ["LIMEN_FLAGS_PROVIDER", "LIMEN_FAIL_SAFE_MODE"] {
+            let err = ConfigOverrides::from_lookup(|k| {
+                (k == var).then(|| "redis://:CANARY@host".to_string())
+            })
+            .unwrap_err();
+            let message = err.to_string();
+            assert!(!message.contains("CANARY"), "{message}");
+            assert!(message.contains(var), "{message}");
+            assert!(message.contains("value redacted"), "{message}");
+        }
     }
 }

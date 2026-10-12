@@ -207,15 +207,24 @@ impl Scrape {
     /// Parse a Prometheus text exposition. Comment/blank lines are skipped;
     /// any other unparseable line is an error — this parser reads limen's own
     /// exporter, so leniency would only hide renderer drift (fail closed).
+    ///
+    /// A bad line is reported by number and length, never by content: the text
+    /// is whatever answered at `--control-url`, and a misdirected service that
+    /// reflects its request (the query's token, say) would put it in the error.
     pub fn parse(text: &str) -> Result<Scrape, InputUnavailable> {
         let mut samples = Vec::new();
-        for line in text.lines() {
-            let line = line.trim();
+        for (index, raw) in text.lines().enumerate() {
+            let line = raw.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;
             }
-            let sample = parse_sample(line)
-                .ok_or_else(|| InputUnavailable(format!("unparseable /metrics line: {line:?}")))?;
+            let sample = parse_sample(line).ok_or_else(|| {
+                InputUnavailable(format!(
+                    "unparseable /metrics line {} ({} bytes; its content is not echoed)",
+                    index + 1,
+                    raw.len()
+                ))
+            })?;
             samples.push(sample);
         }
         Ok(Scrape { samples })
@@ -1151,11 +1160,11 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
         .send()
         .await
         .map_err(|e| request_failed("canary trigger unreachable at", &url, e))?;
-    if !resp.status().is_success() {
+    let status = resp.status();
+    if !status.is_success() {
         return Err(InputUnavailable(format!(
-            "canary trigger refused at {shown} (HTTP {}): is `debug.sink_canary: true` set \
-             in the running proxy's config?",
-            resp.status()
+            "canary trigger refused at {shown} (HTTP {status}): is `debug.sink_canary: true` set \
+             in the running proxy's config?"
         )));
     }
     // Require the endpoint's own acknowledgment, not just a 2xx: a mis-aimed
@@ -1171,8 +1180,12 @@ async fn trigger_canary(client: &reqwest::Client, base: &str) -> Result<(), Inpu
         ))
     })?;
     if body.get("injected") != Some(&serde_json::Value::Bool(true)) {
+        // The body is not quoted: a control endpoint that is not limen's may
+        // answer by reflecting the request, query token and all.
         return Err(InputUnavailable(format!(
-            "canary trigger at {shown} did not acknowledge the injection (body: {body})"
+            "canary trigger at {shown} did not acknowledge the injection: HTTP {status}, a \
+             {}-byte JSON body without `\"injected\": true` (not echoed)",
+            text.len()
         )));
     }
     Ok(())

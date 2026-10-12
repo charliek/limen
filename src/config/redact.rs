@@ -46,6 +46,98 @@ pub(crate) fn redact_url(raw: &str) -> String {
     format!("{}://{host}{port}{path}", url.scheme())
 }
 
+/// Whether [`redact_url`] would drop something from `raw`: a userinfo, a query
+/// or a fragment, or the whole value because it does not parse. For a caller
+/// that keeps the URL as written when there is nothing to hide (a draft config
+/// is read back, and a rewritten-but-equivalent URL is churn) and says so when
+/// it had to cut.
+pub(crate) fn carries_secrets(raw: &str) -> bool {
+    match Url::parse(raw) {
+        Ok(url) => {
+            !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+        }
+        Err(_) => true,
+    }
+}
+
+/// A serde deserialization error with the configured values it quotes taken out.
+///
+/// serde builds its type errors out of the input it was handed: `invalid type:
+/// string "redis://:pw@host", expected struct RedisFlagsConfig` is what a
+/// nesting mistake in `flags.redis` prints, and an enum field says `unknown
+/// variant `<the value>``. That is raised while the file is *parsed*, before any
+/// validator can see the value, so it needs its own redaction. What stays is the
+/// field path, the kind of thing found (`string`, `integer`), what was expected
+/// and the line and column; a string, character or number found where something
+/// else was expected, and an unknown variant name, become `(value redacted)`.
+/// Field *names* (`unknown field`, `missing field`) are schema vocabulary and
+/// are kept: they are how a typo'd key is found.
+///
+/// Anything unrecognized is passed through untouched, so a message serde has
+/// not been taught to quote is no worse than before; a quote that never closes
+/// is cut at the marker rather than guessed at.
+pub(crate) fn serde_message(message: &str) -> String {
+    // How to find what follows a quoted value, given the text after its opener.
+    type After = fn(&str) -> &str;
+    // (what serde prints before the value, what to keep of it, where it ends)
+    const QUOTED: [(&str, &str, After); 5] = [
+        ("string \"", "string", after_debug_string),
+        ("character `", "character", after_backtick),
+        ("integer `", "integer", after_backtick),
+        ("floating point `", "floating point", after_backtick),
+        ("unknown variant `", "unknown variant", after_variant_name),
+    ];
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some((at, marker, kept, after)) = QUOTED
+        .iter()
+        .filter_map(|&(marker, kept, after)| rest.find(marker).map(|at| (at, marker, kept, after)))
+        .min_by_key(|&(at, ..)| at)
+    {
+        out.push_str(&rest[..at]);
+        out.push_str(kept);
+        out.push_str(" (value redacted)");
+        rest = after(&rest[at + marker.len()..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// What follows the closing backtick of a backtick-quoted number or character
+/// whose opening backtick has been consumed; nothing when it never closes.
+fn after_backtick(value: &str) -> &str {
+    value.find('`').map_or("", |end| &value[end + 1..])
+}
+
+/// What follows an unknown variant's name, whose opening backtick has been
+/// consumed: `unknown variant `<name>`, expected <the schema's variants>`. The
+/// variants are fixed identifiers, so the *last* "`, expected " is the real
+/// boundary even if the name itself contains one.
+fn after_variant_name(value: &str) -> &str {
+    value
+        .rfind("`, expected ")
+        .map_or("", |end| &value[end + 1..])
+}
+
+/// What follows the closing quote of a `{:?}`-rendered string whose opening
+/// quote has been consumed, honoring `\\` and `\"`; nothing when it never closes.
+fn after_debug_string(value: &str) -> &str {
+    let mut chars = value.char_indices();
+    while let Some((i, c)) = chars.next() {
+        match c {
+            '\\' => {
+                chars.next();
+            }
+            '"' => return &value[i + 1..],
+            _ => {}
+        }
+    }
+    ""
+}
+
 /// A Redis client-construction error without the value it rejected.
 ///
 /// The `redis` crate appends the offending part of the URL to some of its
@@ -133,6 +225,113 @@ mod tests {
         assert_eq!(
             unparseable_url(reason),
             "is not a valid URL (invalid port number; value redacted)"
+        );
+    }
+
+    #[test]
+    fn carries_secrets_is_true_exactly_when_redaction_cuts_something() {
+        for hidden in [
+            "https://u:p@legacy.internal",
+            "https://u@legacy.internal",
+            "https://legacy.internal/?t=1",
+            "https://legacy.internal/#f",
+            "https://legacy.internal:99999",
+            "not a url",
+        ] {
+            assert!(carries_secrets(hidden), "{hidden}");
+        }
+        for plain in [
+            "https://legacy.internal",
+            "https://legacy.internal:8443/api/",
+            "redis://localhost:6379/0",
+        ] {
+            assert!(!carries_secrets(plain), "{plain}");
+        }
+    }
+
+    #[test]
+    fn serde_message_keeps_the_path_and_what_was_expected() {
+        assert_eq!(
+            serde_message(
+                "flags.redis: invalid type: string \"redis://:pw@host\", expected struct \
+                 RedisFlagsConfig at line 9 column 12"
+            ),
+            "flags.redis: invalid type: string (value redacted), expected struct \
+             RedisFlagsConfig at line 9 column 12"
+        );
+        assert_eq!(
+            serde_message(
+                "flags.provider: unknown variant `redis://:pw@h`, expected one of `static`, \
+                 `file`, `redis` at line 3 column 13"
+            ),
+            "flags.provider: unknown variant (value redacted), expected one of `static`, \
+             `file`, `redis` at line 3 column 13"
+        );
+    }
+
+    #[test]
+    fn serde_message_redacts_every_kind_of_quoted_value() {
+        for (message, expected) in [
+            (
+                "invalid value: string \"a\", expected b",
+                "invalid value: string (value redacted), expected b",
+            ),
+            (
+                "invalid type: integer `5432`, expected a string",
+                "invalid type: integer (value redacted), expected a string",
+            ),
+            (
+                "invalid type: floating point `1.5`, expected a string",
+                "invalid type: floating point (value redacted), expected a string",
+            ),
+            (
+                "invalid type: character `x`, expected a string",
+                "invalid type: character (value redacted), expected a string",
+            ),
+        ] {
+            assert_eq!(serde_message(message), expected);
+        }
+    }
+
+    #[test]
+    fn serde_message_does_not_end_the_value_at_an_escaped_quote() {
+        // serde renders the string with `{:?}`, so a quote inside it is `\"`.
+        let shown = serde_message(&format!(
+            "invalid type: string {:?}, expected a map at line 1 column 1",
+            format!("a\"{CANARY}\\b\"{CANARY}")
+        ));
+        assert!(!shown.contains(CANARY), "{shown}");
+        assert!(
+            shown.ends_with(", expected a map at line 1 column 1"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn serde_message_does_not_end_a_variant_at_a_quoted_expected() {
+        let shown = serde_message(&format!(
+            "unknown variant `x`, expected {CANARY}`, expected one of `a`, `b` at line 1"
+        ));
+        assert!(!shown.contains(CANARY), "{shown}");
+        assert!(
+            shown.ends_with(", expected one of `a`, `b` at line 1"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn serde_message_cuts_a_quote_that_never_closes_and_leaves_the_rest_alone() {
+        assert_eq!(
+            serde_message(&format!("invalid type: string \"{CANARY}")),
+            "invalid type: string (value redacted)"
+        );
+        // Field names are vocabulary, not values: they are how a typo is found.
+        let unknown = "unknown field `rediss`, expected one of `provider`, `redis` at line 2";
+        assert_eq!(serde_message(unknown), unknown);
+        assert_eq!(serde_message("missing field `id`"), "missing field `id`");
+        assert_eq!(
+            serde_message("invalid type: map, expected a string"),
+            "invalid type: map, expected a string"
         );
     }
 

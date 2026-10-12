@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::compare::jsonpath;
+use crate::config::redact;
 use crate::contract::model::{BehavioralRules, Contract};
 
 /// The only contract schema version the MVP supports.
@@ -106,14 +107,14 @@ pub fn load_file(path: &Path) -> Result<Contract, ContractError> {
             let de = yaml_serde::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: e.to_string(),
+                message: redact::serde_message(&e.to_string()),
             })
         }
         Some("json") => {
             let de = &mut serde_json::Deserializer::from_str(&text);
             serde_path_to_error::deserialize(de).map_err(|e| ContractError::Parse {
                 path: path.to_path_buf(),
-                message: e.to_string(),
+                message: redact::serde_message(&e.to_string()),
             })
         }
         _ => Err(ContractError::UnknownExtension {
@@ -543,5 +544,32 @@ routes:
         assert!(issues
             .iter()
             .any(|i| i.path == "$..deep" && i.route_id.as_deref() == Some("r")));
+    }
+
+    /// Invariant 5: serde quotes the value it choked on, in YAML and in JSON
+    /// alike; the contract loader reports the field and the expected type.
+    #[test]
+    fn a_wrong_typed_contract_value_is_not_echoed() {
+        let dir = tempfile::tempdir().unwrap();
+        for (file, text) in [
+            (
+                "svc.contract.yaml",
+                "version: \"CANARY-V\"\nservice: svc\nroutes: []\n",
+            ),
+            (
+                "svc.contract.json",
+                r#"{"version": "CANARY-V", "service": "svc", "routes": []}"#,
+            ),
+        ] {
+            let path = dir.path().join(file);
+            std::fs::write(&path, text).unwrap();
+            let message = load_file(&path).unwrap_err().to_string();
+            assert!(!message.contains("CANARY-V"), "{file}: {message}");
+            assert!(message.contains("version"), "{file}: {message}");
+            assert!(
+                message.contains("invalid type: string (value redacted), expected u32"),
+                "{file}: {message}"
+            );
+        }
     }
 }

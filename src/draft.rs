@@ -46,7 +46,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 
 use crate::config::model::{ComparisonConfig, Config, RouteConfig, RouteMode};
-use crate::config::redact::redact_url;
+use crate::config::redact::{self, carries_secrets, redact_url};
 use crate::observability::observe::{ObserveProfile, RouteProfile, OBSERVE_PROFILE_PATH};
 use crate::observability::prometheus::IN_FLIGHT;
 use crate::routing::matcher::{basis_normalizes_paths, PathMatcher};
@@ -467,8 +467,9 @@ fn load_profile_file(path: &Path) -> Result<ObserveProfile, SuggestError> {
     })?;
     serde_json::from_str(&text).map_err(|e| {
         SuggestError::InputUnavailable(format!(
-            "{} is not an observe profile document: {e}",
-            path.display()
+            "{} is not an observe profile document: {}",
+            path.display(),
+            redact::serde_message(&e.to_string())
         ))
     })
 }
@@ -608,9 +609,12 @@ fn request_failed(context: &str, url: &str, error: reqwest::Error) -> SuggestErr
 
 fn parse_profile(document: &str, url: &str) -> Result<ObserveProfile, SuggestError> {
     serde_json::from_str(document).map_err(|e| {
+        // serde quotes the value it choked on, and this document is whatever
+        // answered at `--control-url`.
         SuggestError::InputUnavailable(format!(
-            "{} did not serve an observe profile: {e}",
-            redact_url(url)
+            "{} did not serve an observe profile: {}",
+            redact_url(url),
+            redact::serde_message(&e.to_string())
         ))
     })
 }
@@ -823,6 +827,13 @@ pub fn render_yaml(
     if let Some(sink) = head.diff_sink.as_mut() {
         sink.dir = absolutize(Path::new(""), &sink.dir);
     }
+    // …and one deliberate omission: this document is printed to stdout and ends
+    // up in tickets and CI logs, so no URL in it keeps a userinfo, query or
+    // fragment (invariant 5). The Redis URL is where a password normally sits.
+    if carries_secrets(&head.flags.redis.url) {
+        head.flags.redis.url = redact_url(&head.flags.redis.url);
+        out.push_str(REDIS_URL_CUT_NOTE);
+    }
     let mut value = yaml_serde::to_value(&head)?;
     if let Some(mapping) = value.as_mapping_mut() {
         mapping.remove("routes");
@@ -831,7 +842,8 @@ pub fn render_yaml(
 
     out.push_str("routes:\n");
     for (route, suggestion) in config.routes.iter().zip(suggestions) {
-        let drafted = draft_route(route, suggestion, opts);
+        let mut drafted = draft_route(route, suggestion, opts);
+        redact_upstreams(&mut drafted);
         for line in comment_block(suggestion, &drafted) {
             if line.is_empty() {
                 out.push_str("  #\n");
@@ -846,6 +858,35 @@ pub fn render_yaml(
         )?));
     }
     Ok(out)
+}
+
+/// Said above the flags block when the input's `flags.redis.url` had a userinfo,
+/// query or fragment the draft does not carry. The overrides are the supported
+/// way to give limen a URL without writing it into a file.
+const REDIS_URL_CUT_NOTE: &str = "\
+# flags.redis.url: the input URL carried credentials, a query or a fragment. A\n\
+# draft is printed and pasted around, so it keeps only scheme://host[:port]/path.\n\
+# Supply the full URL when you run it: LIMEN_REDIS_URL or --redis-url.\n\
+#\n";
+
+/// Drop the userinfo, query and fragment from a drafted route's upstreams, and
+/// say so in the route's notes. Credentials in an upstream URL are unusual, but
+/// the draft is output and the URL is operator input (`--new-upstream` included);
+/// a URL with nothing to hide is left exactly as written.
+fn redact_upstreams(drafted: &mut DraftedRoute) {
+    for (field, upstream) in [
+        ("legacy_upstream", &mut drafted.route.legacy_upstream),
+        ("new_upstream", &mut drafted.route.new_upstream),
+    ] {
+        let Some(raw) = upstream.as_deref().filter(|raw| carries_secrets(raw)) else {
+            continue;
+        };
+        drafted.notes.push(format!(
+            "{field} carried credentials, a query or a fragment; the draft keeps only \
+             scheme://host[:port]/path. Restore the full URL before running it."
+        ));
+        *upstream = Some(redact_url(raw));
+    }
 }
 
 /// The document preamble: what this file is and what it is not.
@@ -2277,6 +2318,139 @@ routes:
             );
             assert!(!message.contains("CANARY-DRAFT"), "{message}");
         }
+    }
+
+    /// A valid config whose every URL carries a canary where a credential or a
+    /// token would sit: the Redis password, userinfo on both upstreams, and a
+    /// query and fragment on each.
+    const CREDENTIALED: &str = r#"
+observe: {}
+flags:
+  provider: redis
+  redis: { url: "redis://user:CANARY-PW@redis.internal:6379/0?token=CANARY-Q#CANARY-F", key_prefix: "p", refresh_interval_ms: 1000 }
+routes:
+  - id: pat-validate
+    match: { methods: ["GET"], path_prefix: "/api/v1/pat/validate" }
+    legacy_upstream: "https://u:CANARY-PW@legacy.internal/api?token=CANARY-Q#CANARY-F"
+    new_upstream: "https://u:CANARY-PW@new.internal/?token=CANARY-Q"
+    mode: shadow_legacy_primary
+  - id: unshadowed
+    match: { methods: ["GET"], path_prefix: "/other" }
+    legacy_upstream: "http://legacy.internal"
+    mode: legacy_only
+  - id: query-only
+    match: { methods: ["GET"], path_prefix: "/q" }
+    legacy_upstream: "http://legacy.internal/q?token=CANARY-Q"
+    mode: legacy_only
+  - id: fragment-only
+    match: { methods: ["GET"], path_prefix: "/f" }
+    legacy_upstream: "http://legacy.internal/f#CANARY-F"
+    mode: legacy_only
+"#;
+
+    /// Invariant 5 on the emitted draft: it is printed to stdout and pasted into
+    /// tickets, so it carries no userinfo, query or fragment — and still loads.
+    #[test]
+    fn the_draft_carries_no_url_credentials() {
+        let config = config_from(CREDENTIALED);
+        let draft = draft_of(
+            &config,
+            &candidate_profile("pat-validate"),
+            &DraftOptions::default(),
+        );
+        assert!(!draft.contains("CANARY"), "{draft}");
+
+        // Still a config limen accepts, with the hosts and paths intact.
+        let parsed = assert_valid(&draft);
+        // A URL cut for its query alone, or its fragment alone, is cut too.
+        assert_eq!(
+            parsed.routes[2].legacy_upstream.as_deref(),
+            Some("http://legacy.internal/q")
+        );
+        assert_eq!(
+            parsed.routes[3].legacy_upstream.as_deref(),
+            Some("http://legacy.internal/f")
+        );
+        assert_eq!(parsed.flags.redis.url, "redis://redis.internal:6379/0");
+        assert_eq!(
+            parsed.routes[0].legacy_upstream.as_deref(),
+            Some("https://legacy.internal/api")
+        );
+        assert_eq!(
+            parsed.routes[0].new_upstream.as_deref(),
+            Some("https://new.internal")
+        );
+
+        // …and says what was left out and where to supply it.
+        let comments = draft
+            .lines()
+            .filter_map(|l| l.trim_start().strip_prefix('#'))
+            .flat_map(str::split_whitespace)
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            comments.contains("LIMEN_REDIS_URL or --redis-url"),
+            "{draft}"
+        );
+        assert!(
+            comments.contains("legacy_upstream carried credentials"),
+            "{draft}"
+        );
+        assert!(
+            comments.contains("new_upstream carried credentials"),
+            "{draft}"
+        );
+    }
+
+    /// `--new-upstream` is operator input like any other: the URL a route is
+    /// given from the command line is redacted the same way.
+    #[test]
+    fn a_credentialed_new_upstream_option_is_redacted_too() {
+        let config = config_from(CREDENTIALED);
+        let draft = draft_of(
+            &config,
+            &candidate_profile("unshadowed"),
+            &DraftOptions {
+                new_upstream: Some("https://u:CANARY-PW@opt.internal/x?t=CANARY-Q".to_string()),
+                ..DraftOptions::default()
+            },
+        );
+        assert!(!draft.contains("CANARY"), "{draft}");
+        let parsed = assert_valid(&draft);
+        assert_eq!(
+            parsed.routes[1].new_upstream.as_deref(),
+            Some("https://opt.internal/x")
+        );
+    }
+
+    #[test]
+    fn the_json_surface_carries_no_url_credentials() {
+        let config = config_from(CREDENTIALED);
+        let profile = candidate_profile("pat-validate");
+        let suggestions = classify_all(&config, &profile, &thresholds_of(&profile));
+        let json = render_json(&suggestions).expect("json");
+        assert!(!json.contains("CANARY"), "{json}");
+        // Not vacuous: the routes are in it.
+        assert!(json.contains("pat-validate"), "{json}");
+    }
+
+    /// The other half: a config with nothing to hide is drafted byte-for-byte as
+    /// before — no note, and the URLs exactly as written.
+    #[test]
+    fn urls_without_credentials_are_drafted_as_written() {
+        let draft = draft_of(
+            &hostile_config(),
+            &candidate_profile("pat-validate"),
+            &DraftOptions::default(),
+        );
+        assert!(!draft.contains("LIMEN_REDIS_URL"), "{draft}");
+        assert!(!draft.contains("carried credentials"), "{draft}");
+        let parsed = assert_valid(&draft);
+        assert_eq!(
+            parsed.routes[0].legacy_upstream.as_deref(),
+            Some("http://legacy.internal")
+        );
+        assert_eq!(parsed.flags.redis.url, "redis://localhost:6379");
     }
 
     #[test]

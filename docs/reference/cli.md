@@ -43,11 +43,21 @@ modes, resolvable contract references, the contract-vs-inline conflict rule,
 JSONPath-subset compliance, and valid fail-safe / budget values. Failures name
 the offending field and route. Exits non-zero on any error.
 
+Values the file holds are never echoed back by a parse error either: serde's
+`invalid type: string "…"` and `unknown variant` messages are rewritten to
+`invalid type: string (value redacted), expected …` — the field path, the
+expected type and the line and column stay. This holds for the YAML and JSON
+forms of a config and a contract, and for a rejected `LIMEN_FLAGS_PROVIDER` /
+`LIMEN_FAIL_SAFE_MODE` override.
+
 A URL that fails validation is never echoed back: `flags.redis.url` and the
 route upstreams can carry a password in their userinfo or a token in their
 query, so the message says what failed to parse (`is not a valid URL (invalid
 port number; value redacted)`) and leaves the value out. The same holds for
-every message that names a configured or `--control-url` URL.
+every message that names a configured or `--control-url` URL, and
+`verdict --canary` / `suggest-routes` report a control plane's unexpected answer
+by status and size (`did not acknowledge the injection: HTTP 200 OK, a
+62-byte JSON body`), never by quoting its body.
 
 ## `print-routes`
 
@@ -376,6 +386,17 @@ enabled: false }`, with the suggestion riding as a comment above it —
 because response metadata can prove a route unsafe to compare but never safe.
 `--adopt-suggestions` is the deliberate human act that promotes a suggestion
 into a shadowing config.
+
+The draft is printed to stdout and ends up in tickets and CI logs, so **no URL
+in it keeps a userinfo, query or fragment**: `flags.redis.url` and each
+route's `legacy_upstream` / `new_upstream` (and `--new-upstream`) are emitted
+as `scheme://host[:port]/path` when the input carried any, with a comment
+saying so. A Redis password is the usual casualty — give limen the full URL
+when you run the draft, with `LIMEN_REDIS_URL` or `--redis-url`, which win over
+the file. Credentials in an upstream URL are unusual; a draft whose upstream
+had them needs the full URL restored by hand before it is run. A URL with
+nothing to hide is emitted exactly as written. The `--format json` surface
+carries no URLs.
 
 Like `verdict`, a config file is required: it supplies the route table
 classified and the `observe.sample_rate` the profile is cross-checked

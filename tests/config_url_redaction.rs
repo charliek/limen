@@ -79,10 +79,20 @@ impl Workspace {
     }
 
     fn command(&self, args: &[&str]) -> Command {
+        self.command_for("limen.config.yaml", args)
+    }
+
+    /// Write `text` as `file` beside the config, for a format or a shape the
+    /// workspace's own config is not.
+    fn write(&self, file: &str, text: &str) {
+        std::fs::write(self.dir.path().join(file), text).expect("write file");
+    }
+
+    fn command_for(&self, config_file: &str, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_limen"));
         cmd.current_dir(self.dir.path())
             .args(args)
-            .args(["-c", "limen.config.yaml"]);
+            .args(["-c", config_file]);
         // The binary reads these as overrides; a developer's shell must not
         // change what the test feeds it.
         for var in [
@@ -304,7 +314,7 @@ fn an_unreachable_control_url_is_reported_without_userinfo_or_query() {
 }
 
 /// One control-plane stub answer: `(http method, path, status, body)`.
-type Stub = (&'static str, &'static str, u16, &'static str);
+type Stub<'a> = (&'a str, &'a str, u16, &'a str);
 
 /// Run `args` (`verdict` or `suggest-routes`) against a control plane answering
 /// as `stubs` say, with a `--control-url` that carries a password and a token,
@@ -315,7 +325,7 @@ type Stub = (&'static str, &'static str, u16, &'static str);
 /// case is the test above.
 async fn assert_bad_answer_is_reported_redacted(
     args: &[&str],
-    stubs: &[Stub],
+    stubs: &[Stub<'_>],
     marker: &str,
     asked: &str,
 ) {
@@ -359,11 +369,14 @@ async fn assert_bad_answer_is_reported_redacted(
             all.contains(marker),
             "{args:?} {format} lost {marker:?}: {all}"
         );
-        assert_eq!(
-            all.matches(&shown).count(),
-            1,
-            "{args:?} {format} must name {shown} once: {all}"
-        );
+        // `asked` is empty for a message that does not name the URL at all.
+        if !asked.is_empty() {
+            assert_eq!(
+                all.matches(&shown).count(),
+                1,
+                "{args:?} {format} must name {shown} once: {all}"
+            );
+        }
     }
 }
 
@@ -469,6 +482,135 @@ async fn suggest_routes_reports_a_garbled_profile_without_the_credentials() {
             ("GET", "/observe/profile", 200, "not json"),
         ],
         "did not serve an observe profile",
+        "/observe/profile",
+    )
+    .await;
+}
+
+/// serde's type errors quote the value they choked on, and they are raised while
+/// the file is parsed, before any validator has seen it. A URL written one
+/// level too shallow (`redis:` holds a struct, not a URL) is the realistic way
+/// to get one; the message keeps the field path and the expected type.
+#[test]
+fn a_config_that_fails_to_parse_does_not_echo_its_values() {
+    let ws = Workspace::with_config(&config(None, "https://l", "https://n"));
+    for (file, body) in [
+        (
+            "nested.yaml",
+            format!(
+                "{BASE_CONFIG}flags:\n  provider: redis\n  redis: \"redis://:{CANARY}@host\"\n"
+            ),
+        ),
+        (
+            "nested.json",
+            format!(r#"{{"flags": {{"provider": "redis", "redis": "redis://:{CANARY}@host"}}}}"#),
+        ),
+        (
+            "provider.yaml",
+            format!("{BASE_CONFIG}flags:\n  provider: \"redis://:{CANARY}@host\"\n"),
+        ),
+        (
+            "wrong_type.yaml",
+            format!("{BASE_CONFIG}flags:\n  stale_ttl_ms: \"{CANARY}\"\n"),
+        ),
+    ] {
+        ws.write(file, &body);
+        let out = ws
+            .command_for(file, &["validate-config"])
+            .output()
+            .expect("run limen");
+        assert_eq!(out.status.code(), Some(1), "{file}: {}", text(&out));
+        assert_no_canary(file, &out);
+        let err = stderr(&out);
+        assert!(err.contains("invalid config"), "{file}: {err}");
+        assert!(err.contains("(value redacted)"), "{file}: {err}");
+    }
+}
+
+/// The overrides are matched by hand, not by serde, and used to name the value
+/// they rejected.
+#[test]
+fn a_rejected_override_does_not_echo_its_value() {
+    let ws = Workspace::with_config(&config(None, "https://l", "https://n"));
+    let bad = format!("redis://:{CANARY}@host");
+
+    let flag = ws.run(&["validate-config", "--flags-provider", &bad]);
+    assert_eq!(flag.status.code(), Some(1), "{}", text(&flag));
+    assert_no_canary("--flags-provider", &flag);
+    assert!(
+        stderr(&flag).contains("LIMEN_FLAGS_PROVIDER"),
+        "{}",
+        text(&flag)
+    );
+
+    let env = ws
+        .command(&["validate-config"])
+        .env("LIMEN_FAIL_SAFE_MODE", &bad)
+        .output()
+        .expect("run limen");
+    assert_eq!(env.status.code(), Some(1), "{}", text(&env));
+    assert_no_canary("LIMEN_FAIL_SAFE_MODE", &env);
+    assert!(
+        stderr(&env).contains("LIMEN_FAIL_SAFE_MODE"),
+        "{}",
+        text(&env)
+    );
+}
+
+/// What a control endpoint that is not limen's can answer with: a body that
+/// reflects its request, query token included.
+const REFLECTED: &str = r#"{"injected": false, "echo": "/debug/canary?token=CANARY-9z"}"#;
+
+/// A `--canary` trigger answered 200 without the acknowledgement reports the
+/// status and how big the body was, never the body.
+#[tokio::test]
+async fn verdict_does_not_echo_the_body_of_an_unacknowledged_canary() {
+    assert_bad_answer_is_reported_redacted(
+        &["verdict", "--canary"],
+        &[("POST", "/debug/canary", 200, REFLECTED)],
+        &format!(
+            "did not acknowledge the injection: HTTP 200 OK, a {}-byte JSON body",
+            REFLECTED.len()
+        ),
+        "/debug/canary",
+    )
+    .await;
+}
+
+/// A scrape line limen cannot parse is reported by number and length: the line
+/// is whatever answered at `--control-url`.
+#[tokio::test]
+async fn a_scrape_that_does_not_parse_is_reported_without_its_content() {
+    const LINE: &str = "not a metric CANARY-9z {";
+    let body = format!("# a comment\n{LINE}\n");
+    let marker = format!("unparseable /metrics line 2 ({} bytes", LINE.len());
+    for args in [&["verdict"][..], &["suggest-routes"][..]] {
+        assert_bad_answer_is_reported_redacted(
+            args,
+            &[("GET", "/metrics", 200, &body)],
+            &marker,
+            "",
+        )
+        .await;
+    }
+}
+
+/// serde's error for a profile document quotes the value it rejected; the
+/// document is the control endpoint's, so that value is not limen's to print.
+#[tokio::test]
+async fn a_profile_that_does_not_deserialize_is_reported_without_its_values() {
+    assert_bad_answer_is_reported_redacted(
+        &["suggest-routes"],
+        &[
+            ("GET", "/metrics", 200, "limen_in_flight_requests 0\n"),
+            (
+                "GET",
+                "/observe/profile",
+                200,
+                r#"{"sample_rate": "CANARY-9z", "routes": {}}"#,
+            ),
+        ],
+        "invalid type: string (value redacted)",
         "/observe/profile",
     )
     .await;
