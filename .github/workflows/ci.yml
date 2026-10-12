@@ -144,6 +144,10 @@ jobs:
   # such as an unmaintained crate print but do not fail the job; only a
   # vulnerability does. An advisory with no fix yet gets an `--ignore` here with a
   # reason comment and a link, never a skipped job.
+  # Advisory, deliberately NOT in ci-success's needs: a RUSTSEC id published
+  # while a PR is open must not block an unrelated merge. It runs on every PR
+  # and push as its own job, so a red result is visible and attributable; the
+  # fix is a lock bump or a reasoned ignore, in its own PR.
   audit:
     runs-on: ubuntu-latest
     steps:
