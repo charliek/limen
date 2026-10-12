@@ -2183,8 +2183,8 @@ checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
 
 [[package]]
 name = "stridelabs-http"
-version = "0.4.0"
-source = "git+https://github.com/charliek/stridelabs-rust.git?rev=9233c447e46426bd26634efe49b89490806709ce#9233c447e46426bd26634efe49b89490806709ce"
+version = "0.5.0"
+source = "git+https://github.com/charliek/stridelabs-rust.git?rev=f1af05ecd0e70b7c2a0d1cd52c740a65ed42a3b4#f1af05ecd0e70b7c2a0d1cd52c740a65ed42a3b4"
 dependencies = [
  "anyhow",
  "axum",

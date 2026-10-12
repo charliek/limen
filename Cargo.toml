@@ -65,10 +65,11 @@ rustls = { version = "0.23", default-features = false, features = [
 # names the intent, the lock enforces it, and bumping either is a deliberate
 # edit reviewed here.
 #
-# TEMPORARY: a commit rev, not the tag. reqwest 0.13 (and with it the shared
-# client's types) is in v0.5.0, which is not tagged yet; this is the head of the
-# branch that becomes it. The next commit re-pins to `tag = "v0.5.0"`.
-stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "9233c447e46426bd26634efe49b89490806709ce", default-features = false, features = [
+# TEMPORARY: a commit rev, not the tag. This is the binding-proof pin: the merge
+# commit of the v0.5.0 release PR (stridelabs-rust#32), which this lock and the
+# full gates are proven against before that exact commit is tagged. The next
+# commit re-pins to `tag = "v0.5.0"`.
+stridelabs-http = { git = "https://github.com/charliek/stridelabs-rust.git", rev = "f1af05ecd0e70b7c2a0d1cd52c740a65ed42a3b4", default-features = false, features = [
     "proxy",
 ] }
 
