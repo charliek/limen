@@ -1,0 +1,12 @@
+version: 1
+targets:
+  proxy:
+    kind: web-service
+    # The Dockerfile builds the limen binary from Cargo.lock (--locked), but
+    # nothing is released or deployed yet: Cargo.toml's version is the 0.0.0
+    # "never published" sentinel, and no workflow pushes the image.
+    ships: [Cargo.lock]
+lockfiles:
+  # pyproject.toml has only the docs group (zensical and the docs theme): it
+  # builds the documentation site, which the image doesn't contain.
+  uv.lock: { role: build-tool }
